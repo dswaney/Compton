@@ -3,7 +3,7 @@ setlocal
 
 REM Set credentials
 set "USERNAME=MISAdmin"
-set "PASSWORD=M1$admin"
+set "PASSWORD="
 
 REM Register Weekly Tasks (Every Sunday)
 call :CreateTask "Remove User Profiles Weekly"        "C:\Windows\Scripts\01_Remove-UserProfiles.ps1"       "01:30"
