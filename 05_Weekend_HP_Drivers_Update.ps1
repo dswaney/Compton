@@ -1,0 +1,452 @@
+# ScriptVersion: 1.0
+# LastUpdated: 2026-03-23
+
+[CmdletBinding()]
+param(
+    [switch]$IncludeBIOS = $false,
+    [switch]$IncludeSoftware = $false,
+    [switch]$SuspendBitLockerForBIOS = $false,
+    [string]$WorkingRoot = 'C:\Temp\HPDrivers',
+    [string]$LogPath = 'C:\Temp\HPDrivers\HP-Driver-Update.log',
+    [int]$CleanupRetryCount = 12,
+    [int]$CleanupRetryDelaySeconds = 10
+)
+
+$ErrorActionPreference = 'Stop'
+
+function Write-Log {
+    param(
+        [string]$Message,
+        [ValidateSet('INFO','OK','WARN','ERROR')]
+        [string]$Level = 'INFO'
+    )
+
+    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $line = "[$timestamp] [$('{0,-5}' -f $Level)] $Message"
+
+    switch ($Level) {
+        'INFO'  { Write-Host $line -ForegroundColor Cyan }
+        'OK'    { Write-Host $line -ForegroundColor Green }
+        'WARN'  { Write-Host $line -ForegroundColor Yellow }
+        'ERROR' { Write-Host $line -ForegroundColor Red }
+    }
+
+    try {
+        $logDir = Split-Path -Path $LogPath -Parent
+        if (-not [string]::IsNullOrWhiteSpace($logDir) -and -not (Test-Path -LiteralPath $logDir)) {
+            New-Item -Path $logDir -ItemType Directory -Force | Out-Null
+        }
+        Add-Content -Path $LogPath -Value $line -Encoding UTF8
+    }
+    catch {
+    }
+}
+
+function Test-IsAdministrator {
+    try {
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+        return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    }
+    catch {
+        return $false
+    }
+}
+
+function Test-IsHPSystem {
+    try {
+        $manufacturer = (Get-CimInstance -ClassName Win32_ComputerSystem).Manufacturer
+        return ($manufacturer -match 'HP|Hewlett-Packard')
+    }
+    catch {
+        return $false
+    }
+}
+
+function Ensure-Folder {
+    param([string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        New-Item -Path $Path -ItemType Directory -Force | Out-Null
+    }
+}
+
+function Save-PowerSettings {
+    $settings = [ordered]@{}
+
+    $settings.DisplayTimeoutDC = (
+        Get-CimInstance -Namespace root\cimv2\power -Class Win32_PowerSettingDataIndex |
+        Where-Object InstanceID -EQ 'Microsoft:PowerSettingDataIndex\{381b4222-f694-41f0-9685-ff5bb260df2e}\DC\{3c0bc021-c8a8-4e07-a973-6b14cbcb2b7e}'
+    ).SettingIndexValue / 60
+
+    $settings.DisplayTimeoutAC = (
+        Get-CimInstance -Namespace root\cimv2\power -Class Win32_PowerSettingDataIndex |
+        Where-Object InstanceID -EQ 'Microsoft:PowerSettingDataIndex\{381b4222-f694-41f0-9685-ff5bb260df2e}\AC\{3c0bc021-c8a8-4e07-a973-6b14cbcb2b7e}'
+    ).SettingIndexValue / 60
+
+    $settings.SleepTimeoutDC = (
+        Get-CimInstance -Namespace root\cimv2\power -Class Win32_PowerSettingDataIndex |
+        Where-Object InstanceID -EQ 'Microsoft:PowerSettingDataIndex\{381b4222-f694-41f0-9685-ff5bb260df2e}\DC\{29f6c1db-86da-48c5-9fdb-f2b67b1f44da}'
+    ).SettingIndexValue / 60
+
+    $settings.SleepTimeoutAC = (
+        Get-CimInstance -Namespace root\cimv2\power -Class Win32_PowerSettingDataIndex |
+        Where-Object InstanceID -EQ 'Microsoft:PowerSettingDataIndex\{381b4222-f694-41f0-9685-ff5bb260df2e}\AC\{29f6c1db-86da-48c5-9fdb-f2b67b1f44da}'
+    ).SettingIndexValue / 60
+
+    return [PSCustomObject]$settings
+}
+
+function Set-UnlimitedPowerTimeouts {
+    Write-Log "Temporarily disabling monitor and sleep timeouts..." 'INFO'
+    powercfg -change -monitor-timeout-dc 0 | Out-Null
+    powercfg -change -monitor-timeout-ac 0 | Out-Null
+    powercfg -change -standby-timeout-dc 0 | Out-Null
+    powercfg -change -standby-timeout-ac 0 | Out-Null
+}
+
+function Restore-PowerSettings {
+    param($Saved)
+
+    if ($null -eq $Saved) { return }
+
+    Write-Log "Restoring previous power timeout settings..." 'INFO'
+    powercfg -change -monitor-timeout-dc $Saved.DisplayTimeoutDC | Out-Null
+    powercfg -change -monitor-timeout-ac $Saved.DisplayTimeoutAC | Out-Null
+    powercfg -change -standby-timeout-dc $Saved.SleepTimeoutDC | Out-Null
+    powercfg -change -standby-timeout-ac $Saved.SleepTimeoutAC | Out-Null
+}
+
+function Ensure-Tls12 {
+    try {
+        [Net.ServicePointManager]::SecurityProtocol =
+            [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        Write-Log "Enabled TLS 1.2 for PowerShell Gallery access." 'OK'
+    }
+    catch {
+        Write-Log "Could not explicitly enable TLS 1.2: $($_.Exception.Message)" 'WARN'
+    }
+}
+
+function Ensure-NuGetProvider {
+    Write-Log "Ensuring NuGet provider is installed..." 'INFO'
+    try {
+        Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope AllUsers | Out-Null
+        Write-Log "NuGet provider is ready." 'OK'
+    }
+    catch {
+        Write-Log "NuGet provider installation/check failed: $($_.Exception.Message)" 'WARN'
+    }
+}
+
+function Ensure-PSGalleryTrusted {
+    try {
+        $repo = Get-PSRepository -Name 'PSGallery' -ErrorAction Stop
+        if ($repo.InstallationPolicy -ne 'Trusted') {
+            Set-PSRepository -Name 'PSGallery' -InstallationPolicy Trusted
+            Write-Log "Set PSGallery repository to Trusted." 'OK'
+        }
+        else {
+            Write-Log "PSGallery repository already Trusted." 'INFO'
+        }
+    }
+    catch {
+        Write-Log "Could not validate/set PSGallery trust: $($_.Exception.Message)" 'WARN'
+    }
+}
+
+function Install-ModuleIfPossible {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [switch]$AllowClobber
+    )
+
+    $args = @{
+        Name        = $Name
+        Scope       = 'AllUsers'
+        Force       = $true
+        ErrorAction = 'Stop'
+    }
+
+    if ($AllowClobber) {
+        $args['AllowClobber'] = $true
+    }
+
+    Install-Module @args | Out-Null
+}
+
+function Ensure-PackageTooling {
+    Write-Log "Ensuring PowerShell package tooling is current enough for HPCMSL..." 'INFO'
+
+    Ensure-Tls12
+    Ensure-NuGetProvider
+    Ensure-PSGalleryTrusted
+
+    try {
+        Install-ModuleIfPossible -Name 'PowerShellGet' -AllowClobber
+        Write-Log "PowerShellGet installed/updated." 'OK'
+    }
+    catch {
+        Write-Log "PowerShellGet update failed: $($_.Exception.Message)" 'WARN'
+    }
+
+    try {
+        Install-ModuleIfPossible -Name 'Microsoft.PowerShell.PSResourceGet'
+        Write-Log "Microsoft.PowerShell.PSResourceGet installed/updated." 'OK'
+    }
+    catch {
+        Write-Log "PSResourceGet install/update failed: $($_.Exception.Message)" 'WARN'
+    }
+
+    try {
+        Import-Module PowerShellGet -Force -ErrorAction Stop
+    }
+    catch {
+        Write-Log "Could not import PowerShellGet: $($_.Exception.Message)" 'WARN'
+    }
+
+    try {
+        Import-Module Microsoft.PowerShell.PSResourceGet -Force -ErrorAction Stop
+    }
+    catch {
+        Write-Log "Could not import PSResourceGet yet: $($_.Exception.Message)" 'WARN'
+    }
+}
+
+function Ensure-HPCMSL {
+    Write-Log "Ensuring HP CMSL is available..." 'INFO'
+
+    Ensure-PackageTooling
+
+    $moduleLoaded = $false
+
+    if (-not (Get-Module -ListAvailable -Name HPCMSL)) {
+        try {
+            if (Get-Command -Name Install-PSResource -ErrorAction SilentlyContinue) {
+                Write-Log "Installing HPCMSL with Install-PSResource..." 'INFO'
+                Install-PSResource -Name HPCMSL -Scope AllUsers -TrustRepository -Quiet -AcceptLicense -ErrorAction Stop | Out-Null
+            }
+            else {
+                Write-Log "Install-PSResource not available. Falling back to Install-Module for HPCMSL..." 'WARN'
+                Install-ModuleIfPossible -Name 'HPCMSL' -AllowClobber
+            }
+        }
+        catch {
+            Write-Log "Primary HPCMSL install attempt failed: $($_.Exception.Message)" 'WARN'
+
+            try {
+                Write-Log "Trying fallback HPCMSL install with Install-Module..." 'INFO'
+                Install-ModuleIfPossible -Name 'HPCMSL' -AllowClobber
+            }
+            catch {
+                throw "Failed to install HPCMSL. $($_.Exception.Message)"
+            }
+        }
+    }
+    else {
+        Write-Log "HPCMSL already present on system." 'INFO'
+    }
+
+    try {
+        Import-Module HPCMSL -Force -ErrorAction Stop
+        $moduleLoaded = $true
+    }
+    catch {
+        try {
+            Import-Module HP.Softpaq -Force -ErrorAction Stop
+            $moduleLoaded = $true
+        }
+        catch {
+            throw "HPCMSL/HP.Softpaq could not be imported after installation. $($_.Exception.Message)"
+        }
+    }
+
+    if ($moduleLoaded) {
+        Write-Log "HP CMSL imported successfully." 'OK'
+    }
+}
+
+function Get-HPSoftpaqCategories {
+    $categories = @('Driver')
+
+    if ($IncludeBIOS) {
+        $categories += 'BIOS'
+    }
+
+    if ($IncludeSoftware) {
+        $categories += @('Diagnostic', 'Dock', 'Software', 'Utility')
+    }
+
+    return $categories
+}
+
+function Get-DriverList {
+    $categories = Get-HPSoftpaqCategories
+    Write-Log "Querying HP SoftPaq list for categories: $($categories -join ', ')" 'INFO'
+
+    $list = Get-SoftpaqList -Category $categories
+
+    if (-not $list) {
+        Write-Log "No applicable HP SoftPaq updates were returned." 'OK'
+        return @()
+    }
+
+    foreach ($item in $list) {
+        Write-Log "Detected: [$($item.Id)] $($item.Name) Version $($item.Version)" 'INFO'
+    }
+
+    return @($list)
+}
+
+function Install-SoftpaqList {
+    param([object[]]$Softpaqs)
+
+    $failures = 0
+
+    foreach ($item in $Softpaqs) {
+        try {
+            Write-Log "Installing SoftPaq [$($item.Id)] $($item.Name)..." 'INFO'
+            Get-Softpaq -Number $item.Id -Action SilentInstall | Out-Null
+            Write-Log "Installed SoftPaq [$($item.Id)] $($item.Name)." 'OK'
+        }
+        catch {
+            Write-Log "Failed SoftPaq [$($item.Id)] $($item.Name): $($_.Exception.Message)" 'WARN'
+            $failures++
+        }
+    }
+
+    return $failures
+}
+
+function Suspend-BitLockerIfNeeded {
+    if (-not $SuspendBitLockerForBIOS) {
+        return
+    }
+
+    if (-not $IncludeBIOS) {
+        Write-Log "SuspendBitLockerForBIOS was requested, but IncludeBIOS is not enabled. Skipping BitLocker suspend." 'WARN'
+        return
+    }
+
+    try {
+        $vol = Get-BitLockerVolume -MountPoint 'C:'
+        if ($vol.VolumeStatus -ne 'FullyDecrypted') {
+            Suspend-BitLocker -MountPoint 'C:' -RebootCount 1
+            Write-Log "BitLocker suspended for one reboot." 'OK'
+        }
+        else {
+            Write-Log "BitLocker is not active on C:. No suspend needed." 'INFO'
+        }
+    }
+    catch {
+        Write-Log "Could not evaluate or suspend BitLocker: $($_.Exception.Message)" 'WARN'
+    }
+}
+
+function Remove-WorkingFolderRobust {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [int]$RetryCount = 12,
+        [int]$RetryDelaySeconds = 10
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        Write-Log "Working folder already absent: $Path" 'OK'
+        return $true
+    }
+
+    Write-Log "Attempting to remove working folder: $Path" 'INFO'
+
+    for ($i = 1; $i -le $RetryCount; $i++) {
+        try {
+            Start-Sleep -Seconds 2
+            Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+
+            if (-not (Test-Path -LiteralPath $Path)) {
+                Write-Log "Working folder removed successfully." 'OK'
+                return $true
+            }
+        }
+        catch {
+            Write-Log "Cleanup attempt $i/$RetryCount failed: $($_.Exception.Message)" 'WARN'
+        }
+
+        if ($i -lt $RetryCount) {
+            Start-Sleep -Seconds $RetryDelaySeconds
+        }
+    }
+
+    Write-Log "Working folder still exists after cleanup attempts: $Path" 'ERROR'
+    return $false
+}
+
+# Main
+if (-not (Test-IsAdministrator)) {
+    Write-Error "Please run this script as Administrator."
+    exit 1
+}
+
+if (-not (Test-IsHPSystem)) {
+    Write-Host "This is not an HP or Hewlett-Packard system. Skipping HP driver update." -ForegroundColor Yellow
+    exit 0
+}
+
+Ensure-Folder -Path $WorkingRoot
+
+$SavedPower = $null
+$OriginalLocation = (Get-Location).Path
+$Failures = 0
+$CleanupOk = $false
+
+try {
+    Write-Log "Initializing HP driver update script..." 'INFO'
+    Write-Log "Working root: $WorkingRoot" 'INFO'
+
+    $SavedPower = Save-PowerSettings
+    Set-UnlimitedPowerTimeouts
+    Ensure-HPCMSL
+    Suspend-BitLockerIfNeeded
+
+    Set-Location -Path $WorkingRoot
+
+    $softpaqs = Get-DriverList
+    if ($softpaqs.Count -eq 0) {
+        $CleanupOk = Remove-WorkingFolderRobust -Path $WorkingRoot -RetryCount $CleanupRetryCount -RetryDelaySeconds $CleanupRetryDelaySeconds
+        exit 0
+    }
+
+    $Failures = Install-SoftpaqList -Softpaqs $softpaqs
+}
+catch {
+    Write-Log "Script failed: $($_.Exception.Message)" 'ERROR'
+    $Failures++
+}
+finally {
+    try {
+        Set-Location -Path $OriginalLocation
+    }
+    catch {
+    }
+
+    try {
+        Restore-PowerSettings -Saved $SavedPower
+    }
+    catch {
+        Write-Log "Failed restoring power settings: $($_.Exception.Message)" 'WARN'
+    }
+
+    $CleanupOk = Remove-WorkingFolderRobust -Path $WorkingRoot -RetryCount $CleanupRetryCount -RetryDelaySeconds $CleanupRetryDelaySeconds
+}
+
+if ($Failures -eq 0 -and $CleanupOk) {
+    Write-Log "HP driver update script completed successfully." 'OK'
+    exit 0
+}
+elseif ($Failures -eq 0 -and -not $CleanupOk) {
+    Write-Log "HP driver update succeeded, but cleanup was incomplete." 'WARN'
+    exit 2
+}
+else {
+    Write-Log "HP driver update completed with one or more failures." 'WARN'
+    exit 3
+}
