@@ -1,4 +1,4 @@
-﻿# ScriptVersion: 1.0
+﻿# ScriptVersion: 1.1
 # LastUpdated: 2026-03-23
 
 [CmdletBinding()]
