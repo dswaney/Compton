@@ -1,7 +1,7 @@
 # =====================================================================
 # ScriptName: 06_Weekend_Windows_Updates.ps1
-# ScriptVersion: 1.2
-# LastUpdated: 2026-03-23
+# ScriptVersion: 1.3
+# LastUpdated: 2026-03-24
 # Purpose: Installs Windows Updates using PSWindowsUpdate, writes a
 #          standard log and a YAML audit log in C:\Logs, and explicitly
 #          reboots if Windows reports that a reboot is required.
@@ -99,7 +99,7 @@ function Initialize-YamlLog {
     Ensure-Folder -Path $YamlLogFolder
 
     $timestamp = Get-Date -Format 'yyyy-MM-dd_HHmmss'
-    $fileName = "$($script:ComputerName)-WindowsUpdate-$timestamp.yml"
+    $fileName = "$($script:ComputerName)-WindowsUpdates-$timestamp.yml"
     $script:YamlLogPath = Join-Path $YamlLogFolder $fileName
 
     Write-Log "YAML log will be written to: $($script:YamlLogPath)" 'INFO'
@@ -217,7 +217,7 @@ function Write-YamlLog {
 
         $yamlLines.Add('computer_name: ' + (ConvertTo-YamlSafeValue $script:ComputerName)) | Out-Null
         $yamlLines.Add('script_name: "06_Weekend_Windows_Updates.ps1"') | Out-Null
-        $yamlLines.Add('script_version: "1.2"') | Out-Null
+        $yamlLines.Add('script_version: "1.3"') | Out-Null
         $yamlLines.Add('run_started: ' + (ConvertTo-YamlSafeValue ($script:RunStart.ToString('yyyy-MM-dd HH:mm:ss')))) | Out-Null
         $yamlLines.Add('run_finished: ' + (ConvertTo-YamlSafeValue ($runEnd.ToString('yyyy-MM-dd HH:mm:ss')))) | Out-Null
         $yamlLines.Add('duration_seconds: ' + $duration) | Out-Null
