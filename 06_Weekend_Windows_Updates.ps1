@@ -1,36 +1,31 @@
-# ScriptVersion: 1.0
+# =====================================================================
+# ScriptName: 06_Weekend_Windows_Updates.ps1
+# ScriptVersion: 1.2
 # LastUpdated: 2026-03-23
-
-<#
-.SYNOPSIS
-    Installs Windows Updates using PSWindowsUpdate and explicitly reboots
-    if Windows reports that a reboot is required.
-
-.DESCRIPTION
-    This script is intended for scheduled/task-based execution where relying
-    on -AutoReboot alone may not be consistent enough.
-
-    It:
-      - Ensures it is running as Administrator
-      - Verifies/imports PSWindowsUpdate
-      - Optionally resets Windows Update components
-      - Installs available updates
-      - Explicitly checks whether a reboot is required
-      - Explicitly issues the reboot command
-
-.NOTES
-    Recommended to run as SYSTEM or a local administrator in Task Scheduler.
-#>
+# Purpose: Installs Windows Updates using PSWindowsUpdate, writes a
+#          standard log and a YAML audit log in C:\Logs, and explicitly
+#          reboots if Windows reports that a reboot is required.
+# =====================================================================
 
 [CmdletBinding()]
 param(
     [switch]$ResetWUComponentsFirst = $false,
     [int]$OperationTimeoutSeconds = 1800,
     [int]$RebootDelaySeconds = 30,
-    [string]$LogPath = "$env:SystemDrive\Temp\Weekend-Windows-Updates.log"
+    [string]$LogPath = "$env:SystemDrive\Logs\Weekend-Windows-Updates.log",
+    [string]$YamlLogFolder = "$env:SystemDrive\Logs"
 )
 
 $ErrorActionPreference = 'Stop'
+
+$script:RunStart       = Get-Date
+$script:ComputerName   = $env:COMPUTERNAME
+$script:YamlLogPath    = $null
+$script:UpdateEntries  = New-Object System.Collections.Generic.List[object]
+$script:RawUpdateLines = New-Object System.Collections.Generic.List[string]
+$script:OverallResult  = 'Unknown'
+$script:RebootRequired = $false
+$script:FailureMessage = $null
 
 function Write-Log {
     param(
@@ -72,40 +67,206 @@ function Test-IsAdministrator {
     }
 }
 
-function Invoke-WithTimeout {
+function Ensure-Folder {
     param(
         [Parameter(Mandatory)]
-        [scriptblock]$ScriptBlock,
-
-        [int]$TimeoutSeconds = 1800,
-
-        [string]$ActivityName = 'Operation'
+        [string]$Path
     )
 
-    Write-Log "Starting: $ActivityName" 'INFO'
+    if (-not (Test-Path -LiteralPath $Path)) {
+        New-Item -Path $Path -ItemType Directory -Force | Out-Null
+    }
+}
 
-    $job = Start-Job -ScriptBlock $ScriptBlock
+function ConvertTo-YamlSafeValue {
+    param(
+        [AllowNull()]
+        [object]$Value
+    )
 
-    try {
-        if (Wait-Job -Job $job -Timeout $TimeoutSeconds) {
-            $output = Receive-Job -Job $job -Keep
-            if ($output) {
-                $output | ForEach-Object { Write-Log "$_" 'INFO' }
-            }
+    if ($null -eq $Value) {
+        return 'null'
+    }
 
-            if ($job.State -eq 'Failed') {
-                throw "Job failed for activity: $ActivityName"
-            }
+    $text = [string]$Value
+    $text = $text -replace "`r", ' '
+    $text = $text -replace "`n", ' '
+    $text = $text -replace '"', '\"'
+    return '"' + $text + '"'
+}
 
-            Write-Log "Completed: $ActivityName" 'OK'
-        }
-        else {
-            Stop-Job -Job $job -Force -ErrorAction SilentlyContinue | Out-Null
-            throw "Timed out after $TimeoutSeconds seconds: $ActivityName"
+function Initialize-YamlLog {
+    Ensure-Folder -Path $YamlLogFolder
+
+    $timestamp = Get-Date -Format 'yyyy-MM-dd_HHmmss'
+    $fileName = "$($script:ComputerName)-WindowsUpdate-$timestamp.yml"
+    $script:YamlLogPath = Join-Path $YamlLogFolder $fileName
+
+    Write-Log "YAML log will be written to: $($script:YamlLogPath)" 'INFO'
+}
+
+function Add-UpdateEntry {
+    param(
+        [string]$Title,
+        [string]$KB,
+        [string]$Size,
+        [string]$Status,
+        [string]$Result,
+        [string]$Source = 'PSWindowsUpdate'
+    )
+
+    $entry = [PSCustomObject]@{
+        Title  = $Title
+        KB     = $KB
+        Size   = $Size
+        Status = $Status
+        Result = $Result
+        Source = $Source
+    }
+
+    $script:UpdateEntries.Add($entry) | Out-Null
+}
+
+function Try-ParseUpdateObject {
+    param(
+        [Parameter(Mandatory)]
+        [object]$Item
+    )
+
+    if ($null -eq $Item) {
+        return $false
+    }
+
+    $properties = $Item.PSObject.Properties.Name
+    if (-not $properties -or $properties.Count -eq 0) {
+        return $false
+    }
+
+    $title = $null
+    foreach ($name in @('Title','KBArticleTitle')) {
+        if ($properties -contains $name -and -not [string]::IsNullOrWhiteSpace([string]$Item.$name)) {
+            $title = [string]$Item.$name
+            break
         }
     }
-    finally {
-        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue | Out-Null
+
+    $kb = $null
+    foreach ($name in @('KB','KBArticleIDs','KBArticleID')) {
+        if ($properties -contains $name -and $null -ne $Item.$name) {
+            $value = $Item.$name
+            if ($value -is [System.Array]) {
+                $kb = (($value | ForEach-Object { [string]$_ }) -join ', ')
+            }
+            else {
+                $kb = [string]$value
+            }
+            if (-not [string]::IsNullOrWhiteSpace($kb)) {
+                break
+            }
+        }
+    }
+
+    $size = $null
+    foreach ($name in @('Size','MaxDownloadSize')) {
+        if ($properties -contains $name -and $null -ne $Item.$name) {
+            $size = [string]$Item.$name
+            if (-not [string]::IsNullOrWhiteSpace($size)) {
+                break
+            }
+        }
+    }
+
+    $status = $null
+    foreach ($name in @('Status','Result','UpdateState')) {
+        if ($properties -contains $name -and $null -ne $Item.$name) {
+            $status = [string]$Item.$name
+            if (-not [string]::IsNullOrWhiteSpace($status)) {
+                break
+            }
+        }
+    }
+
+    $result = $null
+    foreach ($name in @('Result','Status','HResult')) {
+        if ($properties -contains $name -and $null -ne $Item.$name) {
+            $result = [string]$Item.$name
+            if (-not [string]::IsNullOrWhiteSpace($result)) {
+                break
+            }
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($title) -or -not [string]::IsNullOrWhiteSpace($kb)) {
+        Add-UpdateEntry -Title $title -KB $kb -Size $size -Status $status -Result $result
+        return $true
+    }
+
+    return $false
+}
+
+function Write-YamlLog {
+    try {
+        if ([string]::IsNullOrWhiteSpace($script:YamlLogPath)) {
+            Initialize-YamlLog
+        }
+
+        $runEnd = Get-Date
+        $duration = [math]::Round(($runEnd - $script:RunStart).TotalSeconds, 0)
+
+        $yamlLines = New-Object System.Collections.Generic.List[string]
+
+        $yamlLines.Add('computer_name: ' + (ConvertTo-YamlSafeValue $script:ComputerName)) | Out-Null
+        $yamlLines.Add('script_name: "06_Weekend_Windows_Updates.ps1"') | Out-Null
+        $yamlLines.Add('script_version: "1.2"') | Out-Null
+        $yamlLines.Add('run_started: ' + (ConvertTo-YamlSafeValue ($script:RunStart.ToString('yyyy-MM-dd HH:mm:ss')))) | Out-Null
+        $yamlLines.Add('run_finished: ' + (ConvertTo-YamlSafeValue ($runEnd.ToString('yyyy-MM-dd HH:mm:ss')))) | Out-Null
+        $yamlLines.Add('duration_seconds: ' + $duration) | Out-Null
+        $yamlLines.Add('reset_wu_components_first: ' + ($(if ($ResetWUComponentsFirst) { 'true' } else { 'false' }))) | Out-Null
+        $yamlLines.Add('reboot_required: ' + ($(if ($script:RebootRequired) { 'true' } else { 'false' }))) | Out-Null
+        $yamlLines.Add('overall_result: ' + (ConvertTo-YamlSafeValue $script:OverallResult)) | Out-Null
+
+        if (-not [string]::IsNullOrWhiteSpace($script:FailureMessage)) {
+            $yamlLines.Add('failure_message: ' + (ConvertTo-YamlSafeValue $script:FailureMessage)) | Out-Null
+        } else {
+            $yamlLines.Add('failure_message: null') | Out-Null
+        }
+
+        $yamlLines.Add('updates:') | Out-Null
+
+        if ($script:UpdateEntries.Count -gt 0) {
+            foreach ($entry in $script:UpdateEntries) {
+                $yamlLines.Add('  - title: '  + (ConvertTo-YamlSafeValue $entry.Title))  | Out-Null
+                $yamlLines.Add('    kb: '     + (ConvertTo-YamlSafeValue $entry.KB))     | Out-Null
+                $yamlLines.Add('    size: '   + (ConvertTo-YamlSafeValue $entry.Size))   | Out-Null
+                $yamlLines.Add('    status: ' + (ConvertTo-YamlSafeValue $entry.Status)) | Out-Null
+                $yamlLines.Add('    result: ' + (ConvertTo-YamlSafeValue $entry.Result)) | Out-Null
+                $yamlLines.Add('    source: ' + (ConvertTo-YamlSafeValue $entry.Source)) | Out-Null
+            }
+        }
+        else {
+            $yamlLines.Add('  - title: "No structured update entries captured"') | Out-Null
+            $yamlLines.Add('    kb: null') | Out-Null
+            $yamlLines.Add('    size: null') | Out-Null
+            $yamlLines.Add('    status: "None"') | Out-Null
+            $yamlLines.Add('    result: "None"') | Out-Null
+            $yamlLines.Add('    source: "Script"') | Out-Null
+        }
+
+        $yamlLines.Add('raw_output:') | Out-Null
+        if ($script:RawUpdateLines.Count -gt 0) {
+            foreach ($line in $script:RawUpdateLines) {
+                $yamlLines.Add('  - ' + (ConvertTo-YamlSafeValue $line)) | Out-Null
+            }
+        }
+        else {
+            $yamlLines.Add('  - "No raw update output captured"') | Out-Null
+        }
+
+        Set-Content -Path $script:YamlLogPath -Value $yamlLines -Encoding UTF8
+        Write-Log "YAML log written successfully: $($script:YamlLogPath)" 'OK'
+    }
+    catch {
+        Write-Log "Failed to write YAML log: $($_.Exception.Message)" 'WARN'
     }
 }
 
@@ -166,8 +327,14 @@ function Install-AvailableWindowsUpdates {
     $results = Install-WindowsUpdate -MicrosoftUpdate -AcceptAll -IgnoreReboot -Verbose *>&1
 
     if ($results) {
-        $results | ForEach-Object {
-            Write-Log "$_" 'INFO'
+        foreach ($item in $results) {
+            $line = [string]$item
+            if (-not [string]::IsNullOrWhiteSpace($line)) {
+                $script:RawUpdateLines.Add($line) | Out-Null
+                Write-Log $line 'INFO'
+            }
+
+            [void](Try-ParseUpdateObject -Item $item)
         }
     }
 
@@ -229,6 +396,7 @@ if (-not (Test-IsAdministrator)) {
     exit 1
 }
 
+Initialize-YamlLog
 Write-Log "Initializing weekend Windows update script..." 'INFO'
 
 try {
@@ -240,19 +408,26 @@ try {
 
     Install-AvailableWindowsUpdates
 
-    $rebootRequired = Test-WURebootRequired
+    $script:RebootRequired = Test-WURebootRequired
 
-    if ($rebootRequired) {
+    if ($script:RebootRequired) {
+        $script:OverallResult = 'SucceededWithRebootRequired'
         Write-Log "Windows reports that a reboot is required." 'OK'
+        Write-YamlLog
         Invoke-ExplicitReboot -Delay $RebootDelaySeconds
         exit 3010
     }
     else {
+        $script:OverallResult = 'Succeeded'
         Write-Log "No reboot is currently required." 'OK'
+        Write-YamlLog
         exit 0
     }
 }
 catch {
+    $script:OverallResult = 'Failed'
+    $script:FailureMessage = $_.Exception.Message
     Write-Log "Script failed: $($_.Exception.Message)" 'ERROR'
+    Write-YamlLog
     exit 2
 }
