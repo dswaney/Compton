@@ -1,5 +1,8 @@
-# ScriptVersion: 1.0
+# =====================================================================
+# ScriptName: 05_Weekend_HP_Drivers_Update.ps1
+# ScriptVersion: 1.1
 # LastUpdated: 2026-03-23
+# =====================================================================
 
 [CmdletBinding()]
 param(
@@ -8,11 +11,21 @@ param(
     [switch]$SuspendBitLockerForBIOS = $false,
     [string]$WorkingRoot = 'C:\Temp\HPDrivers',
     [string]$LogPath = 'C:\Temp\HPDrivers\HP-Driver-Update.log',
+    [string]$YamlLogFolder = 'C:\Logs',
     [int]$CleanupRetryCount = 12,
     [int]$CleanupRetryDelaySeconds = 10
 )
 
 $ErrorActionPreference = 'Stop'
+
+$script:RunStart = Get-Date
+$script:ComputerName = $env:COMPUTERNAME
+$script:YamlLogPath = $null
+$script:OverallResult = 'Unknown'
+$script:FailureMessage = $null
+$script:CleanupResult = $false
+$script:DetectedSoftPaqs = New-Object System.Collections.Generic.List[object]
+$script:InstalledSoftPaqResults = New-Object System.Collections.Generic.List[object]
 
 function Write-Log {
     param(
@@ -68,6 +81,145 @@ function Ensure-Folder {
 
     if (-not (Test-Path -LiteralPath $Path)) {
         New-Item -Path $Path -ItemType Directory -Force | Out-Null
+    }
+}
+
+function ConvertTo-YamlSafeValue {
+    param(
+        [AllowNull()]
+        [object]$Value
+    )
+
+    if ($null -eq $Value) {
+        return 'null'
+    }
+
+    $text = [string]$Value
+    $text = $text -replace "`r", ' '
+    $text = $text -replace "`n", ' '
+    $text = $text -replace '"', '\"'
+    return '"' + $text + '"'
+}
+
+function Initialize-YamlLog {
+    Ensure-Folder -Path $YamlLogFolder
+
+    $timestamp = Get-Date -Format 'yyyy-MM-dd_HHmmss'
+    $fileName = "$($script:ComputerName)-HPDrivers-$timestamp.yml"
+    $script:YamlLogPath = Join-Path $YamlLogFolder $fileName
+
+    Write-Log "YAML log will be written to: $($script:YamlLogPath)" 'INFO'
+}
+
+function Add-DetectedSoftPaq {
+    param(
+        [string]$Id,
+        [string]$Name,
+        [string]$Version,
+        [string]$Category
+    )
+
+    $script:DetectedSoftPaqs.Add([PSCustomObject]@{
+        Id       = $Id
+        Name     = $Name
+        Version  = $Version
+        Category = $Category
+    }) | Out-Null
+}
+
+function Add-InstalledSoftPaqResult {
+    param(
+        [string]$Id,
+        [string]$Name,
+        [string]$Version,
+        [string]$Status,
+        [string]$Message
+    )
+
+    $script:InstalledSoftPaqResults.Add([PSCustomObject]@{
+        Id      = $Id
+        Name    = $Name
+        Version = $Version
+        Status  = $Status
+        Message = $Message
+    }) | Out-Null
+}
+
+function Write-YamlLog {
+    try {
+        if ([string]::IsNullOrWhiteSpace($script:YamlLogPath)) {
+            Initialize-YamlLog
+        }
+
+        $runEnd = Get-Date
+        $duration = [math]::Round(($runEnd - $script:RunStart).TotalSeconds, 0)
+
+        $yamlLines = New-Object System.Collections.Generic.List[string]
+
+        $yamlLines.Add('computer_name: ' + (ConvertTo-YamlSafeValue $script:ComputerName)) | Out-Null
+        $yamlLines.Add('script_name: "05_Weekend_HP_Drivers_Update.ps1"') | Out-Null
+        $yamlLines.Add('script_version: "1.1"') | Out-Null
+        $yamlLines.Add('run_started: ' + (ConvertTo-YamlSafeValue ($script:RunStart.ToString('yyyy-MM-dd HH:mm:ss')))) | Out-Null
+        $yamlLines.Add('run_finished: ' + (ConvertTo-YamlSafeValue ($runEnd.ToString('yyyy-MM-dd HH:mm:ss')))) | Out-Null
+        $yamlLines.Add('duration_seconds: ' + $duration) | Out-Null
+
+        $yamlLines.Add('options:') | Out-Null
+        $yamlLines.Add('  include_bios: ' + ($(if ($IncludeBIOS) { 'true' } else { 'false' }))) | Out-Null
+        $yamlLines.Add('  include_software: ' + ($(if ($IncludeSoftware) { 'true' } else { 'false' }))) | Out-Null
+        $yamlLines.Add('  suspend_bitlocker_for_bios: ' + ($(if ($SuspendBitLockerForBIOS) { 'true' } else { 'false' }))) | Out-Null
+        $yamlLines.Add('  working_root: ' + (ConvertTo-YamlSafeValue $WorkingRoot)) | Out-Null
+        $yamlLines.Add('  cleanup_retry_count: ' + $CleanupRetryCount) | Out-Null
+        $yamlLines.Add('  cleanup_retry_delay_seconds: ' + $CleanupRetryDelaySeconds) | Out-Null
+
+        $yamlLines.Add('cleanup_successful: ' + ($(if ($script:CleanupResult) { 'true' } else { 'false' }))) | Out-Null
+        $yamlLines.Add('overall_result: ' + (ConvertTo-YamlSafeValue $script:OverallResult)) | Out-Null
+
+        if (-not [string]::IsNullOrWhiteSpace($script:FailureMessage)) {
+            $yamlLines.Add('failure_message: ' + (ConvertTo-YamlSafeValue $script:FailureMessage)) | Out-Null
+        }
+        else {
+            $yamlLines.Add('failure_message: null') | Out-Null
+        }
+
+        $yamlLines.Add('detected_softpaqs:') | Out-Null
+        if ($script:DetectedSoftPaqs.Count -gt 0) {
+            foreach ($item in $script:DetectedSoftPaqs) {
+                $yamlLines.Add('  - id: ' + (ConvertTo-YamlSafeValue $item.Id)) | Out-Null
+                $yamlLines.Add('    name: ' + (ConvertTo-YamlSafeValue $item.Name)) | Out-Null
+                $yamlLines.Add('    version: ' + (ConvertTo-YamlSafeValue $item.Version)) | Out-Null
+                $yamlLines.Add('    category: ' + (ConvertTo-YamlSafeValue $item.Category)) | Out-Null
+            }
+        }
+        else {
+            $yamlLines.Add('  - id: null') | Out-Null
+            $yamlLines.Add('    name: "No applicable HP SoftPaq updates detected"') | Out-Null
+            $yamlLines.Add('    version: null') | Out-Null
+            $yamlLines.Add('    category: null') | Out-Null
+        }
+
+        $yamlLines.Add('install_results:') | Out-Null
+        if ($script:InstalledSoftPaqResults.Count -gt 0) {
+            foreach ($item in $script:InstalledSoftPaqResults) {
+                $yamlLines.Add('  - id: ' + (ConvertTo-YamlSafeValue $item.Id)) | Out-Null
+                $yamlLines.Add('    name: ' + (ConvertTo-YamlSafeValue $item.Name)) | Out-Null
+                $yamlLines.Add('    version: ' + (ConvertTo-YamlSafeValue $item.Version)) | Out-Null
+                $yamlLines.Add('    status: ' + (ConvertTo-YamlSafeValue $item.Status)) | Out-Null
+                $yamlLines.Add('    message: ' + (ConvertTo-YamlSafeValue $item.Message)) | Out-Null
+            }
+        }
+        else {
+            $yamlLines.Add('  - id: null') | Out-Null
+            $yamlLines.Add('    name: "No SoftPaq install operations were performed"') | Out-Null
+            $yamlLines.Add('    version: null') | Out-Null
+            $yamlLines.Add('    status: "None"') | Out-Null
+            $yamlLines.Add('    message: "None"') | Out-Null
+        }
+
+        Set-Content -Path $script:YamlLogPath -Value $yamlLines -Encoding UTF8
+        Write-Log "YAML log written successfully: $($script:YamlLogPath)" 'OK'
+    }
+    catch {
+        Write-Log "Failed to write YAML log: $($_.Exception.Message)" 'WARN'
     }
 }
 
@@ -292,6 +444,12 @@ function Get-DriverList {
     }
 
     foreach ($item in $list) {
+        $category = $null
+        if ($item.PSObject.Properties.Name -contains 'Category') {
+            $category = [string]$item.Category
+        }
+
+        Add-DetectedSoftPaq -Id ([string]$item.Id) -Name ([string]$item.Name) -Version ([string]$item.Version) -Category $category
         Write-Log "Detected: [$($item.Id)] $($item.Name) Version $($item.Version)" 'INFO'
     }
 
@@ -308,9 +466,12 @@ function Install-SoftpaqList {
             Write-Log "Installing SoftPaq [$($item.Id)] $($item.Name)..." 'INFO'
             Get-Softpaq -Number $item.Id -Action SilentInstall | Out-Null
             Write-Log "Installed SoftPaq [$($item.Id)] $($item.Name)." 'OK'
+            Add-InstalledSoftPaqResult -Id ([string]$item.Id) -Name ([string]$item.Name) -Version ([string]$item.Version) -Status 'Succeeded' -Message 'Installed successfully'
         }
         catch {
-            Write-Log "Failed SoftPaq [$($item.Id)] $($item.Name): $($_.Exception.Message)" 'WARN'
+            $msg = $_.Exception.Message
+            Write-Log "Failed SoftPaq [$($item.Id)] $($item.Name): $msg" 'WARN'
+            Add-InstalledSoftPaqResult -Id ([string]$item.Id) -Name ([string]$item.Name) -Version ([string]$item.Version) -Status 'Failed' -Message $msg
             $failures++
         }
     }
@@ -386,8 +547,12 @@ if (-not (Test-IsAdministrator)) {
     exit 1
 }
 
+Initialize-YamlLog
+
 if (-not (Test-IsHPSystem)) {
-    Write-Host "This is not an HP or Hewlett-Packard system. Skipping HP driver update." -ForegroundColor Yellow
+    Write-Log "This is not an HP or Hewlett-Packard system. Skipping HP driver update." 'WARN'
+    $script:OverallResult = 'SkippedNonHPSystem'
+    Write-YamlLog
     exit 0
 }
 
@@ -412,12 +577,16 @@ try {
     $softpaqs = Get-DriverList
     if ($softpaqs.Count -eq 0) {
         $CleanupOk = Remove-WorkingFolderRobust -Path $WorkingRoot -RetryCount $CleanupRetryCount -RetryDelaySeconds $CleanupRetryDelaySeconds
-        exit 0
+        $script:CleanupResult = $CleanupOk
+        $script:OverallResult = if ($CleanupOk) { 'SucceededNoApplicableUpdates' } else { 'SucceededNoApplicableUpdatesCleanupIncomplete' }
+        Write-YamlLog
+        exit $(if ($CleanupOk) { 0 } else { 2 })
     }
 
     $Failures = Install-SoftpaqList -Softpaqs $softpaqs
 }
 catch {
+    $script:FailureMessage = $_.Exception.Message
     Write-Log "Script failed: $($_.Exception.Message)" 'ERROR'
     $Failures++
 }
@@ -436,17 +605,27 @@ finally {
     }
 
     $CleanupOk = Remove-WorkingFolderRobust -Path $WorkingRoot -RetryCount $CleanupRetryCount -RetryDelaySeconds $CleanupRetryDelaySeconds
+    $script:CleanupResult = $CleanupOk
 }
 
 if ($Failures -eq 0 -and $CleanupOk) {
     Write-Log "HP driver update script completed successfully." 'OK'
+    $script:OverallResult = 'Succeeded'
+    Write-YamlLog
     exit 0
 }
 elseif ($Failures -eq 0 -and -not $CleanupOk) {
     Write-Log "HP driver update succeeded, but cleanup was incomplete." 'WARN'
+    $script:OverallResult = 'SucceededCleanupIncomplete'
+    Write-YamlLog
     exit 2
 }
 else {
     Write-Log "HP driver update completed with one or more failures." 'WARN'
+    if ([string]::IsNullOrWhiteSpace($script:FailureMessage)) {
+        $script:FailureMessage = 'One or more SoftPaq installations failed.'
+    }
+    $script:OverallResult = 'Failed'
+    Write-YamlLog
     exit 3
 }
