@@ -1,51 +1,56 @@
-﻿# ScriptVersion: 1.0
+# =====================================================================
+# ScriptName: 07_Force_Reboot_Install_Updates.ps1
+# ScriptVersion: 1.1
 # LastUpdated: 2026-03-23
-
-<#
-.SYNOPSIS
-    Reboots Windows and verifies after startup whether Windows Update / CBS
-    pending reboot flags were cleared.
-
-.DESCRIPTION
-    Designed for Deep Freeze or similar environments where updates are staged
-    during a thawed window and must complete during reboot/startup.
-
-    This script:
-      - DOES NOT clear reboot flags
-      - Detects pre-reboot pending state
-      - Creates a one-time startup scheduled task
-      - Writes a post-boot verification script
-      - Reboots the machine
-      - After boot, verifies whether Windows Update / CBS reboot indicators cleared
-      - Logs all results to disk
-
-.NOTES
-    Run while the machine is still THAWED.
-    Keep the machine thawed through reboot and until Windows finishes processing.
-#>
+# =====================================================================
 
 [CmdletBinding()]
 param(
-    [int]$DelaySeconds = 20,
-    [switch]$ForceReboot = $true,
-    [switch]$WaitForStaging = $true,
-    [int]$StagingWaitSeconds = 60,
-    [int]$PostBootInitialWaitSeconds = 180,
-    [string]$BaseFolder = "$env:ProgramData\UpdateRebootVerifier"
+    [int]$RebootDelaySeconds = 30,
+    [string]$LogDirectory = 'C:\Logs',
+    [string]$StateDirectory = 'C:\ProgramData\MISMaintenance',
+    [string]$StateFileName = '07_Force_Reboot_Install_Updates_State.json'
 )
 
 $ErrorActionPreference = 'Stop'
 
-$LogPath               = Join-Path $BaseFolder 'UpdateRebootVerifier.log'
-$PostBootScriptPath    = Join-Path $BaseFolder 'PostBoot-VerifyUpdateFlags.ps1'
-$PreBootStatePath      = Join-Path $BaseFolder 'PreBoot-State.json'
-$PostBootStatePath     = Join-Path $BaseFolder 'PostBoot-State.json'
-$ResultPath            = Join-Path $BaseFolder 'Verification-Result.txt'
-$TaskName              = 'Verify-WindowsUpdate-Reboot-Completion'
+$script:RunStart = Get-Date
+$script:ComputerName = $env:COMPUTERNAME
+$script:StateFilePath = Join-Path $StateDirectory $StateFileName
+$script:YamlLogPath = $null
+$script:LogFilePath = $null
+$script:CurrentFlags = New-Object System.Collections.Generic.List[object]
+$script:ClearResults = New-Object System.Collections.Generic.List[object]
+$script:OverallResult = 'Unknown'
+$script:FailureMessage = $null
+
+function Ensure-Folder {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        New-Item -Path $Path -ItemType Directory -Force | Out-Null
+    }
+}
+
+function Initialize-Paths {
+    Ensure-Folder -Path $LogDirectory
+    Ensure-Folder -Path $StateDirectory
+
+    $timestamp = $script:RunStart.ToString('yyyy-MM-dd_HH-mm-ss')
+    $baseName = "$($script:ComputerName)-ForceRebootInstallUpdates-$timestamp"
+
+    $script:YamlLogPath = Join-Path $LogDirectory ($baseName + '.yaml')
+    $script:LogFilePath = Join-Path $LogDirectory 'Force-Reboot-Install-Updates.log'
+}
 
 function Write-Log {
     param(
+        [Parameter(Mandatory)]
         [string]$Message,
+
         [ValidateSet('INFO','OK','WARN','ERROR')]
         [string]$Level = 'INFO'
     )
@@ -61,19 +66,15 @@ function Write-Log {
     }
 
     try {
-        if (-not (Test-Path -Path $BaseFolder)) {
-            New-Item -Path $BaseFolder -ItemType Directory -Force | Out-Null
-        }
-        Add-Content -Path $LogPath -Value $line
+        Add-Content -Path $script:LogFilePath -Value $line -Encoding UTF8
     }
     catch {
-        # Do not break execution if logging fails
     }
 }
 
 function Test-IsAdministrator {
     try {
-        $identity  = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
         $principal = New-Object Security.Principal.WindowsPrincipal($identity)
         return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
     }
@@ -82,21 +83,83 @@ function Test-IsAdministrator {
     }
 }
 
-function Test-RegKeyExists {
+function ConvertTo-YamlScalar {
+    param(
+        [AllowNull()]$Value
+    )
+
+    if ($null -eq $Value) {
+        return 'null'
+    }
+
+    if ($Value -is [bool]) {
+        return $Value.ToString().ToLowerInvariant()
+    }
+
+    if ($Value -is [datetime]) {
+        return "'" + $Value.ToString('yyyy-MM-dd HH:mm:ss') + "'"
+    }
+
+    if ($Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal]) {
+        return [string]$Value
+    }
+
+    $text = [string]$Value
+    $text = $text -replace "'", "''"
+    return "'" + $text + "'"
+}
+
+function Add-FlagRecord {
+    param(
+        [string]$Name,
+        [string]$Type,
+        [string]$Path,
+        [string]$ValueName,
+        [string]$Details
+    )
+
+    $script:CurrentFlags.Add([PSCustomObject]@{
+        Name      = $Name
+        Type      = $Type
+        Path      = $Path
+        ValueName = $ValueName
+        Details   = $Details
+    }) | Out-Null
+}
+
+function Add-ClearResult {
+    param(
+        [string]$Name,
+        [string]$Path,
+        [string]$Action,
+        [string]$Status,
+        [string]$Message
+    )
+
+    $script:ClearResults.Add([PSCustomObject]@{
+        Name    = $Name
+        Path    = $Path
+        Action  = $Action
+        Status  = $Status
+        Message = $Message
+    }) | Out-Null
+}
+
+function Test-RegistryKeyExists {
     param(
         [Parameter(Mandatory)]
         [string]$Path
     )
 
     try {
-        return (Test-Path -Path $Path)
+        return (Test-Path -LiteralPath $Path)
     }
     catch {
         return $false
     }
 }
 
-function Get-RegValue {
+function Get-RegistryValueSafe {
     param(
         [Parameter(Mandatory)]
         [string]$Path,
@@ -106,448 +169,389 @@ function Get-RegValue {
     )
 
     try {
-        return (Get-ItemProperty -Path $Path -Name $Name -ErrorAction Stop).$Name
+        $item = Get-ItemProperty -LiteralPath $Path -Name $Name -ErrorAction Stop
+        return $item.$Name
     }
     catch {
         return $null
     }
 }
 
-function Get-PendingRebootState {
-    $result = [ordered]@{
-        Timestamp                         = (Get-Date).ToString('o')
-        CBServicing_RebootPending         = $false
-        CBServicing_RebootInProgress      = $false
-        WindowsUpdate_RebootRequired      = $false
-        SessionManager_PendingFileRename  = $false
-        SessionManager_PendingFileRename2 = $false
-        UpdateExeVolatile                 = $false
-        ComputerNameChangePending         = $false
-        PackagesPending                   = $false
-        WUAU_RebootRequired_COM           = $false
-        AnyPendingReboot                  = $false
-        WindowsUpdatePending              = $false
-        GenericPendingOnly                = $false
+function Get-PendingRebootFlags {
+    $script:CurrentFlags.Clear()
+
+    $wuRebootRequired = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
+    if (Test-RegistryKeyExists -Path $wuRebootRequired) {
+        Add-FlagRecord -Name 'WindowsUpdateRebootRequired' -Type 'RegistryKey' -Path $wuRebootRequired -ValueName '' -Details 'Windows Update indicates a reboot is required.'
     }
 
-    $cbsRebootPending     = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
-    $cbsRebootInProgress  = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootInProgress'
-    $wuRebootRequired     = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
-    $sessionMgr           = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'
-    $updateExeVolatile    = 'HKLM:\SOFTWARE\Microsoft\Updates'
-    $packagesPending      = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\PackagesPending'
-    $activeComputerName   = 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ActiveComputerName'
-    $pendingComputerName  = 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName'
-
-    $result.CBServicing_RebootPending    = Test-RegKeyExists -Path $cbsRebootPending
-    $result.CBServicing_RebootInProgress = Test-RegKeyExists -Path $cbsRebootInProgress
-    $result.WindowsUpdate_RebootRequired = Test-RegKeyExists -Path $wuRebootRequired
-    $result.PackagesPending              = Test-RegKeyExists -Path $packagesPending
-
-    $pendingRename = Get-RegValue -Path $sessionMgr -Name 'PendingFileRenameOperations'
-    if ($null -ne $pendingRename -and $pendingRename.Count -gt 0) {
-        $result.SessionManager_PendingFileRename = $true
+    $wuPostRebootReporting = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\PostRebootReporting'
+    if (Test-RegistryKeyExists -Path $wuPostRebootReporting) {
+        Add-FlagRecord -Name 'WindowsUpdatePostRebootReporting' -Type 'RegistryKey' -Path $wuPostRebootReporting -ValueName '' -Details 'Windows Update post-reboot reporting flag is present.'
     }
 
-    $pendingRename2 = Get-RegValue -Path $sessionMgr -Name 'PendingFileRenameOperations2'
-    if ($null -ne $pendingRename2 -and $pendingRename2.Count -gt 0) {
-        $result.SessionManager_PendingFileRename2 = $true
+    $cbsRebootPending = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
+    if (Test-RegistryKeyExists -Path $cbsRebootPending) {
+        Add-FlagRecord -Name 'CBSRebootPending' -Type 'RegistryKey' -Path $cbsRebootPending -ValueName '' -Details 'Component Based Servicing reports RebootPending.'
     }
 
-    $uev = Get-RegValue -Path $updateExeVolatile -Name 'UpdateExeVolatile'
-    if ($null -ne $uev) {
-        try {
-            if ([int]$uev -ne 0) {
-                $result.UpdateExeVolatile = $true
-            }
+    $cbsRebootInProgress = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootInProgress'
+    if (Test-RegistryKeyExists -Path $cbsRebootInProgress) {
+        Add-FlagRecord -Name 'CBSRebootInProgress' -Type 'RegistryKey' -Path $cbsRebootInProgress -ValueName '' -Details 'Component Based Servicing reports RebootInProgress.'
+    }
+
+    $cbsPackagesPending = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\PackagesPending'
+    if (Test-RegistryKeyExists -Path $cbsPackagesPending) {
+        Add-FlagRecord -Name 'CBSPackagesPending' -Type 'RegistryKey' -Path $cbsPackagesPending -ValueName '' -Details 'Component Based Servicing reports PackagesPending.'
+    }
+
+    $sessionManagerPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'
+    $pendingFileRenameOperations = Get-RegistryValueSafe -Path $sessionManagerPath -Name 'PendingFileRenameOperations'
+    if ($null -ne $pendingFileRenameOperations) {
+        $details = if ($pendingFileRenameOperations -is [System.Array]) {
+            ($pendingFileRenameOperations -join ' | ')
         }
-        catch {
-            if (-not [string]::IsNullOrWhiteSpace([string]$uev)) {
-                $result.UpdateExeVolatile = $true
-            }
+        else {
+            [string]$pendingFileRenameOperations
         }
+
+        Add-FlagRecord -Name 'PendingFileRenameOperations' -Type 'RegistryValue' -Path $sessionManagerPath -ValueName 'PendingFileRenameOperations' -Details $details
     }
 
-    $activeName  = Get-RegValue -Path $activeComputerName -Name 'ComputerName'
-    $pendingName = Get-RegValue -Path $pendingComputerName -Name 'ComputerName'
-    if ($activeName -and $pendingName -and $activeName -ne $pendingName) {
-        $result.ComputerNameChangePending = $true
+    $pendingFileRenameOperations2 = Get-RegistryValueSafe -Path $sessionManagerPath -Name 'PendingFileRenameOperations2'
+    if ($null -ne $pendingFileRenameOperations2) {
+        $details = if ($pendingFileRenameOperations2 -is [System.Array]) {
+            ($pendingFileRenameOperations2 -join ' | ')
+        }
+        else {
+            [string]$pendingFileRenameOperations2
+        }
+
+        Add-FlagRecord -Name 'PendingFileRenameOperations2' -Type 'RegistryValue' -Path $sessionManagerPath -ValueName 'PendingFileRenameOperations2' -Details $details
+    }
+
+    $updatesPath = 'HKLM:\SOFTWARE\Microsoft\Updates'
+    $updateExeVolatile = Get-RegistryValueSafe -Path $updatesPath -Name 'UpdateExeVolatile'
+    if ($null -ne $updateExeVolatile -and [int]$updateExeVolatile -ne 0) {
+        Add-FlagRecord -Name 'UpdateExeVolatile' -Type 'RegistryValue' -Path $updatesPath -ValueName 'UpdateExeVolatile' -Details "Value is $updateExeVolatile"
+    }
+
+    return @($script:CurrentFlags)
+}
+
+function Get-State {
+    if (-not (Test-Path -LiteralPath $script:StateFilePath)) {
+        return [PSCustomObject]@{
+            RebootAttempts = 0
+            FirstSeen      = $null
+            LastRun        = $null
+            LastFlags      = @()
+        }
     }
 
     try {
-        $sysInfo = New-Object -ComObject Microsoft.Update.SystemInfo
-        if ($sysInfo.RebootRequired) {
-            $result.WUAU_RebootRequired_COM = $true
+        $raw = Get-Content -LiteralPath $script:StateFilePath -Raw -Encoding UTF8
+        $obj = $raw | ConvertFrom-Json
+
+        if ($null -eq $obj.RebootAttempts) {
+            $obj | Add-Member -NotePropertyName RebootAttempts -NotePropertyValue 0 -Force
+        }
+        if ($null -eq $obj.LastFlags) {
+            $obj | Add-Member -NotePropertyName LastFlags -NotePropertyValue @() -Force
+        }
+
+        return $obj
+    }
+    catch {
+        Write-Log "State file was unreadable. Resetting state. Error: $($_.Exception.Message)" 'WARN'
+        return [PSCustomObject]@{
+            RebootAttempts = 0
+            FirstSeen      = $null
+            LastRun        = $null
+            LastFlags      = @()
+        }
+    }
+}
+
+function Save-State {
+    param(
+        [Parameter(Mandatory)]
+        [int]$RebootAttempts,
+
+        [AllowNull()]
+        [datetime]$FirstSeen,
+
+        [AllowNull()]
+        [datetime]$LastRun,
+
+        [AllowNull()]
+        [object[]]$LastFlags
+    )
+
+    $state = [ordered]@{
+        RebootAttempts = $RebootAttempts
+        FirstSeen      = if ($FirstSeen) { $FirstSeen.ToString('o') } else { $null }
+        LastRun        = if ($LastRun) { $LastRun.ToString('o') } else { $null }
+        LastFlags      = @($LastFlags)
+    }
+
+    $json = $state | ConvertTo-Json -Depth 6
+    Set-Content -LiteralPath $script:StateFilePath -Value $json -Encoding UTF8
+}
+
+function Reset-State {
+    try {
+        if (Test-Path -LiteralPath $script:StateFilePath) {
+            Remove-Item -LiteralPath $script:StateFilePath -Force -ErrorAction Stop
+            Write-Log "Reset reboot-attempt state." 'OK'
         }
     }
     catch {
-        # Keep silent in this function
+        Write-Log "Failed to reset state file: $($_.Exception.Message)" 'WARN'
     }
-
-    $result.WindowsUpdatePending =
-        $result.WindowsUpdate_RebootRequired -or
-        $result.WUAU_RebootRequired_COM -or
-        $result.CBServicing_RebootPending -or
-        $result.PackagesPending
-
-    $result.AnyPendingReboot =
-        $result.WindowsUpdatePending -or
-        $result.CBServicing_RebootInProgress -or
-        $result.SessionManager_PendingFileRename -or
-        $result.SessionManager_PendingFileRename2 -or
-        $result.UpdateExeVolatile -or
-        $result.ComputerNameChangePending
-
-    $result.GenericPendingOnly =
-        $result.AnyPendingReboot -and -not $result.WindowsUpdatePending
-
-    return [PSCustomObject]$result
 }
 
-function Wait-ForUpdateStaging {
+function Remove-RegistryKeySafe {
     param(
-        [int]$Seconds = 60
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$Path
     )
 
-    Write-Log "Waiting up to $Seconds seconds for update staging activity to settle..." 'INFO'
-
-    $serviceNames = @(
-        'wuauserv',
-        'UsoSvc',
-        'BITS',
-        'TrustedInstaller'
-    )
-
-    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-
-    do {
-        $busyServices = @()
-
-        foreach ($svcName in $serviceNames) {
-            try {
-                $svc = Get-Service -Name $svcName -ErrorAction Stop
-                if ($svc.Status -eq 'Running') {
-                    $busyServices += $svcName
-                }
-            }
-            catch {
-                # Ignore lookup failures
-            }
+    try {
+        if (Test-Path -LiteralPath $Path) {
+            Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+            Add-ClearResult -Name $Name -Path $Path -Action 'RemoveKey' -Status 'Succeeded' -Message 'Registry key removed.'
+            Write-Log "Cleared flag [$Name] by removing key: $Path" 'OK'
         }
-
-        if ($busyServices.Count -eq 0) {
-            Write-Log "Update-related services are not actively running." 'OK'
-            return
+        else {
+            Add-ClearResult -Name $Name -Path $Path -Action 'RemoveKey' -Status 'Skipped' -Message 'Registry key not present.'
+            Write-Log "Flag key already absent for [$Name]: $Path" 'INFO'
         }
-
-        Write-Log "Still seeing update-related service activity: $($busyServices -join ', ')" 'INFO'
-        Start-Sleep -Seconds 5
     }
-    while ($stopwatch.Elapsed.TotalSeconds -lt $Seconds)
-
-    Write-Log "Reached staging wait timeout. Proceeding with reboot." 'WARN'
+    catch {
+        Add-ClearResult -Name $Name -Path $Path -Action 'RemoveKey' -Status 'Failed' -Message $_.Exception.Message
+        Write-Log "Failed to remove key for [$Name]: $($_.Exception.Message)" 'ERROR'
+    }
 }
 
-function Write-PostBootVerifierScript {
-    $scriptContent = @"
-`$ErrorActionPreference = 'Stop'
-
-`$BaseFolder            = '$BaseFolder'
-`$LogPath               = '$LogPath'
-`$PreBootStatePath      = '$PreBootStatePath'
-`$PostBootStatePath     = '$PostBootStatePath'
-`$ResultPath            = '$ResultPath'
-`$TaskName              = '$TaskName'
-`$PostBootInitialWait   = $PostBootInitialWaitSeconds
-
-function Write-Log {
+function Remove-RegistryValueSafe {
     param(
-        [string]`$Message,
-        [ValidateSet('INFO','OK','WARN','ERROR')]
-        [string]`$Level = 'INFO'
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$ValueName
     )
 
     try {
-        if (-not (Test-Path -Path `$BaseFolder)) {
-            New-Item -Path `$BaseFolder -ItemType Directory -Force | Out-Null
-        }
-    }
-    catch {}
-
-    `$timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    `$line = "[`$timestamp] [`$(''{0,-5}'' -f `$Level)] `$Message"
-
-    try { Add-Content -Path `$LogPath -Value `$line } catch {}
-}
-
-function Test-RegKeyExists {
-    param([string]`$Path)
-    try { return (Test-Path -Path `$Path) } catch { return `$false }
-}
-
-function Get-RegValue {
-    param([string]`$Path,[string]`$Name)
-    try { return (Get-ItemProperty -Path `$Path -Name `$Name -ErrorAction Stop).`$Name } catch { return `$null }
-}
-
-function Get-PendingRebootState {
-    `$result = [ordered]@{
-        Timestamp                         = (Get-Date).ToString('o')
-        CBServicing_RebootPending         = `$false
-        CBServicing_RebootInProgress      = `$false
-        WindowsUpdate_RebootRequired      = `$false
-        SessionManager_PendingFileRename  = `$false
-        SessionManager_PendingFileRename2 = `$false
-        UpdateExeVolatile                 = `$false
-        ComputerNameChangePending         = `$false
-        PackagesPending                   = `$false
-        WUAU_RebootRequired_COM           = `$false
-        AnyPendingReboot                  = `$false
-        WindowsUpdatePending              = `$false
-        GenericPendingOnly                = `$false
-    }
-
-    `$cbsRebootPending     = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
-    `$cbsRebootInProgress  = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootInProgress'
-    `$wuRebootRequired     = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
-    `$sessionMgr           = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'
-    `$updateExeVolatile    = 'HKLM:\SOFTWARE\Microsoft\Updates'
-    `$packagesPending      = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\PackagesPending'
-    `$activeComputerName   = 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ActiveComputerName'
-    `$pendingComputerName  = 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName'
-
-    `$result.CBServicing_RebootPending    = Test-RegKeyExists -Path `$cbsRebootPending
-    `$result.CBServicing_RebootInProgress = Test-RegKeyExists -Path `$cbsRebootInProgress
-    `$result.WindowsUpdate_RebootRequired = Test-RegKeyExists -Path `$wuRebootRequired
-    `$result.PackagesPending              = Test-RegKeyExists -Path `$packagesPending
-
-    `$pendingRename = Get-RegValue -Path `$sessionMgr -Name 'PendingFileRenameOperations'
-    if (`$null -ne `$pendingRename -and `$pendingRename.Count -gt 0) {
-        `$result.SessionManager_PendingFileRename = `$true
-    }
-
-    `$pendingRename2 = Get-RegValue -Path `$sessionMgr -Name 'PendingFileRenameOperations2'
-    if (`$null -ne `$pendingRename2 -and `$pendingRename2.Count -gt 0) {
-        `$result.SessionManager_PendingFileRename2 = `$true
-    }
-
-    `$uev = Get-RegValue -Path `$updateExeVolatile -Name 'UpdateExeVolatile'
-    if (`$null -ne `$uev) {
-        try {
-            if ([int]`$uev -ne 0) { `$result.UpdateExeVolatile = `$true }
-        }
-        catch {
-            if (-not [string]::IsNullOrWhiteSpace([string]`$uev)) {
-                `$result.UpdateExeVolatile = `$true
+        if (Test-Path -LiteralPath $Path) {
+            $currentValue = Get-RegistryValueSafe -Path $Path -Name $ValueName
+            if ($null -ne $currentValue) {
+                Remove-ItemProperty -LiteralPath $Path -Name $ValueName -ErrorAction Stop
+                Add-ClearResult -Name $Name -Path "$Path\$ValueName" -Action 'RemoveValue' -Status 'Succeeded' -Message 'Registry value removed.'
+                Write-Log "Cleared flag [$Name] by removing value: $Path\$ValueName" 'OK'
+            }
+            else {
+                Add-ClearResult -Name $Name -Path "$Path\$ValueName" -Action 'RemoveValue' -Status 'Skipped' -Message 'Registry value not present.'
+                Write-Log "Flag value already absent for [$Name]: $Path\$ValueName" 'INFO'
             }
         }
-    }
-
-    `$activeName  = Get-RegValue -Path `$activeComputerName -Name 'ComputerName'
-    `$pendingName = Get-RegValue -Path `$pendingComputerName -Name 'ComputerName'
-    if (`$activeName -and `$pendingName -and `$activeName -ne `$pendingName) {
-        `$result.ComputerNameChangePending = `$true
-    }
-
-    try {
-        `$sysInfo = New-Object -ComObject Microsoft.Update.SystemInfo
-        if (`$sysInfo.RebootRequired) {
-            `$result.WUAU_RebootRequired_COM = `$true
+        else {
+            Add-ClearResult -Name $Name -Path "$Path\$ValueName" -Action 'RemoveValue' -Status 'Skipped' -Message 'Registry path not present.'
+            Write-Log "Registry path absent for [$Name]: $Path" 'INFO'
         }
     }
-    catch {}
-
-    `$result.WindowsUpdatePending =
-        `$result.WindowsUpdate_RebootRequired -or
-        `$result.WUAU_RebootRequired_COM -or
-        `$result.CBServicing_RebootPending -or
-        `$result.PackagesPending
-
-    `$result.AnyPendingReboot =
-        `$result.WindowsUpdatePending -or
-        `$result.CBServicing_RebootInProgress -or
-        `$result.SessionManager_PendingFileRename -or
-        `$result.SessionManager_PendingFileRename2 -or
-        `$result.UpdateExeVolatile -or
-        `$result.ComputerNameChangePending
-
-    `$result.GenericPendingOnly =
-        `$result.AnyPendingReboot -and -not `$result.WindowsUpdatePending
-
-    return [PSCustomObject]`$result
-}
-
-function Wait-ForServicesToSettle {
-    param([int]`$MaxSeconds = 300)
-
-    Write-Log "Post-boot verifier waiting `$PostBootInitialWait second(s) before checking state..." 'INFO'
-    Start-Sleep -Seconds `$PostBootInitialWait
-
-    `$serviceNames = @('wuauserv','UsoSvc','BITS','TrustedInstaller')
-    `$sw = [System.Diagnostics.Stopwatch]::StartNew()
-
-    do {
-        `$busy = @()
-
-        foreach (`$svcName in `$serviceNames) {
-            try {
-                `$svc = Get-Service -Name `$svcName -ErrorAction Stop
-                if (`$svc.Status -eq 'Running') {
-                    `$busy += `$svcName
-                }
-            }
-            catch {}
-        }
-
-        if (`$busy.Count -eq 0) {
-            Write-Log "Post-boot verifier sees no active update-related services." 'OK'
-            return
-        }
-
-        Write-Log "Post-boot verifier still sees service activity: `$(`$busy -join ', ')" 'INFO'
-        Start-Sleep -Seconds 10
-    }
-    while (`$sw.Elapsed.TotalSeconds -lt `$MaxSeconds)
-
-    Write-Log "Post-boot verifier timeout reached; proceeding with current state evaluation." 'WARN'
-}
-
-try {
-    Write-Log "Post-boot verification started." 'INFO'
-    Wait-ForServicesToSettle -MaxSeconds 300
-
-    `$postState = Get-PendingRebootState
-    `$postState | ConvertTo-Json -Depth 5 | Set-Content -Path `$PostBootStatePath -Encoding UTF8
-
-    `$success = -not `$postState.WindowsUpdatePending
-
-    if (`$success) {
-        Write-Log "SUCCESS: Windows Update / CBS-specific pending reboot flags are no longer present after reboot." 'OK'
-        "SUCCESS" | Set-Content -Path `$ResultPath -Encoding UTF8
-    }
-    else {
-        Write-Log "FAILURE: Windows Update / CBS-specific pending reboot flags are still present after reboot." 'ERROR'
-        "FAILURE" | Set-Content -Path `$ResultPath -Encoding UTF8
-    }
-
-    if (`$postState.GenericPendingOnly) {
-        Write-Log "INFO: Some generic reboot indicators remain, but not Windows Update / CBS-specific ones." 'WARN'
+    catch {
+        Add-ClearResult -Name $Name -Path "$Path\$ValueName" -Action 'RemoveValue' -Status 'Failed' -Message $_.Exception.Message
+        Write-Log "Failed to remove value for [$Name]: $($_.Exception.Message)" 'ERROR'
     }
 }
-catch {
-    Write-Log "Post-boot verification error: `$(`$_.Exception.Message)" 'ERROR'
-    "ERROR" | Set-Content -Path `$ResultPath -Encoding UTF8
-}
-finally {
-    try {
-        Unregister-ScheduledTask -TaskName `$TaskName -Confirm:`$false -ErrorAction SilentlyContinue | Out-Null
-        Write-Log "Removed startup verification task." 'INFO'
-    }
-    catch {}
-}
-"@
 
-    Set-Content -Path $PostBootScriptPath -Value $scriptContent -Encoding UTF8 -Force
-    Write-Log "Wrote post-boot verifier script: $PostBootScriptPath" 'OK'
-}
-
-function Register-PostBootTask {
-    Write-Log "Registering startup scheduled task: $TaskName" 'INFO'
-
-    try {
-        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
-    }
-    catch {}
-
-    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$PostBootScriptPath`""
-    $trigger = New-ScheduledTaskTrigger -AtStartup
-    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -RunLevel Highest
-    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances Ignore
-
-    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
-    Write-Log "Startup scheduled task registered successfully." 'OK'
-}
-
-function Invoke-ImmediateReboot {
+function Set-RegistryValueSafe {
     param(
-        [int]$Delay = 20,
-        [bool]$Force = $true
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$ValueName,
+        [Parameter(Mandatory)]$Value,
+        [Parameter(Mandatory)][string]$Type
     )
 
-    $comment = 'Restarting to allow pending Windows Update and servicing operations to complete while system remains thawed.'
+    try {
+        if (-not (Test-Path -LiteralPath $Path)) {
+            New-Item -Path $Path -Force | Out-Null
+        }
 
-    $arguments = @(
-        '/r'
-        '/t', $Delay.ToString()
-        '/d', 'p:2:17'
-        '/c', "`"$comment`""
-    )
-
-    if ($Force) {
-        $arguments += '/f'
+        New-ItemProperty -LiteralPath $Path -Name $ValueName -PropertyType $Type -Value $Value -Force | Out-Null
+        Add-ClearResult -Name $Name -Path "$Path\$ValueName" -Action 'SetValue' -Status 'Succeeded' -Message "Set to $Value."
+        Write-Log "Set value for [$Name]: $Path\$ValueName = $Value" 'OK'
     }
-
-    Write-Log "Issuing reboot command: shutdown.exe $($arguments -join ' ')" 'INFO'
-
-    & "$env:SystemRoot\System32\shutdown.exe" @arguments
-
-    $shutdownExitCode = $LASTEXITCODE
-    if ($shutdownExitCode -ne 0) {
-        throw "shutdown.exe returned exit code $shutdownExitCode"
+    catch {
+        Add-ClearResult -Name $Name -Path "$Path\$ValueName" -Action 'SetValue' -Status 'Failed' -Message $_.Exception.Message
+        Write-Log "Failed setting value for [$Name]: $($_.Exception.Message)" 'ERROR'
     }
 }
+
+function Clear-PendingRebootFlags {
+    Write-Log "Attempting to clear reboot-pending flags..." 'INFO'
+    $script:ClearResults.Clear()
+
+    Remove-RegistryKeySafe -Name 'WindowsUpdateRebootRequired'      -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
+    Remove-RegistryKeySafe -Name 'WindowsUpdatePostRebootReporting' -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\PostRebootReporting'
+    Remove-RegistryKeySafe -Name 'CBSRebootPending'                 -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
+    Remove-RegistryKeySafe -Name 'CBSRebootInProgress'              -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootInProgress'
+    Remove-RegistryKeySafe -Name 'CBSPackagesPending'               -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\PackagesPending'
+
+    Remove-RegistryValueSafe -Name 'PendingFileRenameOperations'  -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -ValueName 'PendingFileRenameOperations'
+    Remove-RegistryValueSafe -Name 'PendingFileRenameOperations2' -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -ValueName 'PendingFileRenameOperations2'
+
+    Set-RegistryValueSafe -Name 'UpdateExeVolatile' -Path 'HKLM:\SOFTWARE\Microsoft\Updates' -ValueName 'UpdateExeVolatile' -Value 0 -Type DWord
+
+    return @($script:ClearResults)
+}
+
+function Write-YamlLog {
+    param(
+        [Parameter(Mandatory)]
+        [int]$RebootAttemptsBeforeClear,
+
+        [AllowNull()]
+        [object[]]$FlagsBeforeClear,
+
+        [AllowNull()]
+        [object[]]$ClearResults
+    )
+
+    try {
+        $runEnd = Get-Date
+        $duration = [math]::Round(($runEnd - $script:RunStart).TotalSeconds, 0)
+
+        $lines = New-Object System.Collections.Generic.List[string]
+
+        $lines.Add("computer_name: $(ConvertTo-YamlScalar $script:ComputerName)") | Out-Null
+        $lines.Add("script_name: '07_Force_Reboot_Install_Updates.ps1'") | Out-Null
+        $lines.Add("script_version: '1.1'") | Out-Null
+        $lines.Add("run_started: $(ConvertTo-YamlScalar $script:RunStart)") | Out-Null
+        $lines.Add("run_finished: $(ConvertTo-YamlScalar $runEnd)") | Out-Null
+        $lines.Add("duration_seconds: $duration") | Out-Null
+        $lines.Add("reboot_attempts_before_clear: $RebootAttemptsBeforeClear") | Out-Null
+        $lines.Add("overall_result: $(ConvertTo-YamlScalar $script:OverallResult)") | Out-Null
+        $lines.Add("failure_message: $(ConvertTo-YamlScalar $script:FailureMessage)") | Out-Null
+        $lines.Add('') | Out-Null
+
+        $lines.Add('flags_still_present_before_clear:') | Out-Null
+        if ($FlagsBeforeClear -and @($FlagsBeforeClear).Count -gt 0) {
+            foreach ($flag in $FlagsBeforeClear) {
+                $lines.Add('  -') | Out-Null
+                $lines.Add("    name: $(ConvertTo-YamlScalar $flag.Name)") | Out-Null
+                $lines.Add("    type: $(ConvertTo-YamlScalar $flag.Type)") | Out-Null
+                $lines.Add("    path: $(ConvertTo-YamlScalar $flag.Path)") | Out-Null
+                $lines.Add("    value_name: $(ConvertTo-YamlScalar $flag.ValueName)") | Out-Null
+                $lines.Add("    details: $(ConvertTo-YamlScalar $flag.Details)") | Out-Null
+            }
+        }
+        else {
+            $lines.Add('  []') | Out-Null
+        }
+
+        $lines.Add('') | Out-Null
+        $lines.Add('clear_actions:') | Out-Null
+        if ($ClearResults -and @($ClearResults).Count -gt 0) {
+            foreach ($item in $ClearResults) {
+                $lines.Add('  -') | Out-Null
+                $lines.Add("    name: $(ConvertTo-YamlScalar $item.Name)") | Out-Null
+                $lines.Add("    path: $(ConvertTo-YamlScalar $item.Path)") | Out-Null
+                $lines.Add("    action: $(ConvertTo-YamlScalar $item.Action)") | Out-Null
+                $lines.Add("    status: $(ConvertTo-YamlScalar $item.Status)") | Out-Null
+                $lines.Add("    message: $(ConvertTo-YamlScalar $item.Message)") | Out-Null
+            }
+        }
+        else {
+            $lines.Add('  []') | Out-Null
+        }
+
+        Set-Content -Path $script:YamlLogPath -Value $lines -Encoding UTF8
+        Write-Log "YAML log written: $($script:YamlLogPath)" 'OK'
+    }
+    catch {
+        Write-Log "Failed to write YAML log: $($_.Exception.Message)" 'ERROR'
+    }
+}
+
+function Invoke-ForcedReboot {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Reason
+    )
+
+    Write-Log "Issuing forced reboot in $RebootDelaySeconds seconds. Reason: $Reason" 'WARN'
+
+    & shutdown.exe /r /f /t $RebootDelaySeconds /c $Reason | Out-Null
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "shutdown.exe returned exit code $LASTEXITCODE"
+    }
+
+    exit 3010
+}
+
+# Main
+Initialize-Paths
 
 if (-not (Test-IsAdministrator)) {
-    throw "This script must be run as Administrator."
+    Write-Error "Please run this script as Administrator."
+    exit 1
 }
 
-if (-not (Test-Path -Path $BaseFolder)) {
-    New-Item -Path $BaseFolder -ItemType Directory -Force | Out-Null
-}
-
-Write-Log "Initializing script..." 'INFO'
-Write-Log "Checking pending reboot and Windows Update servicing state..." 'INFO'
-
-$preState = Get-PendingRebootState
-$preState | ConvertTo-Json -Depth 5 | Set-Content -Path $PreBootStatePath -Encoding UTF8
-
-$preState | Format-List | Out-String | ForEach-Object {
-    $_.TrimEnd() -split "`r?`n" | ForEach-Object {
-        if ($_ -match '\S') {
-            Write-Host $_ -ForegroundColor Gray
-            try { Add-Content -Path $LogPath -Value $_ } catch {}
-        }
-    }
-}
-
-if ($preState.WindowsUpdatePending) {
-    Write-Log "Windows Update / CBS indicates a reboot is pending to complete servicing." 'OK'
-}
-elseif ($preState.GenericPendingOnly) {
-    Write-Log "A reboot is pending, but it is not clearly Windows Update-specific." 'WARN'
-}
-else {
-    Write-Log "No pending reboot indicators were detected." 'WARN'
-}
-
-if ($WaitForStaging) {
-    Wait-ForUpdateStaging -Seconds $StagingWaitSeconds
-}
-
-Write-PostBootVerifierScript
-Register-PostBootTask
-
-Write-Log "IMPORTANT: This script does NOT clear Windows Update, CBS, or PendingFileRename reboot flags." 'INFO'
-Write-Log "The post-boot verifier will log whether Windows Update / CBS reboot flags cleared after startup." 'INFO'
-Write-Log "Rebooting now..." 'INFO'
+Write-Log "Starting reboot-flag evaluation..." 'INFO'
 
 try {
-    Invoke-ImmediateReboot -Delay $DelaySeconds -Force:$ForceReboot
+    $state = Get-State
+    $flags = Get-PendingRebootFlags
+
+    if (@($flags).Count -eq 0) {
+        Write-Log "No reboot-pending flags detected." 'OK'
+        Reset-State
+        $script:OverallResult = 'NoFlagsPresent'
+        exit 0
+    }
+
+    Write-Log "Detected $(@($flags).Count) reboot-pending flag(s)." 'WARN'
+    foreach ($flag in $flags) {
+        Write-Log "Flag detected: $($flag.Name) | $($flag.Path) $($flag.ValueName) | $($flag.Details)" 'WARN'
+    }
+
+    $attempts = [int]$state.RebootAttempts
+
+    if ($attempts -lt 1) {
+        $firstSeen = if ($state.FirstSeen) { [datetime]$state.FirstSeen } else { Get-Date }
+        Save-State -RebootAttempts 1 -FirstSeen $firstSeen -LastRun (Get-Date) -LastFlags $flags
+        $script:OverallResult = 'RebootIssuedAttempt1'
+        Invoke-ForcedReboot -Reason 'Pending reboot flags detected after update process. Reboot attempt 1 of 2.'
+    }
+    elseif ($attempts -lt 2) {
+        $firstSeen = if ($state.FirstSeen) { [datetime]$state.FirstSeen } else { Get-Date }
+        Save-State -RebootAttempts 2 -FirstSeen $firstSeen -LastRun (Get-Date) -LastFlags $flags
+        $script:OverallResult = 'RebootIssuedAttempt2'
+        Invoke-ForcedReboot -Reason 'Pending reboot flags remain after first reboot. Reboot attempt 2 of 2.'
+    }
+    else {
+        Write-Log "Flags still present after two reboot attempts. Writing YAML log and clearing flags." 'ERROR'
+        $script:OverallResult = 'FlagsPersistedAfterTwoReboots'
+
+        $clearResults = Clear-PendingRebootFlags
+        Write-YamlLog -RebootAttemptsBeforeClear $attempts -FlagsBeforeClear $flags -ClearResults $clearResults
+
+        Reset-State
+        Write-Log "Persistent reboot flags were logged and clear actions were attempted." 'WARN'
+        exit 2
+    }
 }
 catch {
-    Write-Log "Failed to issue reboot command: $($_.Exception.Message)" 'ERROR'
-    exit 2
+    $script:FailureMessage = $_.Exception.Message
+    $script:OverallResult = 'Failed'
+    Write-Log "Script failed: $($_.Exception.Message)" 'ERROR'
+    try {
+        Write-YamlLog -RebootAttemptsBeforeClear 0 -FlagsBeforeClear $script:CurrentFlags -ClearResults $script:ClearResults
+    }
+    catch {
+    }
+    exit 3
 }
-
-Write-Log "If you are seeing this message, the reboot command may have been blocked or delayed." 'WARN'
-exit 0
