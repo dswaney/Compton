@@ -1,5 +1,8 @@
-﻿# ScriptVersion: 1.0
+# =====================================================================
+# ScriptName: 02_Remove_User_Profiles.ps1
+# ScriptVersion: 1.1
 # LastUpdated: 2026-03-23
+# =====================================================================
 
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
 param(
@@ -28,7 +31,7 @@ $ErrorActionPreference = 'Stop'
 $script:RunStart = Get-Date
 $script:ComputerName = $env:COMPUTERNAME
 $script:TimestampForFile = $script:RunStart.ToString('yyyy-MM-dd_HH-mm-ss')
-$script:BaseFileName = "{0}_{1}_RemoveUserProfiles" -f $script:ComputerName, $script:TimestampForFile
+$script:BaseFileName = "{0}-RemoveUserProfiles-{1}" -f $script:ComputerName, $script:TimestampForFile
 $script:YamlLogPath = Join-Path $LogDirectory ($script:BaseFileName + '.yaml')
 
 $script:Summary = [ordered]@{
