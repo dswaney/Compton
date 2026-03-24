@@ -1,5 +1,12 @@
-﻿# ScriptVersion: 1.1
+# =====================================================================
+# ScriptName: 01_Enable_Windows_Update_Services.ps1
+# ScriptVersion: 1.2
 # LastUpdated: 2026-03-23
+# Purpose: Restore Windows Update services, tasks, and policy settings
+#          on Windows 11, verify required services are running, retry
+#          startup failures up to 4 total attempts, and force a reboot
+#          if critical services still refuse to start.
+# =====================================================================
 
 [CmdletBinding()]
 param()
@@ -95,6 +102,108 @@ function Set-ServiceStartupAndStart {
     }
 }
 
+function Get-ServiceStateSafe {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Name
+    )
+
+    try {
+        return (Get-Service -Name $Name -ErrorAction Stop).Status
+    }
+    catch {
+        return $null
+    }
+}
+
+function Wait-ForServiceRunning {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Name,
+
+        [int]$TimeoutSeconds = 15
+    )
+
+    $stopWatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+    while ($stopWatch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
+        $status = Get-ServiceStateSafe -Name $Name
+        if ($status -eq 'Running') {
+            return $true
+        }
+
+        Start-Sleep -Seconds 2
+    }
+
+    return $false
+}
+
+function Ensure-ServiceRunningWithRetry {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Name,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('Automatic','Manual')]
+        [string]$StartupType,
+
+        [int]$MaxAttempts = 4,
+
+        [int]$WaitPerAttemptSeconds = 15
+    )
+
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        $currentState = Get-ServiceStateSafe -Name $Name
+
+        if ($currentState -eq 'Running') {
+            Write-Status "Service $Name is already running." 'OK'
+            return $true
+        }
+
+        Write-Status "Attempt $attempt of $MaxAttempts to start service $Name..." 'INFO'
+
+        try {
+            Set-ServiceStartupAndStart -Name $Name -StartupType $StartupType
+        }
+        catch {
+            Write-Status "Unexpected error while attempting to start $Name : $($_.Exception.Message)" 'WARN'
+        }
+
+        if (Wait-ForServiceRunning -Name $Name -TimeoutSeconds $WaitPerAttemptSeconds) {
+            Write-Status "Verified service is running: $Name" 'OK'
+            return $true
+        }
+
+        $stateAfterWait = Get-ServiceStateSafe -Name $Name
+        Write-Status "Service $Name did not reach Running state after attempt $attempt. Current state: $stateAfterWait" 'WARN'
+
+        if ($attempt -lt $MaxAttempts) {
+            Start-Sleep -Seconds 5
+        }
+    }
+
+    Write-Status "Service $Name failed to reach Running state after $MaxAttempts attempts." 'ERROR'
+    return $false
+}
+
+function Force-RebootNow {
+    param(
+        [string]$Reason = 'Required Windows Update services failed to start after multiple attempts.'
+    )
+
+    Write-Status "FORCING REBOOT: $Reason" 'ERROR'
+
+    try {
+        shutdown.exe /r /f /t 30 /c "$Reason" | Out-Null
+        Write-Status "Forced reboot command issued successfully. System will restart in 30 seconds." 'ERROR'
+    }
+    catch {
+        Write-Status "Failed to issue shutdown.exe reboot command: $($_.Exception.Message)" 'ERROR'
+    }
+
+    exit 1
+}
+
 function Enable-ScheduledTaskSafe {
     param(
         [Parameter(Mandatory)]
@@ -185,17 +294,17 @@ Write-Status "Initializing script..." 'INFO'
 # Common defaults used for Windows Update-related services:
 # wuauserv = Manual (3)
 # bits = Manual (3)
-# dosvc = Automatic Delayed/Automatic family; registry restore to Automatic (2)
+# dosvc = Automatic family (2)
 # UsoSvc = Automatic (2)
-# WaaSMedicSvc = Manual/triggered on many systems; registry restore to Manual (3)
+# WaaSMedicSvc = Manual/triggered on many systems (3)
 
-Set-ServiceStartRegistry -ServiceName 'wuauserv'    -StartValue 3
-Set-ServiceStartRegistry -ServiceName 'bits'        -StartValue 3
-Set-ServiceStartRegistry -ServiceName 'dosvc'       -StartValue 2
-Set-ServiceStartRegistry -ServiceName 'UsoSvc'      -StartValue 2
+Set-ServiceStartRegistry -ServiceName 'wuauserv'     -StartValue 3
+Set-ServiceStartRegistry -ServiceName 'bits'         -StartValue 3
+Set-ServiceStartRegistry -ServiceName 'dosvc'        -StartValue 2
+Set-ServiceStartRegistry -ServiceName 'UsoSvc'       -StartValue 2
 Set-ServiceStartRegistry -ServiceName 'WaaSMedicSvc' -StartValue 3
 
-# Restore service startup and start the key update services
+# Initial restore and startup
 Set-ServiceStartupAndStart -Name 'wuauserv' -StartupType Manual
 Set-ServiceStartupAndStart -Name 'bits'     -StartupType Manual
 Set-ServiceStartupAndStart -Name 'dosvc'    -StartupType Automatic
@@ -222,10 +331,8 @@ catch {
 $wuPolicyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
 $auPolicyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'
 
-# Either remove the policy values entirely or set them to enabled defaults.
-# This script sets explicit values for clarity:
 Set-RegistryDwordSafe -Path $auPolicyPath -Name 'NoAutoUpdate' -Value 0
-Set-RegistryDwordSafe -Path $auPolicyPath -Name 'AUOptions' -Value 3
+Set-RegistryDwordSafe -Path $auPolicyPath -Name 'AUOptions'    -Value 3
 
 # Remove common WSUS redirection values if they were previously set
 Remove-RegistryValueSafe -Path $wuPolicyPath -Name 'WUServer'
@@ -263,5 +370,28 @@ foreach ($svc in $restartOrder) {
     }
 }
 
-Write-Status "Windows Update settings have been restored." 'OK'
-Write-Status "A reboot is recommended, then check Settings > Windows Update." 'INFO'
+# Verify and retry critical services
+$requiredServices = @(
+    @{ Name = 'wuauserv'; StartupType = 'Manual' },
+    @{ Name = 'bits';     StartupType = 'Manual' },
+    @{ Name = 'dosvc';    StartupType = 'Automatic' },
+    @{ Name = 'UsoSvc';   StartupType = 'Automatic' }
+)
+
+$failedServices = @()
+
+foreach ($requiredService in $requiredServices) {
+    $serviceStarted = Ensure-ServiceRunningWithRetry -Name $requiredService.Name -StartupType $requiredService.StartupType -MaxAttempts 4 -WaitPerAttemptSeconds 15
+    if (-not $serviceStarted) {
+        $failedServices += $requiredService.Name
+    }
+}
+
+if ($failedServices.Count -gt 0) {
+    $failedList = $failedServices -join ', '
+    Write-Status "One or more critical Windows Update services failed to start: $failedList" 'ERROR'
+    Force-RebootNow -Reason "Windows Update service recovery failed. Services not running: $failedList"
+}
+
+Write-Status "Windows Update settings have been restored and critical services are running." 'OK'
+Write-Status "No reboot required. Continuing normally." 'INFO'
