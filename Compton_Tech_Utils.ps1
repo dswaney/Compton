@@ -3380,7 +3380,7 @@ function Show-Menu {
     Write-Host "17. Install Computer Lab Scheduled Tasks" -ForegroundColor White
     Write-Host "18. Set OneDrive Auto Login on Boot" -ForegroundColor White
     Write-Host "19. Run Full System Updates" -ForegroundColor White
-    Write-Host "20. Network Diag & Repair" -ForegroundColor White
+    Write-Host "20. Network Diag and Repair" -ForegroundColor White
     Write-Host "Q.  Exit" -ForegroundColor Red
 
     Write-Host ""
