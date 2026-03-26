@@ -1,10 +1,10 @@
 # =====================================================================
 # ScriptName: 06_Weekend_Windows_Updates.ps1
-# ScriptVersion: 1.3
-# LastUpdated: 2026-03-24
+# ScriptVersion: 1.4
+# LastUpdated: 2026-03-26
 # Purpose: Installs Windows Updates using PSWindowsUpdate, writes a
-#          standard log and a YAML audit log in C:\Logs, and explicitly
-#          reboots if Windows reports that a reboot is required.
+#          YAML audit log in C:\Logs, and explicitly reboots if Windows
+#          reports that a reboot is required.
 # =====================================================================
 
 [CmdletBinding()]
@@ -12,20 +12,20 @@ param(
     [switch]$ResetWUComponentsFirst = $false,
     [int]$OperationTimeoutSeconds = 1800,
     [int]$RebootDelaySeconds = 30,
-    [string]$LogPath = "$env:SystemDrive\Logs\Weekend-Windows-Updates.log",
     [string]$YamlLogFolder = "$env:SystemDrive\Logs"
 )
 
 $ErrorActionPreference = 'Stop'
 
-$script:RunStart       = Get-Date
-$script:ComputerName   = $env:COMPUTERNAME
-$script:YamlLogPath    = $null
-$script:UpdateEntries  = New-Object System.Collections.Generic.List[object]
-$script:RawUpdateLines = New-Object System.Collections.Generic.List[string]
-$script:OverallResult  = 'Unknown'
-$script:RebootRequired = $false
-$script:FailureMessage = $null
+$script:RunStart        = Get-Date
+$script:ComputerName    = $env:COMPUTERNAME
+$script:YamlLogPath     = $null
+$script:UpdateEntries   = New-Object System.Collections.Generic.List[object]
+$script:RawUpdateLines  = New-Object System.Collections.Generic.List[string]
+$script:ActionHistory   = New-Object System.Collections.Generic.List[object]
+$script:OverallResult   = 'Unknown'
+$script:RebootRequired  = $false
+$script:FailureMessage  = $null
 
 function Write-Log {
     param(
@@ -44,16 +44,11 @@ function Write-Log {
         'ERROR' { Write-Host $line -ForegroundColor Red }
     }
 
-    try {
-        $logDir = Split-Path -Path $LogPath -Parent
-        if (-not [string]::IsNullOrWhiteSpace($logDir) -and -not (Test-Path -Path $logDir)) {
-            New-Item -Path $logDir -ItemType Directory -Force | Out-Null
-        }
-        Add-Content -Path $LogPath -Value $line
-    }
-    catch {
-        # Do not fail script because logging failed
-    }
+    $script:ActionHistory.Add([PSCustomObject]@{
+        Time    = $timestamp
+        Level   = $Level
+        Message = $Message
+    }) | Out-Null
 }
 
 function Test-IsAdministrator {
@@ -86,6 +81,14 @@ function ConvertTo-YamlSafeValue {
 
     if ($null -eq $Value) {
         return 'null'
+    }
+
+    if ($Value -is [bool]) {
+        return $Value.ToString().ToLowerInvariant()
+    }
+
+    if ($Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal]) {
+        return [string]$Value
     }
 
     $text = [string]$Value
@@ -217,22 +220,25 @@ function Write-YamlLog {
 
         $yamlLines.Add('computer_name: ' + (ConvertTo-YamlSafeValue $script:ComputerName)) | Out-Null
         $yamlLines.Add('script_name: "06_Weekend_Windows_Updates.ps1"') | Out-Null
-        $yamlLines.Add('script_version: "1.3"') | Out-Null
+        $yamlLines.Add('script_version: "1.4"') | Out-Null
         $yamlLines.Add('run_started: ' + (ConvertTo-YamlSafeValue ($script:RunStart.ToString('yyyy-MM-dd HH:mm:ss')))) | Out-Null
         $yamlLines.Add('run_finished: ' + (ConvertTo-YamlSafeValue ($runEnd.ToString('yyyy-MM-dd HH:mm:ss')))) | Out-Null
         $yamlLines.Add('duration_seconds: ' + $duration) | Out-Null
+        $yamlLines.Add('yaml_log_path: ' + (ConvertTo-YamlSafeValue $script:YamlLogPath)) | Out-Null
         $yamlLines.Add('reset_wu_components_first: ' + ($(if ($ResetWUComponentsFirst) { 'true' } else { 'false' }))) | Out-Null
+        $yamlLines.Add('operation_timeout_seconds: ' + $OperationTimeoutSeconds) | Out-Null
+        $yamlLines.Add('reboot_delay_seconds: ' + $RebootDelaySeconds) | Out-Null
         $yamlLines.Add('reboot_required: ' + ($(if ($script:RebootRequired) { 'true' } else { 'false' }))) | Out-Null
         $yamlLines.Add('overall_result: ' + (ConvertTo-YamlSafeValue $script:OverallResult)) | Out-Null
 
         if (-not [string]::IsNullOrWhiteSpace($script:FailureMessage)) {
             $yamlLines.Add('failure_message: ' + (ConvertTo-YamlSafeValue $script:FailureMessage)) | Out-Null
-        } else {
+        }
+        else {
             $yamlLines.Add('failure_message: null') | Out-Null
         }
 
         $yamlLines.Add('updates:') | Out-Null
-
         if ($script:UpdateEntries.Count -gt 0) {
             foreach ($entry in $script:UpdateEntries) {
                 $yamlLines.Add('  - title: '  + (ConvertTo-YamlSafeValue $entry.Title))  | Out-Null
@@ -262,11 +268,22 @@ function Write-YamlLog {
             $yamlLines.Add('  - "No raw update output captured"') | Out-Null
         }
 
+        $yamlLines.Add('actions:') | Out-Null
+        if ($script:ActionHistory.Count -gt 0) {
+            foreach ($action in $script:ActionHistory) {
+                $yamlLines.Add('  - time: ' + (ConvertTo-YamlSafeValue $action.Time)) | Out-Null
+                $yamlLines.Add('    level: ' + (ConvertTo-YamlSafeValue $action.Level)) | Out-Null
+                $yamlLines.Add('    message: ' + (ConvertTo-YamlSafeValue $action.Message)) | Out-Null
+            }
+        }
+        else {
+            $yamlLines.Add('  - "No actions recorded"') | Out-Null
+        }
+
         Set-Content -Path $script:YamlLogPath -Value $yamlLines -Encoding UTF8
-        Write-Log "YAML log written successfully: $($script:YamlLogPath)" 'OK'
     }
     catch {
-        Write-Log "Failed to write YAML log: $($_.Exception.Message)" 'WARN'
+        Write-Warning "Failed to write YAML log: $($_.Exception.Message)"
     }
 }
 
@@ -324,7 +341,22 @@ function Install-AvailableWindowsUpdates {
         throw "Install-WindowsUpdate command was not found."
     }
 
-    $results = Install-WindowsUpdate -MicrosoftUpdate -AcceptAll -IgnoreReboot -Verbose *>&1
+    $job = Start-Job -ScriptBlock {
+        param($ResetModulePath)
+        Import-Module PSWindowsUpdate -Force
+        Install-WindowsUpdate -MicrosoftUpdate -AcceptAll -IgnoreReboot -Verbose *>&1
+    }
+
+    $completed = Wait-Job -Job $job -Timeout $OperationTimeoutSeconds
+
+    if (-not $completed) {
+        Stop-Job -Job $job -Force | Out-Null
+        Remove-Job -Job $job -Force | Out-Null
+        throw "Install-WindowsUpdate exceeded timeout of $OperationTimeoutSeconds seconds."
+    }
+
+    $results = Receive-Job -Job $job
+    Remove-Job -Job $job -Force | Out-Null
 
     if ($results) {
         foreach ($item in $results) {
@@ -379,6 +411,7 @@ function Invoke-ExplicitReboot {
     )
 
     Write-Log "Issuing reboot command: shutdown.exe $($arguments -join ' ')" 'INFO'
+    Write-YamlLog
 
     & "$env:SystemRoot\System32\shutdown.exe" @arguments
 
