@@ -1,6 +1,6 @@
 # =====================================================================
 # ScriptName: Compton_Tech_Utils.ps1
-# ScriptVersion: 1.8
+# ScriptVersion: 1.8.0
 # LastUpdated: 2026-03-26
 # Notes: Added startup self-update check against GitHub.
 # Notes: Master utility script with merged menu options and YAML logging.
