@@ -1,10 +1,155 @@
 # =====================================================================
 # ScriptName: Compton_Tech_Utils.ps1
-# ScriptVersion: 1.6.0
+# ScriptVersion: 1.7.0
 # LastUpdated: 2026-03-26
+# Notes: Added startup self-update check against GitHub.
 # Notes: Master utility script with merged menu options and YAML logging.
 # =====================================================================
 
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Startup Self-Update Check
+# ─────────────────────────────────────────────────────────────────────────────
+function Get-LocalScriptVersion {
+    param(
+        [Parameter(Mandatory)][string]$ScriptPath
+    )
+
+    try {
+        if (-not (Test-Path -LiteralPath $ScriptPath)) {
+            return $null
+        }
+
+        $firstLines = Get-Content -LiteralPath $ScriptPath -TotalCount 25 -ErrorAction Stop
+        $versionLine = $firstLines | Where-Object { $_ -match '^\s*#\s*ScriptVersion\s*:\s*(.+?)\s*$' } | Select-Object -First 1
+        if (-not $versionLine) {
+            return $null
+        }
+
+        $versionText = ($versionLine -replace '^\s*#\s*ScriptVersion\s*:\s*', '').Trim()
+        return [version]$versionText
+    }
+    catch {
+        return $null
+    }
+}
+
+function Get-RemoteScriptMetadata {
+    param(
+        [Parameter(Mandatory)][string]$RawUrl
+    )
+
+    try {
+        $response = Invoke-WebRequest -Uri $RawUrl -UseBasicParsing -ErrorAction Stop
+        $content = [string]$response.Content
+        $versionMatch = [regex]::Match($content, '(?im)^\s*#\s*ScriptVersion\s*:\s*([^\r\n]+)')
+        $updatedMatch = [regex]::Match($content, '(?im)^\s*#\s*LastUpdated\s*:\s*([^\r\n]+)')
+
+        $remoteVersion = $null
+        if ($versionMatch.Success) {
+            try {
+                $remoteVersion = [version]$versionMatch.Groups[1].Value.Trim()
+            }
+            catch {
+                $remoteVersion = $null
+            }
+        }
+
+        [PSCustomObject]@{
+            Version     = $remoteVersion
+            LastUpdated = if ($updatedMatch.Success) { $updatedMatch.Groups[1].Value.Trim() } else { $null }
+            Content     = $content
+        }
+    }
+    catch {
+        Write-Host "Unable to check GitHub for script updates: $($_.Exception.Message)" -ForegroundColor Yellow
+        return $null
+    }
+}
+
+function Invoke-StartupSelfUpdate {
+    [CmdletBinding()]
+    param()
+
+    $rawUrl = 'https://raw.githubusercontent.com/dswaney/Compton/main/Compton_Tech_Utils.ps1'
+    $currentScriptPath = $PSCommandPath
+
+    if ([string]::IsNullOrWhiteSpace($currentScriptPath)) {
+        $currentScriptPath = $MyInvocation.MyCommand.Path
+    }
+
+    if ([string]::IsNullOrWhiteSpace($currentScriptPath)) {
+        Write-Host 'Startup update check skipped because the current script path could not be determined.' -ForegroundColor Yellow
+        return
+    }
+
+    Write-Host 'Checking GitHub for a newer version of Compton_Tech_Utils.ps1...' -ForegroundColor Cyan
+
+    $localVersion = Get-LocalScriptVersion -ScriptPath $currentScriptPath
+    $remoteMetadata = Get-RemoteScriptMetadata -RawUrl $rawUrl
+
+    if (-not $remoteMetadata -or -not $remoteMetadata.Version) {
+        Write-Host 'Update check skipped. Continuing with the current script.' -ForegroundColor Yellow
+        return
+    }
+
+    if (-not $localVersion) {
+        Write-Host "Current local script version could not be read. GitHub version detected: $($remoteMetadata.Version)" -ForegroundColor Yellow
+    }
+    else {
+        Write-Host "Current version: $localVersion" -ForegroundColor Gray
+        Write-Host "GitHub version : $($remoteMetadata.Version)" -ForegroundColor Gray
+    }
+
+    if ($localVersion -and $remoteMetadata.Version -le $localVersion) {
+        Write-Host 'This script is already up to date.' -ForegroundColor Green
+        return
+    }
+
+    $prompt = if ($remoteMetadata.LastUpdated) {
+        "A newer version ($($remoteMetadata.Version), updated $($remoteMetadata.LastUpdated)) is available. Download and run it now? (Y/N)"
+    }
+    else {
+        "A newer version ($($remoteMetadata.Version)) is available. Download and run it now? (Y/N)"
+    }
+
+    do {
+        $updateChoice = Read-Host $prompt
+        $normalizedChoice = ([string]$updateChoice).Trim().ToUpperInvariant()
+    } while ($normalizedChoice -notin @('Y','N','YES','NO'))
+
+    if ($normalizedChoice -in @('N','NO')) {
+        Write-Host 'Continuing with the current script version.' -ForegroundColor Yellow
+        return
+    }
+
+    try {
+        $targetDirectory = Split-Path -Path $currentScriptPath -Parent
+        if (-not [string]::IsNullOrWhiteSpace($targetDirectory) -and -not (Test-Path -LiteralPath $targetDirectory)) {
+            New-Item -Path $targetDirectory -ItemType Directory -Force | Out-Null
+        }
+
+        [System.IO.File]::WriteAllText($currentScriptPath, $remoteMetadata.Content, [System.Text.UTF8Encoding]::new($false))
+        Write-Host "Updated script saved to: $currentScriptPath" -ForegroundColor Green
+        Write-Host 'Launching the updated script...' -ForegroundColor Cyan
+
+        $powershellExe = if (Get-Command -Name 'pwsh.exe' -ErrorAction SilentlyContinue) {
+            'pwsh.exe'
+        }
+        else {
+            'powershell.exe'
+        }
+
+        Start-Process -FilePath $powershellExe -ArgumentList @('-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $currentScriptPath)) | Out-Null
+        exit
+    }
+    catch {
+        Write-Host "Failed to download or relaunch the updated script: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host 'Continuing with the current script version.' -ForegroundColor Yellow
+    }
+}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Option 14 - Remove User Profiles
@@ -258,7 +403,7 @@ function Remove-UserProfilesClassroom {
 
     if (-not (Test-IsAdministrator)) {
         Write-Error "Please run this script as Administrator."
-        $global:LastStatus = "❌ Remove User Profiles requires Administrator rights."
+        $global:LastStatus = "[ERROR] Remove User Profiles requires Administrator rights."
         return 1
     }
 
@@ -282,7 +427,7 @@ function Remove-UserProfilesClassroom {
         Write-Log "Failed to enumerate Win32_UserProfile instances: $($_.Exception.Message)" 'ERROR'
         $script:Summary.EndTime = Get-Date
         Write-YamlLog
-        $global:LastStatus = "❌ Remove User Profiles failed while enumerating profiles."
+        $global:LastStatus = "[ERROR] Remove User Profiles failed while enumerating profiles."
         return 2
     }
 
@@ -372,7 +517,7 @@ function Remove-UserProfilesClassroom {
                 }
             }
             catch {
-                Write-Log "Could not evaluate LastUseTime for $profileName: $($_.Exception.Message)" 'WARN'
+                Write-Log "Could not evaluate LastUseTime for ${profileName}: $($_.Exception.Message)" 'WARN'
             }
         }
 
@@ -421,15 +566,15 @@ function Remove-UserProfilesClassroom {
     Write-YamlLog
 
     if ($script:Summary.FailedProfiles -gt 0) {
-        $global:LastStatus = "⚠ Remove User Profiles completed with failures. Deleted=$($script:Summary.DeletedProfiles), Failed=$($script:Summary.FailedProfiles)"
+        $global:LastStatus = "[WARN] Remove User Profiles completed with failures. Deleted=$($script:Summary.DeletedProfiles), Failed=$($script:Summary.FailedProfiles)"
         return 2
     }
 
     if ($script:Summary.DeletedProfiles -gt 0) {
-        $global:LastStatus = "✅ Removed $($script:Summary.DeletedProfiles) user profile(s)."
+        $global:LastStatus = "[OK] Removed $($script:Summary.DeletedProfiles) user profile(s)."
     }
     else {
-        $global:LastStatus = "ℹ No user profiles were removed."
+        $global:LastStatus = "[INFO] No user profiles were removed."
     }
 
     return 0
@@ -555,7 +700,7 @@ function Apply-LoginScreenRegistryFixes {
                 $verifyValue = Get-ItemProperty -Path $Path -Name $Name -ErrorAction Stop
                 if ($verifyValue.$Name -eq $Value) {
                     $level = if ($SecurityCritical) { 'SECURITY' } else { 'SUCCESS' }
-                    Write-LogEntry "✔ $Description" $level
+                    Write-LogEntry "[OK] $Description" $level
                     $appliedSettings += [pscustomobject]@{
                         Path            = $Path
                         Name            = $Name
@@ -569,7 +714,7 @@ function Apply-LoginScreenRegistryFixes {
                 }
             }
         } catch {
-            Write-LogEntry "✘ Failed to apply $Description : $_" 'ERROR'
+            Write-LogEntry "[ERROR] Failed to apply $Description : $_" 'ERROR'
             $failedSettings += [pscustomobject]@{
                 Path        = $Path
                 Name        = $Name
@@ -588,7 +733,7 @@ function Apply-LoginScreenRegistryFixes {
         }
 
         # Core login screen security settings
-        Write-LogEntry "`n🛡️ Applying core login screen security settings..." 'INFO'
+        Write-LogEntry "`n[SECURITY] Applying core login screen security settings..." 'INFO'
         
         # Speed: Batch registry operations using array
         $coreSettings = @(
@@ -612,7 +757,7 @@ function Apply-LoginScreenRegistryFixes {
 
         # Enhanced security settings (applied when -EnhancedSecurity is used)
         if ($EnhancedSecurity) {
-            Write-LogEntry "`n🔒 Applying enhanced security settings..." 'SECURITY'
+            Write-LogEntry "`n[SECURITY] Applying enhanced security settings..." 'SECURITY'
             
             $enhancedSettings = @(
                 @{
@@ -705,7 +850,7 @@ function Apply-LoginScreenRegistryFixes {
 
         # Security: Additional hardening for classroom environments
         if ($EnhancedSecurity) {
-            Write-LogEntry "`n🏫 Applying classroom-specific security hardening..." 'SECURITY'
+            Write-LogEntry "`n[CLASSROOM] Applying classroom-specific security hardening..." 'SECURITY'
             
             # Disable guest account
             try {
@@ -713,11 +858,11 @@ function Apply-LoginScreenRegistryFixes {
                 if ($guestAccount -and $guestAccount.Enabled) {
                     if ($PSCmdlet.ShouldProcess("LocalUser 'Guest'", "Disable")) {
                         Disable-LocalUser -Name "Guest" -ErrorAction Stop
-                        Write-LogEntry "✔ Disabled Guest account" 'SECURITY'
+                        Write-LogEntry "[OK] Disabled Guest account" 'SECURITY'
                     }
                 }
             } catch {
-                Write-LogEntry "✘ Failed to disable Guest account: $_" 'ERROR'
+                Write-LogEntry "[ERROR] Failed to disable Guest account: $_" 'ERROR'
             }
             
             # Set strong password policy via registry
@@ -744,26 +889,26 @@ function Apply-LoginScreenRegistryFixes {
         }
 
         # Security: Registry integrity verification
-        Write-LogEntry "`n🔍 Verifying registry integrity..." 'INFO'
+        Write-LogEntry "`n[CHECK] Verifying registry integrity..." 'INFO'
         $verificationErrors = 0
         
         foreach ($setting in $appliedSettings) {
             try {
                 $currentValue = Get-ItemProperty -Path $setting.Path -Name $setting.Name -ErrorAction Stop
                 if ($currentValue.($setting.Name) -ne $setting.Value) {
-                    Write-LogEntry "⚠ Verification failed for $($setting.Description)" 'WARNING'
+                    Write-LogEntry "[WARN] Verification failed for $($setting.Description)" 'WARNING'
                     $verificationErrors++
                 }
             } catch {
-                Write-LogEntry "⚠ Could not verify $($setting.Description)" 'WARNING'
+                Write-LogEntry "[WARN] Could not verify $($setting.Description)" 'WARNING'
                 $verificationErrors++
             }
         }
         
         if ($verificationErrors -eq 0) {
-            Write-LogEntry "✔ All registry settings verified successfully" 'SUCCESS'
+            Write-LogEntry "[OK] All registry settings verified successfully" 'SUCCESS'
         } else {
-            Write-LogEntry "⚠ $verificationErrors settings failed verification" 'WARNING'
+            Write-LogEntry "[WARN] $verificationErrors settings failed verification" 'WARNING'
         }
 
         # Create registry backup file
@@ -771,9 +916,9 @@ function Apply-LoginScreenRegistryFixes {
             try {
                 $backupFile = "$env:TEMP\LoginRegistryBackup_$(Get-Date -Format 'yyyyMMdd_HHmmss').json"
                 $backupData | ConvertTo-Json -Depth 5 | Out-File -FilePath $backupFile -Encoding UTF8
-                Write-LogEntry "✔ Registry backup saved to: $backupFile" 'INFO'
+                Write-LogEntry "[OK] Registry backup saved to: $backupFile" 'INFO'
             } catch {
-                Write-LogEntry "⚠ Failed to save registry backup: $_" 'WARNING'
+                Write-LogEntry "[WARN] Failed to save registry backup: $_" 'WARNING'
             }
         }
 
@@ -785,7 +930,7 @@ function Apply-LoginScreenRegistryFixes {
         $duration = $stopwatch.Elapsed.TotalSeconds
         
         # Generate summary
-        Write-LogEntry "`n📊 Configuration Summary:" 'INFO'
+        Write-LogEntry "`n[SUMMARY] Configuration Summary:" 'INFO'
         Write-LogEntry "Duration: $([math]::Round($duration, 2)) seconds" 'INFO'
         Write-LogEntry "Settings applied: $($appliedSettings.Count)" 'SUCCESS'
         Write-LogEntry "Settings failed: $($failedSettings.Count)" 'ERROR'
@@ -796,7 +941,7 @@ function Apply-LoginScreenRegistryFixes {
         }
         
         if ($failedSettings.Count -gt 0) {
-            Write-LogEntry "`n❌ Failed Settings:" 'ERROR'
+            Write-LogEntry "`n[ERROR] Failed Settings:" 'ERROR'
             foreach ($failed in $failedSettings) {
                 Write-LogEntry "  • $($failed.Description): $($failed.Error)" 'ERROR'
             }
@@ -805,14 +950,14 @@ function Apply-LoginScreenRegistryFixes {
         # Write detailed log file
         try {
             $logEntries | Out-File -FilePath $LogPath -Encoding UTF8 -Force
-            Write-LogEntry "📝 Detailed log saved to: $LogPath" 'INFO'
+            Write-LogEntry "[LOG] Detailed log saved to: $LogPath" 'INFO'
         } catch {
-            Write-LogEntry "⚠ Failed to save log file: $_" 'WARNING'
+            Write-LogEntry "[WARN] Failed to save log file: $_" 'WARNING'
         }
         
         # Set global status
         if ($appliedSettings.Count -gt 0) {
-            $statusMsg = "✅ Applied $($appliedSettings.Count) login screen security settings"
+            $statusMsg = "[OK] Applied $($appliedSettings.Count) login screen security settings"
             if ($failedSettings.Count -gt 0) {
                 $statusMsg += " ($($failedSettings.Count) failed)"
             }
@@ -821,7 +966,7 @@ function Apply-LoginScreenRegistryFixes {
             }
             $global:LastStatus = $statusMsg
         } else {
-            $global:LastStatus = "⚠ No login screen settings were applied"
+            $global:LastStatus = "[WARN] No login screen settings were applied"
         }
         
         Write-LogEntry "=== Login Screen Registry Configuration Completed ===" 'INFO'
@@ -851,14 +996,14 @@ function Restore-LoginScreenRegistrySettings {
             
             try {
                 Set-ItemProperty -Path $path -Name $name -Value $entry.Value.Value -ErrorAction Stop
-                Write-Host "✔ Restored: $($entry.Name)" -ForegroundColor Green
+                Write-Host "[OK] Restored: $($entry.Name)" -ForegroundColor Green
                 $restored++
             } catch {
-                Write-Warning "⚠ Failed to restore: $($entry.Name) - $_"
+                Write-Warning "[WARN] Failed to restore: $($entry.Name) - $_"
             }
         }
         
-        Write-Host "✅ Restored $restored registry settings from backup" -ForegroundColor Cyan
+        Write-Host "[OK] Restored $restored registry settings from backup" -ForegroundColor Cyan
     } catch {
         throw "Failed to restore from backup: $_"
     }
@@ -923,7 +1068,7 @@ function Set-DomainAutoLogin {
         )
         
         if (-not $SecurePassword) {
-            Write-LogEntry "⚠ SECURITY WARNING: Auto-login requires storing credentials" 'WARNING'
+            Write-LogEntry "[WARN] SECURITY WARNING: Auto-login requires storing credentials" 'WARNING'
             Write-LogEntry "Consider using alternative authentication methods for production" 'WARNING'
             
             if (-not $Force) {
@@ -971,10 +1116,10 @@ function Set-DomainAutoLogin {
             try {
                 $backupFile = "$env:TEMP\AutoLoginBackup_$(Get-Date -Format 'yyyyMMdd_HHmmss').json"
                 $backupData | ConvertTo-Json | Out-File -FilePath $backupFile -Encoding UTF8
-                Write-LogEntry "✔ Registry backup saved to: $backupFile" 'INFO'
+                Write-LogEntry "[OK] Registry backup saved to: $backupFile" 'INFO'
                 return $backupFile
             } catch {
-                Write-LogEntry "⚠ Failed to save registry backup: $_" 'WARNING'
+                Write-LogEntry "[WARN] Failed to save registry backup: $_" 'WARNING'
             }
         }
         
@@ -1015,7 +1160,7 @@ function Set-DomainAutoLogin {
         param([string]$DomainName)
         
         try {
-            Write-LogEntry "🔍 Validating domain connectivity..." 'INFO'
+            Write-LogEntry "[CHECK] Validating domain connectivity..." 'INFO'
             
             # Test domain controller connectivity
             $domainController = Resolve-DnsName -Name $DomainName -Type A -ErrorAction Stop
@@ -1026,15 +1171,15 @@ function Set-DomainAutoLogin {
             # Test LDAP connectivity
             $ldapTest = Test-NetConnection -ComputerName $DomainName -Port 389 -WarningAction SilentlyContinue
             if (-not $ldapTest.TcpTestSucceeded) {
-                Write-LogEntry "⚠ LDAP connectivity test failed" 'WARNING'
+                Write-LogEntry "[WARN] LDAP connectivity test failed" 'WARNING'
                 return $false
             }
             
-            Write-LogEntry "✔ Domain connectivity validated" 'SUCCESS'
+            Write-LogEntry "[OK] Domain connectivity validated" 'SUCCESS'
             return $true
             
         } catch {
-            Write-LogEntry "⚠ Domain validation failed: $_" 'WARNING'
+            Write-LogEntry "[WARN] Domain validation failed: $_" 'WARNING'
             return $false
         }
     }
@@ -1081,11 +1226,11 @@ function Set-DomainAutoLogin {
             try {
                 if ($PSCmdlet.ShouldProcess("$regPath\$($setting.Name)", "Set registry value")) {
                     Set-ItemProperty -Path $regPath -Name $setting.Name -Value $setting.Value -Type $setting.Type -ErrorAction Stop
-                    Write-LogEntry "✔ Set $($setting.Name)" 'SUCCESS'
+                    Write-LogEntry "[OK] Set $($setting.Name)" 'SUCCESS'
                     $settingsApplied++
                 }
             } catch {
-                Write-LogEntry "✘ Failed to set $($setting.Name): $_" 'ERROR'
+                Write-LogEntry "[ERROR] Failed to set $($setting.Name): $_" 'ERROR'
                 throw
             }
         }
@@ -1102,7 +1247,7 @@ function Set-DomainAutoLogin {
 
         # Handle disable auto-login request
         if ($DisableAutoLogin) {
-            Write-LogEntry "🚫 Disabling auto-login..." 'INFO'
+            Write-LogEntry "[DISABLE] Disabling auto-login..." 'INFO'
             
             $regPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
             
@@ -1120,8 +1265,8 @@ function Set-DomainAutoLogin {
                         }
                     }
                     
-                    Write-LogEntry "✔ Auto-login disabled and credentials cleared" 'SUCCESS'
-                    $global:LastStatus = "✅ Auto-login disabled successfully."
+                    Write-LogEntry "[OK] Auto-login disabled and credentials cleared" 'SUCCESS'
+                    $global:LastStatus = "[OK] Auto-login disabled successfully."
                     return
                     
                 } catch {
@@ -1147,16 +1292,16 @@ function Set-DomainAutoLogin {
             Write-Host "  • Regularly rotate the password" -ForegroundColor Cyan
             Write-Host "="*70 -ForegroundColor Red
             
-            $confirmation = Read-Host "`n❓ Type 'UNDERSTAND' to acknowledge security risks and continue"
+            $confirmation = Read-Host "`n[PROMPT] Type 'UNDERSTAND' to acknowledge security risks and continue"
             if ($confirmation -ne 'UNDERSTAND') {
                 Write-LogEntry "Operation cancelled - security risks not acknowledged" 'WARNING'
-                $global:LastStatus = "⚠ User cancelled auto-login configuration."
+                $global:LastStatus = "[WARN] User cancelled auto-login configuration."
                 return
             }
         }
 
         # Validate inputs
-        Write-LogEntry "🔍 Validating configuration parameters..." 'INFO'
+        Write-LogEntry "[CHECK] Validating configuration parameters..." 'INFO'
         
         if ([string]::IsNullOrWhiteSpace($UserName)) {
             throw "Username cannot be empty"
@@ -1173,18 +1318,18 @@ function Set-DomainAutoLogin {
         }
 
         # Security: Get secure credentials
-        Write-LogEntry "🔐 Processing credentials securely..." 'SECURITY'
+        Write-LogEntry "[CREDENTIALS] Processing credentials securely..." 'SECURITY'
         $credential = Get-SecureCredential -Username $UserName -Domain $DomainName -SecurePassword $Password
         
         # Security: Test credential validity (optional)
         if ($domainConnectivity) {
             try {
-                Write-LogEntry "🔍 Validating credentials..." 'INFO'
+                Write-LogEntry "[CHECK] Validating credentials..." 'INFO'
                 # Note: In production, you might want to test credentials against domain
                 # This is omitted here to avoid additional authentication attempts
-                Write-LogEntry "✔ Credential format validated" 'SUCCESS'
+                Write-LogEntry "[OK] Credential format validated" 'SUCCESS'
             } catch {
-                Write-LogEntry "⚠ Credential validation failed: $_" 'WARNING'
+                Write-LogEntry "[WARN] Credential validation failed: $_" 'WARNING'
                 if (-not $Force) {
                     throw "Invalid credentials provided"
                 }
@@ -1192,26 +1337,26 @@ function Set-DomainAutoLogin {
         }
 
         # Security: Backup current settings
-        Write-LogEntry "💾 Backing up current auto-login settings..." 'INFO'
+        Write-LogEntry "[BACKUP] Backing up current auto-login settings..." 'INFO'
         $backupFile = Backup-AutoLoginSettings
         
         if ($WhatIf) {
             Write-LogEntry "WhatIf: Would configure auto-login for $DomainName\$UserName" 'INFO'
             Write-LogEntry "WhatIf: Would set AutoLogonCount to $AutoLoginCount" 'INFO'
-            $global:LastStatus = "ℹ WhatIf completed - auto-login would be configured."
+            $global:LastStatus = "[INFO] WhatIf completed - auto-login would be configured."
             return
         }
 
         # Security: Encrypt password
-        Write-LogEntry "🔒 Encrypting credentials..." 'SECURITY'
+        Write-LogEntry "[SECURITY] Encrypting credentials..." 'SECURITY'
         $encryptedPassword = Protect-AutoLoginPassword -SecurePassword $credential.Password
         
         # Apply registry settings
-        Write-LogEntry "📝 Applying auto-login registry settings..." 'INFO'
+        Write-LogEntry "[LOG] Applying auto-login registry settings..." 'INFO'
         $settingsCount = Set-AutoLoginRegistry -Username $UserName -Domain $DomainName -EncryptedPassword $encryptedPassword -LoginCount $AutoLoginCount
         
         # Security: Verify settings were applied
-        Write-LogEntry "🔍 Verifying configuration..." 'INFO'
+        Write-LogEntry "[CHECK] Verifying configuration..." 'INFO'
         $regPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
         
         try {
@@ -1223,7 +1368,7 @@ function Set-DomainAutoLogin {
                 $userNameValue.DefaultUserName -eq $UserName -and 
                 $domainValue.DefaultDomainName -eq $DomainName) {
                 
-                Write-LogEntry "✔ Auto-login configuration verified successfully" 'SUCCESS'
+                Write-LogEntry "[OK] Auto-login configuration verified successfully" 'SUCCESS'
             } else {
                 throw "Configuration verification failed"
             }
@@ -1233,7 +1378,7 @@ function Set-DomainAutoLogin {
 
         # Security: Set appropriate permissions on registry key
         try {
-            Write-LogEntry "🔒 Securing registry permissions..." 'SECURITY'
+            Write-LogEntry "[SECURITY] Securing registry permissions..." 'SECURITY'
             
             $acl = Get-Acl -Path $regPath
             # Remove inherited permissions to protect stored credentials
@@ -1245,21 +1390,21 @@ function Set-DomainAutoLogin {
             }
             
             Set-Acl -Path $regPath -AclObject $acl
-            Write-LogEntry "✔ Registry permissions secured" 'SUCCESS'
+            Write-LogEntry "[OK] Registry permissions secured" 'SUCCESS'
             
         } catch {
-            Write-LogEntry "⚠ Failed to secure registry permissions: $_" 'WARNING'
+            Write-LogEntry "[WARN] Failed to secure registry permissions: $_" 'WARNING'
         }
 
     } catch {
         Write-LogEntry "Critical error during auto-login configuration: $_" 'ERROR'
-        $global:LastStatus = "❌ Auto-login configuration failed: $_"
+        $global:LastStatus = "[ERROR] Auto-login configuration failed: $_"
         throw
     } finally {
         $stopwatch.Stop()
         $duration = $stopwatch.Elapsed.TotalSeconds
         
-        Write-LogEntry "`n📊 Configuration Summary:" 'INFO'
+        Write-LogEntry "`n[SUMMARY] Configuration Summary:" 'INFO'
         Write-LogEntry "Duration: $([math]::Round($duration, 2)) seconds" 'INFO'
         
         if (-not $DisableAutoLogin -and -not $WhatIf) {
@@ -1271,17 +1416,17 @@ function Set-DomainAutoLogin {
         # Write log file
         try {
             $logEntries | Out-File -FilePath $LogPath -Encoding UTF8 -Force
-            Write-LogEntry "📝 Detailed log saved to: $LogPath" 'INFO'
+            Write-LogEntry "[LOG] Detailed log saved to: $LogPath" 'INFO'
         } catch {
-            Write-LogEntry "⚠ Failed to save log file: $_" 'WARNING'
+            Write-LogEntry "[WARN] Failed to save log file: $_" 'WARNING'
         }
         
         # Set final status
         if (-not $global:LastStatus -or $global:LastStatus -notlike "*auto-login*") {
             if ($DisableAutoLogin) {
-                $global:LastStatus = "✅ Auto-login disabled successfully."
+                $global:LastStatus = "[OK] Auto-login disabled successfully."
             } else {
-                $global:LastStatus = "✅ Auto-login configured for $DomainName\$UserName."
+                $global:LastStatus = "[OK] Auto-login configured for $DomainName\$UserName."
             }
         }
         
@@ -1503,11 +1648,11 @@ function Set-DesktopPowerSettings {
             
             $backupFile = "$env:TEMP\PowerSettingsBackup_$(Get-Date -Format 'yyyyMMdd_HHmmss').json"
             $backupData | ConvertTo-Json -Depth 3 | Out-File -FilePath $backupFile -Encoding UTF8
-            Write-LogEntry "✔ Power settings backup saved to: $backupFile" 'INFO'
+            Write-LogEntry "[OK] Power settings backup saved to: $backupFile" 'INFO'
             return $backupFile
             
         } catch {
-            Write-LogEntry "⚠ Failed to backup power settings: $_" 'WARNING'
+            Write-LogEntry "[WARN] Failed to backup power settings: $_" 'WARNING'
             return $null
         }
     }
@@ -1535,7 +1680,7 @@ function Set-DesktopPowerSettings {
                         Value = $SchemeName
                         Success = $true
                     }
-                    Write-LogEntry "✔ Power scheme set to: $SchemeName" 'SUCCESS'
+                    Write-LogEntry "[OK] Power scheme set to: $SchemeName" 'SUCCESS'
                 } else {
                     throw "Failed to set power scheme: $result"
                 }
@@ -1547,7 +1692,7 @@ function Set-DesktopPowerSettings {
                 Success = $false
                 Error = $_.Exception.Message
             }
-            Write-LogEntry "✘ Failed to set power scheme: $_" 'ERROR'
+            Write-LogEntry "[ERROR] Failed to set power scheme: $_" 'ERROR'
         }
         
         # Configure monitor timeout
@@ -1565,7 +1710,7 @@ function Set-DesktopPowerSettings {
                         Value = "$MonitorTimeout minutes"
                         Success = $true
                     }
-                    Write-LogEntry "✔ Monitor timeout set to: $MonitorTimeout minutes" 'SUCCESS'
+                    Write-LogEntry "[OK] Monitor timeout set to: $MonitorTimeout minutes" 'SUCCESS'
                 } else {
                     throw "Failed to set monitor timeout: AC=$resultAC, DC=$resultDC"
                 }
@@ -1577,7 +1722,7 @@ function Set-DesktopPowerSettings {
                 Success = $false
                 Error = $_.Exception.Message
             }
-            Write-LogEntry "✘ Failed to set monitor timeout: $_" 'ERROR'
+            Write-LogEntry "[ERROR] Failed to set monitor timeout: $_" 'ERROR'
         }
         
         # Configure disk timeout
@@ -1595,7 +1740,7 @@ function Set-DesktopPowerSettings {
                             Value = "Disabled"
                             Success = $true
                         }
-                        Write-LogEntry "✔ Disk timeout disabled" 'SUCCESS'
+                        Write-LogEntry "[OK] Disk timeout disabled" 'SUCCESS'
                     } else {
                         throw "Failed to disable disk timeout: AC=$resultAC, DC=$resultDC"
                     }
@@ -1607,7 +1752,7 @@ function Set-DesktopPowerSettings {
                     Success = $false
                     Error = $_.Exception.Message
                 }
-                Write-LogEntry "✘ Failed to disable disk timeout: $_" 'ERROR'
+                Write-LogEntry "[ERROR] Failed to disable disk timeout: $_" 'ERROR'
             }
         } else {
             try {
@@ -1623,7 +1768,7 @@ function Set-DesktopPowerSettings {
                             Value = "$DiskTimeout minutes"
                             Success = $true
                         }
-                        Write-LogEntry "✔ Disk timeout set to: $DiskTimeout minutes" 'SUCCESS'
+                        Write-LogEntry "[OK] Disk timeout set to: $DiskTimeout minutes" 'SUCCESS'
                     } else {
                         throw "Failed to set disk timeout: AC=$resultAC, DC=$resultDC"
                     }
@@ -1635,7 +1780,7 @@ function Set-DesktopPowerSettings {
                     Success = $false
                     Error = $_.Exception.Message
                 }
-                Write-LogEntry "✘ Failed to set disk timeout: $_" 'ERROR'
+                Write-LogEntry "[ERROR] Failed to set disk timeout: $_" 'ERROR'
             }
         }
         
@@ -1651,7 +1796,7 @@ function Set-DesktopPowerSettings {
                         Value = "Disabled"
                         Success = $true
                     }
-                    Write-LogEntry "✔ Hibernation disabled" 'SUCCESS'
+                    Write-LogEntry "[OK] Hibernation disabled" 'SUCCESS'
                 } else {
                     throw "Failed to disable hibernation: $result"
                 }
@@ -1663,7 +1808,7 @@ function Set-DesktopPowerSettings {
                 Success = $false
                 Error = $_.Exception.Message
             }
-            Write-LogEntry "✘ Failed to disable hibernation: $_" 'ERROR'
+            Write-LogEntry "[ERROR] Failed to disable hibernation: $_" 'ERROR'
         }
         
         return $configResults
@@ -1681,7 +1826,7 @@ function Set-DesktopPowerSettings {
 
         # Hardware detection and validation
         if (-not $SkipHardwareDetection) {
-            Write-LogEntry "`n🔍 Detecting system hardware type..." 'HARDWARE'
+            Write-LogEntry "`n[CHECK] Detecting system hardware type..." 'HARDWARE'
             $hardwareInfo = Get-SystemHardwareType
             
             Write-LogEntry "Hardware Analysis:" 'HARDWARE'
@@ -1704,12 +1849,12 @@ function Set-DesktopPowerSettings {
                 Write-Host "  • Use -SkipHardwareDetection parameter" -ForegroundColor Cyan
                 Write-Host "="*60 -ForegroundColor Red
                 
-                $global:LastStatus = "⚠ Operation blocked - laptop detected."
+                $global:LastStatus = "[WARN] Operation blocked - laptop detected."
                 return
             }
             
             if ($hardwareInfo.IsLaptop -and ($AllowLaptops -or $Force)) {
-                Write-LogEntry "⚠ Proceeding with laptop configuration (overridden)" 'WARNING'
+                Write-LogEntry "[WARN] Proceeding with laptop configuration (overridden)" 'WARNING'
             }
         }
 
@@ -1726,16 +1871,16 @@ function Set-DesktopPowerSettings {
             Write-Host "`nNote: These settings optimize for desktop performance" -ForegroundColor Yellow
             Write-Host "="*60 -ForegroundColor Yellow
             
-            $confirmation = Read-Host "`n❓ Continue with power configuration? (Y/N)"
+            $confirmation = Read-Host "`n[PROMPT] Continue with power configuration? (Y/N)"
             if ($confirmation -notin @('Y', 'y', 'Yes', 'yes')) {
                 Write-LogEntry "Operation cancelled by user" 'WARNING'
-                $global:LastStatus = "⚠ User cancelled power settings configuration."
+                $global:LastStatus = "[WARN] User cancelled power settings configuration."
                 return
             }
         }
 
         # Get available power schemes
-        Write-LogEntry "`n🔍 Scanning available power schemes..." 'INFO'
+        Write-LogEntry "`n[CHECK] Scanning available power schemes..." 'INFO'
         $powerSchemes = Get-PowerSchemes
         
         if ($powerSchemes.Count -eq 0) {
@@ -1750,7 +1895,7 @@ function Set-DesktopPowerSettings {
         
         # Validate requested power plan
         if (-not $powerSchemes.ContainsKey($PowerPlan)) {
-            Write-LogEntry "⚠ Requested power plan '$PowerPlan' not found" 'WARNING'
+            Write-LogEntry "[WARN] Requested power plan '$PowerPlan' not found" 'WARNING'
             Write-LogEntry "Falling back to 'High Performance' scheme" 'WARNING'
             $PowerPlan = 'High Performance'
             
@@ -1764,7 +1909,7 @@ function Set-DesktopPowerSettings {
 
         # Backup current settings
         if (-not $WhatIfPreference) {
-            Write-LogEntry "`n💾 Backing up current power settings..." 'INFO'
+            Write-LogEntry "`n[BACKUP] Backing up current power settings..." 'INFO'
             $backupFile = Backup-PowerSettings
         }
 
@@ -1774,12 +1919,12 @@ function Set-DesktopPowerSettings {
             Write-LogEntry "  • Would set monitor timeout to: $MonitorTimeoutMinutes minutes" 'INFO'
             Write-LogEntry "  • Would set disk timeout to: $(if($DiskTimeoutMinutes -eq 0){'Disabled'}else{"$DiskTimeoutMinutes minutes"})" 'INFO'
             Write-LogEntry "  • Would disable hibernation" 'INFO'
-            $global:LastStatus = "ℹ WhatIf completed - power settings would be configured."
+            $global:LastStatus = "[INFO] WhatIf completed - power settings would be configured."
             return
         }
 
         # Apply power configuration
-        Write-LogEntry "`n⚡ Applying power configuration..." 'INFO'
+        Write-LogEntry "`n[APPLY] Applying power configuration..." 'INFO'
         $configResults = Set-PowerConfiguration -SchemeName $PowerPlan -SchemeGUID $selectedScheme.GUID -MonitorTimeout $MonitorTimeoutMinutes -DiskTimeout $DiskTimeoutMinutes
         
         # Process results
@@ -1790,40 +1935,40 @@ function Set-DesktopPowerSettings {
         $script:failedSettings = $configResults | Where-Object { -not $_.Success }
 
         # Verify configuration
-        Write-LogEntry "`n🔍 Verifying power configuration..." 'INFO'
+        Write-LogEntry "`n[CHECK] Verifying power configuration..." 'INFO'
         try {
             $currentScheme = powercfg.exe /getactivescheme 2>$null
             if ($currentScheme -and $currentScheme -match $selectedScheme.GUID) {
-                Write-LogEntry "✔ Power scheme verification passed" 'SUCCESS'
+                Write-LogEntry "[OK] Power scheme verification passed" 'SUCCESS'
             } else {
-                Write-LogEntry "⚠ Power scheme verification failed" 'WARNING'
+                Write-LogEntry "[WARN] Power scheme verification failed" 'WARNING'
             }
         } catch {
-            Write-LogEntry "⚠ Could not verify power scheme: $_" 'WARNING'
+            Write-LogEntry "[WARN] Could not verify power scheme: $_" 'WARNING'
         }
 
     } catch {
         Write-LogEntry "Critical error during power settings configuration: $_" 'ERROR'
-        $global:LastStatus = "❌ Power settings configuration failed: $_"
+        $global:LastStatus = "[ERROR] Power settings configuration failed: $_"
         throw
     } finally {
         $stopwatch.Stop()
         $duration = $stopwatch.Elapsed.TotalSeconds
         
-        Write-LogEntry "`n📊 Configuration Summary:" 'INFO'
+        Write-LogEntry "`n[SUMMARY] Configuration Summary:" 'INFO'
         Write-LogEntry "Duration: $([math]::Round($duration, 2)) seconds" 'INFO'
         Write-LogEntry "Settings applied: $($appliedSettings.Count)" 'SUCCESS'
         Write-LogEntry "Settings failed: $($failedSettings.Count)" 'ERROR'
         
         if ($appliedSettings.Count -gt 0) {
-            Write-LogEntry "`n✅ Successfully Applied:" 'SUCCESS'
+            Write-LogEntry "`n[OK] Successfully Applied:" 'SUCCESS'
             foreach ($setting in $appliedSettings) {
                 Write-LogEntry "  • $($setting.Setting): $($setting.Value)" 'SUCCESS'
             }
         }
         
         if ($failedSettings.Count -gt 0) {
-            Write-LogEntry "`n❌ Failed Settings:" 'ERROR'
+            Write-LogEntry "`n[ERROR] Failed Settings:" 'ERROR'
             foreach ($setting in $failedSettings) {
                 Write-LogEntry "  • $($setting.Setting): $($setting.Error)" 'ERROR'
             }
@@ -1832,20 +1977,20 @@ function Set-DesktopPowerSettings {
         # Write log file
         try {
             $logEntries | Out-File -FilePath $LogPath -Encoding UTF8 -Force
-            Write-LogEntry "📝 Detailed log saved to: $LogPath" 'INFO'
+            Write-LogEntry "[LOG] Detailed log saved to: $LogPath" 'INFO'
         } catch {
-            Write-LogEntry "⚠ Failed to save log file: $_" 'WARNING'
+            Write-LogEntry "[WARN] Failed to save log file: $_" 'WARNING'
         }
         
         # Set final status
         if ($appliedSettings.Count -gt 0) {
             if ($failedSettings.Count -eq 0) {
-                $global:LastStatus = "✅ All power settings applied successfully."
+                $global:LastStatus = "[OK] All power settings applied successfully."
             } else {
-                $global:LastStatus = "⚠ Power settings partially applied ($($appliedSettings.Count) success, $($failedSettings.Count) failed)."
+                $global:LastStatus = "[WARN] Power settings partially applied ($($appliedSettings.Count) success, $($failedSettings.Count) failed)."
             }
         } else {
-            $global:LastStatus = "❌ No power settings were applied."
+            $global:LastStatus = "[ERROR] No power settings were applied."
         }
         
         Write-LogEntry "=== Power Settings Configuration Completed ===" 'INFO'
@@ -1904,7 +2049,7 @@ function Register-LabScheduledTasks {
     $ProgressPreference = 'SilentlyContinue'
 
     if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        $global:LastStatus = "❌ Scheduled task setup requires Administrator rights."
+        $global:LastStatus = "[ERROR] Scheduled task setup requires Administrator rights."
         throw "This function must be run as Administrator."
     }
 
@@ -2396,11 +2541,11 @@ function Register-LabScheduledTasks {
 
         if (($fileErrors + $taskErrors) -gt 0) {
             $script:OverallResult = 'CompletedWithErrors'
-            $global:LastStatus = "⚠ Option 17 completed with issues. Scripts downloaded/updated, tasks created: $taskCreated, errors: $($fileErrors + $taskErrors)."
+            $global:LastStatus = "[WARN] Option 17 completed with issues. Scripts downloaded/updated, tasks created: $taskCreated, errors: $($fileErrors + $taskErrors)."
         }
         else {
             $script:OverallResult = 'Succeeded'
-            $global:LastStatus = "✅ Option 17 completed successfully. C:\Scripts refreshed and $taskCreated scheduled tasks registered."
+            $global:LastStatus = "[OK] Option 17 completed successfully. C:\Scripts refreshed and $taskCreated scheduled tasks registered."
         }
 
         Write-YamlLog
@@ -2408,7 +2553,7 @@ function Register-LabScheduledTasks {
     catch {
         $script:FailureMessage = $_.Exception.Message
         $script:OverallResult = 'Failed'
-        $global:LastStatus = "❌ Option 17 failed: $($_.Exception.Message)"
+        $global:LastStatus = "[ERROR] Option 17 failed: $($_.Exception.Message)"
         Write-Status "Fatal error in Option 17: $($_.Exception.Message)" 'ERROR'
         Write-YamlLog
         throw
@@ -2491,12 +2636,12 @@ function Set-OneDriveAutoLoginPolicy {
         try {
             if (-not (Test-RegistryPath $Path)) {
                 New-Item -Path $Path -Force -ErrorAction Stop | Out-Null
-                Write-LogEntry "✔ Created registry path: $Path" 'SUCCESS'
+                Write-LogEntry "[OK] Created registry path: $Path" 'SUCCESS'
                 return $true
             }
             return $true
         } catch {
-            Write-LogEntry "✘ Failed to create registry path: $Path - $_" 'ERROR'
+            Write-LogEntry "[ERROR] Failed to create registry path: $Path - $_" 'ERROR'
             return $false
         }
     }
@@ -2550,7 +2695,7 @@ function Set-OneDriveAutoLoginPolicy {
                 $level = if ($Critical) { 'SKIP' } else { 'SKIP' }
                 Write-LogEntry "⏭ $Description (already configured)" $level
                 
-                # ✅ FIX: Ensure skippedPolicies exists and use ArrayList.Add()
+                # [OK] FIX: Ensure skippedPolicies exists and use ArrayList.Add()
                 if ($null -eq $script:skippedPolicies) {
                     $script:skippedPolicies = New-Object System.Collections.ArrayList
                 }
@@ -2578,9 +2723,9 @@ function Set-OneDriveAutoLoginPolicy {
                 $verifyValue = Get-ItemProperty -Path $Path -Name $Name -ErrorAction Stop
                 if ($verifyValue.$Name -eq $Value) {
                     $level = if ($Critical) { 'POLICY' } else { 'SUCCESS' }
-                    Write-LogEntry "✔ $Description" $level
+                    Write-LogEntry "[OK] $Description" $level
                     
-                    # ✅ FIX: Ensure appliedPolicies exists and use ArrayList.Add()
+                    # [OK] FIX: Ensure appliedPolicies exists and use ArrayList.Add()
                     if ($null -eq $script:appliedPolicies) {
                         $script:appliedPolicies = New-Object System.Collections.ArrayList
                     }
@@ -2598,9 +2743,9 @@ function Set-OneDriveAutoLoginPolicy {
                 }
             }
         } catch {
-            Write-LogEntry "✘ Failed to apply $Description : $_" 'ERROR'
+            Write-LogEntry "[ERROR] Failed to apply $Description : $_" 'ERROR'
             
-            # ✅ FIX: Ensure failedPolicies exists and use ArrayList.Add()
+            # [OK] FIX: Ensure failedPolicies exists and use ArrayList.Add()
             if ($null -eq $script:failedPolicies) {
                 $script:failedPolicies = New-Object System.Collections.ArrayList
             }
@@ -2683,12 +2828,12 @@ function Set-OneDriveAutoLoginPolicy {
             if ($backupData.Count -gt 0) {
                 $backupFile = "$env:TEMP\OneDrivePolicyBackup_$(Get-Date -Format 'yyyyMMdd_HHmmss').json"
                 $backupData | ConvertTo-Json -Depth 4 | Out-File -FilePath $backupFile -Encoding UTF8
-                Write-LogEntry "✔ Policy backup saved to: $backupFile" 'INFO'
+                Write-LogEntry "[OK] Policy backup saved to: $backupFile" 'INFO'
                 return $backupFile
             }
             
         } catch {
-            Write-LogEntry "⚠ Failed to backup OneDrive policies: $_" 'WARNING'
+            Write-LogEntry "[WARN] Failed to backup OneDrive policies: $_" 'WARNING'
         }
         
         return $null
@@ -2728,14 +2873,14 @@ function Set-OneDriveAutoLoginPolicy {
         }
 
         # Validate OneDrive installation
-        Write-LogEntry "`n🔍 Validating OneDrive installation..." 'INFO'
+        Write-LogEntry "`n[CHECK] Validating OneDrive installation..." 'INFO'
         $oneDriveInfo = Test-OneDriveInstallation
         
         if (-not $oneDriveInfo.IsInstalled) {
-            Write-LogEntry "⚠ OneDrive not detected on this system" 'WARNING'
+            Write-LogEntry "[WARN] OneDrive not detected on this system" 'WARNING'
             Write-LogEntry "Policies will be applied but may not take effect until OneDrive is installed" 'WARNING'
         } else {
-            Write-LogEntry "✔ OneDrive installation detected:" 'SUCCESS'
+            Write-LogEntry "[OK] OneDrive installation detected:" 'SUCCESS'
             foreach ($installation in $oneDriveInfo.Installations) {
                 Write-LogEntry "  • $($installation.Type): $($installation.Path) (v$($installation.Version))" 'INFO'
             }
@@ -2751,7 +2896,7 @@ function Set-OneDriveAutoLoginPolicy {
 
         # Backup existing policies if requested
         if ($BackupSettings) {
-            Write-LogEntry "`n💾 Backing up current OneDrive policies..." 'INFO'
+            Write-LogEntry "`n[BACKUP] Backing up current OneDrive policies..." 'INFO'
             $backupFile = Backup-OneDrivePolicies -RegistryPaths $registryPaths.Values
         }
 
@@ -2765,7 +2910,7 @@ function Set-OneDriveAutoLoginPolicy {
             if ($EnableKnownFolderMove) { Write-LogEntry "  • Known Folder Move: Enabled" 'INFO' }
             if ($TenantId) { Write-LogEntry "  • Tenant restriction: $TenantId" 'INFO' }
             if ($SyncThrottleKbps -gt 0) { Write-LogEntry "  • Sync throttle: $SyncThrottleKbps KB/s" 'INFO' }
-            $global:LastStatus = "ℹ WhatIf completed - OneDrive policies would be configured."
+            $global:LastStatus = "[INFO] WhatIf completed - OneDrive policies would be configured."
             return
         }
 
@@ -2824,7 +2969,7 @@ function Set-OneDriveAutoLoginPolicy {
         }
 
         # Additional security and performance policies
-        Write-LogEntry "`n🔒 Applying security and performance policies..." 'POLICY'
+        Write-LogEntry "`n[SECURITY] Applying security and performance policies..." 'POLICY'
         
         # Prevent OneDrive from generating network traffic until user signs in
         Set-OneDrivePolicy -Path $registryPaths.MainPolicy -Name "PreventNetworkTrafficPreUserSignIn" -Value 1 -Description "Prevented network traffic before user sign-in" | Out-Null
@@ -2838,7 +2983,7 @@ function Set-OneDriveAutoLoginPolicy {
         }
 
         # Verification of applied policies
-        Write-LogEntry "`n🔍 Verifying policy application..." 'INFO'
+        Write-LogEntry "`n[CHECK] Verifying policy application..." 'INFO'
         $verificationErrors = 0
         
         # Ensure appliedPolicies exists before iterating
@@ -2847,11 +2992,11 @@ function Set-OneDriveAutoLoginPolicy {
                 try {
                     $currentValue = Get-ItemProperty -Path $policy.Path -Name $policy.Name -ErrorAction Stop
                     if ($currentValue.($policy.Name) -ne $policy.Value) {
-                        Write-LogEntry "⚠ Verification failed for $($policy.Description)" 'WARNING'
+                        Write-LogEntry "[WARN] Verification failed for $($policy.Description)" 'WARNING'
                         $verificationErrors++
                     }
                 } catch {
-                    Write-LogEntry "⚠ Could not verify $($policy.Description)" 'WARNING'
+                    Write-LogEntry "[WARN] Could not verify $($policy.Description)" 'WARNING'
                     $verificationErrors++
                 }
             }
@@ -2861,16 +3006,16 @@ function Set-OneDriveAutoLoginPolicy {
         $skippedCount = if ($null -ne $script:skippedPolicies) { $script:skippedPolicies.Count } else { 0 }
         
         if ($verificationErrors -eq 0 -and $appliedCount -gt 0) {
-            Write-LogEntry "✔ All OneDrive policies verified successfully" 'SUCCESS'
+            Write-LogEntry "[OK] All OneDrive policies verified successfully" 'SUCCESS'
         } elseif ($appliedCount -eq 0 -and $skippedCount -gt 0) {
-            Write-LogEntry "✔ All OneDrive policies already correctly configured" 'SUCCESS'
+            Write-LogEntry "[OK] All OneDrive policies already correctly configured" 'SUCCESS'
         } elseif ($verificationErrors -gt 0) {
-            Write-LogEntry "⚠ $verificationErrors policies failed verification" 'WARNING'
+            Write-LogEntry "[WARN] $verificationErrors policies failed verification" 'WARNING'
         }
 
     } catch {
         Write-LogEntry "Critical error during OneDrive policy configuration: $_" 'ERROR'
-        $global:LastStatus = "❌ OneDrive policy configuration failed: $_"
+        $global:LastStatus = "[ERROR] OneDrive policy configuration failed: $_"
         throw
     } finally {
         $stopwatch.Stop()
@@ -2881,7 +3026,7 @@ function Set-OneDriveAutoLoginPolicy {
         $skippedCount = if ($null -ne $script:skippedPolicies) { $script:skippedPolicies.Count } else { 0 }
         $failedCount = if ($null -ne $script:failedPolicies) { $script:failedPolicies.Count } else { 0 }
         
-        Write-LogEntry "`n📊 Policy Configuration Summary:" 'INFO'
+        Write-LogEntry "`n[SUMMARY] Policy Configuration Summary:" 'INFO'
         Write-LogEntry "Duration: $([math]::Round($duration, 2)) seconds" 'INFO'
         Write-LogEntry "Policies applied: $appliedCount" 'SUCCESS'
         Write-LogEntry "Policies already correct: $skippedCount" 'SKIP'
@@ -2906,7 +3051,7 @@ function Set-OneDriveAutoLoginPolicy {
         }
         
         if ($failedCount -gt 0 -and $null -ne $script:failedPolicies) {
-            Write-LogEntry "`n❌ Failed Policies:" 'ERROR'
+            Write-LogEntry "`n[ERROR] Failed Policies:" 'ERROR'
             foreach ($failed in $script:failedPolicies) {
                 Write-LogEntry "  • $($failed.Description): $($failed.Error)" 'ERROR'
             }
@@ -2916,22 +3061,22 @@ function Set-OneDriveAutoLoginPolicy {
         try {
             if ($null -ne $script:logEntries) {
                 $script:logEntries.ToArray() | Out-File -FilePath $LogPath -Encoding UTF8 -Force
-                Write-LogEntry "📝 Detailed log saved to: $LogPath" 'INFO'
+                Write-LogEntry "[LOG] Detailed log saved to: $LogPath" 'INFO'
             }
         } catch {
-            Write-LogEntry "⚠ Failed to save log file: $_" 'WARNING'
+            Write-LogEntry "[WARN] Failed to save log file: $_" 'WARNING'
         }
         
         # Set global status with safe counting
         $totalPolicies = $appliedCount + $skippedCount
         if ($totalPolicies -gt 0) {
             if ($appliedCount -gt 0) {
-                $statusMsg = "✅ Applied $appliedCount OneDrive policies"
+                $statusMsg = "[OK] Applied $appliedCount OneDrive policies"
                 if ($skippedCount -gt 0) {
                     $statusMsg += " ($skippedCount already correct)"
                 }
             } else {
-                $statusMsg = "✅ All $skippedCount OneDrive policies already correctly configured"
+                $statusMsg = "[OK] All $skippedCount OneDrive policies already correctly configured"
             }
             
             if ($failedCount -gt 0) {
@@ -2942,7 +3087,7 @@ function Set-OneDriveAutoLoginPolicy {
             }
             $global:LastStatus = $statusMsg
         } else {
-            $global:LastStatus = "⚠ No OneDrive policies were processed"
+            $global:LastStatus = "[WARN] No OneDrive policies were processed"
         }
         
         Write-LogEntry "=== OneDrive Policy Configuration Completed ===" 'INFO'
@@ -3016,17 +3161,17 @@ function Remove-OneDrivePolicies {
                 if ($PSCmdlet.ShouldProcess($path, "Remove OneDrive policy registry key")) {
                     if (-not $ConfirmEach -or (Read-Host "Remove $path? (y/n)") -eq 'y') {
                         Remove-Item -Path $path -Recurse -Force -ErrorAction Stop
-                        Write-Host "✔ Removed OneDrive policies from: $path" -ForegroundColor Green
+                        Write-Host "[OK] Removed OneDrive policies from: $path" -ForegroundColor Green
                         $removedCount++
                     }
                 }
             } catch {
-                Write-Warning "⚠ Failed to remove $path : $_"
+                Write-Warning "[WARN] Failed to remove $path : $_"
             }
         }
     }
     
-    Write-Host "✅ Removed OneDrive policies from $removedCount registry locations" -ForegroundColor Cyan
+    Write-Host "[OK] Removed OneDrive policies from $removedCount registry locations" -ForegroundColor Cyan
 }
 
 
@@ -3197,11 +3342,11 @@ function Run-CorePostDeploymentTasks {
     }
 
     if ($failedTasks.Count -eq 0) {
-        $global:LastStatus = "✅ Full System Update completed successfully. Log: $logPath"
+        $global:LastStatus = "[OK] Full System Update completed successfully. Log: $logPath"
         Write-Host $global:LastStatus -ForegroundColor Green
     }
     else {
-        $global:LastStatus = "⚠ Full System Update completed with $($failedTasks.Count) failed task(s). Log: $logPath"
+        $global:LastStatus = "[WARN] Full System Update completed with $($failedTasks.Count) failed task(s). Log: $logPath"
         Write-Host $global:LastStatus -ForegroundColor Yellow
     }
 }
@@ -3360,7 +3505,7 @@ function Main {
 				exit
 			}
             default {
-                $global:LastStatus = "❌ Invalid selection. Please try again."
+                $global:LastStatus = "[ERROR] Invalid selection. Please try again."
                 Start-Sleep -Seconds 1
             }
         }
@@ -3371,4 +3516,5 @@ function Main {
 # ─────────────────────────────────────────────────────────────────────────────
 # Entry Point
 # ─────────────────────────────────────────────────────────────────────────────
+Invoke-StartupSelfUpdate
 Main
