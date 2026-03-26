@@ -1,6 +1,6 @@
 # =====================================================================
 # ScriptName: 08_System_Repair.ps1
-# ScriptVersion: 1.2
+# ScriptVersion: 1.3
 # LastUpdated: 2026-03-26
 # =====================================================================
 
@@ -431,100 +431,334 @@ function Invoke-SfcCommand {
     }
 }
 
-function Clear-DirectoryContent {
-    param(
-        [Parameter(Mandatory)][string]$Path,
-        [switch]$WarnOnly
+
+function Get-DiskSpaceInfo {
+    param([string]$Path)
+
+    try {
+        $driveRoot = Split-Path -Path $Path -Qualifier
+        if ([string]::IsNullOrWhiteSpace($driveRoot)) {
+            $driveRoot = $env:SystemDrive + '\'
+        }
+
+        $drive = [System.IO.DriveInfo]::new($driveRoot)
+        return @{
+            FreeSpace  = [int64]$drive.AvailableFreeSpace
+            TotalSize  = [int64]$drive.TotalSize
+            UsedSpace  = [int64]($drive.TotalSize - $drive.AvailableFreeSpace)
+        }
+    }
+    catch {
+        return $null
+    }
+}
+
+function Test-SafeCleanupPath {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return $false
+    }
+
+    $normalized = $Path.TrimEnd('\')
+
+    $blockedPaths = @(
+        'C:\Windows\System32',
+        'C:\Windows\SysWOW64',
+        'C:\Program Files',
+        'C:\Program Files (x86)',
+        'C:\Windows\explorer.exe',
+        'C:\Windows\System32\drivers'
     )
 
-    $result = [ordered]@{
-        Path           = $Path
-        Exists         = $false
-        RemovedCount   = 0
-        FailedCount    = 0
-        FailedItems    = New-Object System.Collections.Generic.List[string]
+    foreach ($blocked in $blockedPaths) {
+        if ($normalized -ieq $blocked -or $normalized -like ($blocked + '\*')) {
+            return $false
+        }
     }
+
+    $allowedPatterns = @(
+        'C:\Windows\Temp*',
+        'C:\Temp*',
+        'C:\SWSetup*',
+        'C:\system.sav*',
+        'C:\Windows\SoftwareDistribution\Download*',
+        'C:\Windows\Prefetch*',
+        'C:\Windows\Logs\CBS*',
+        'C:\ProgramData\Microsoft\Windows\WER\ReportQueue*',
+        "$env:TEMP*",
+        "$env:LOCALAPPDATA\Temp*",
+        "$env:LOCALAPPDATA\Microsoft\Windows\INetCache*",
+        "$env:LOCALAPPDATA\Microsoft\Windows\WebCache*",
+        "$env:LOCALAPPDATA\CrashDumps*",
+        "$env:LOCALAPPDATA\Microsoft\Windows\DeliveryOptimization\Cache*",
+        "$env:LOCALAPPDATA\D3DSCache*",
+        "$env:LOCALAPPDATA\NVIDIA\DXCache*",
+        "$env:LOCALAPPDATA\NVIDIA\GLCache*"
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+
+    foreach ($pattern in $allowedPatterns) {
+        if ($normalized -like $pattern) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Remove-FolderContents {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Description,
+        [switch]$ContentsOnly
+    )
 
     if (-not (Test-Path -LiteralPath $Path)) {
-        return [PSCustomObject]$result
+        return @{
+            Success    = $true
+            SpaceFreed = [int64]0
+            ItemCount  = 0
+            Message    = 'Path does not exist'
+        }
     }
 
-    $result.Exists = $true
-
-    Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue | ForEach-Object {
-        try {
-            Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction Stop
-            $result.RemovedCount++
+    if (-not (Test-SafeCleanupPath -Path $Path)) {
+        return @{
+            Success    = $false
+            SpaceFreed = [int64]0
+            ItemCount  = 0
+            Message    = 'Path blocked for security'
         }
-        catch {
-            $result.FailedCount++
-            $result.FailedItems.Add($_.FullName) | Out-Null
-            if (-not $WarnOnly) {
-                throw
+    }
+
+    try {
+        $items = if ($ContentsOnly) {
+            @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue)
+        }
+        else {
+            @(Get-ChildItem -LiteralPath $Path -Recurse -Force -File -ErrorAction SilentlyContinue)
+        }
+
+        $itemCount = $items.Count
+        [int64]$sizeBefore = 0
+
+        if ($itemCount -gt 0) {
+            $files = if ($ContentsOnly) {
+                $items | Where-Object { -not $_.PSIsContainer }
+            }
+            else {
+                $items
+            }
+
+            if ($files.Count -gt 0) {
+                $sizeSum = ($files | Measure-Object -Property Length -Sum -ErrorAction SilentlyContinue).Sum
+                if ($null -ne $sizeSum) {
+                    $sizeBefore = [int64]$sizeSum
+                }
             }
         }
-    }
 
-    return [PSCustomObject]$result
+        if ($itemCount -eq 0) {
+            return @{
+                Success    = $true
+                SpaceFreed = [int64]0
+                ItemCount  = 0
+                Message    = 'Folder is empty'
+            }
+        }
+
+        if ($ContentsOnly) {
+            Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop | ForEach-Object {
+                try {
+                    Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction Stop
+                }
+                catch {
+                    Write-Log "Could not remove $($_.FullName): $($_.Exception.Message)" 'WARN'
+                }
+            }
+        }
+        else {
+            Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+        }
+
+        return @{
+            Success    = $true
+            SpaceFreed = $sizeBefore
+            ItemCount  = $itemCount
+            Message    = 'Successfully cleaned'
+        }
+    }
+    catch {
+        return @{
+            Success    = $false
+            SpaceFreed = [int64]0
+            ItemCount  = 0
+            Message    = $_.Exception.Message
+        }
+    }
+}
+
+function Invoke-WindowsCleanup {
+    param([int]$TimeoutSec = 300)
+
+    try {
+        $cleanmgrPath = Join-Path $env:SystemRoot 'System32\cleanmgr.exe'
+        if (-not (Test-Path -LiteralPath $cleanmgrPath)) {
+            throw 'Windows Disk Cleanup utility not found.'
+        }
+
+        Write-Log "Starting Windows Disk Cleanup (timeout: ${TimeoutSec}s)..." 'INFO'
+
+        $job = Start-Job -ScriptBlock {
+            Start-Process -FilePath "$env:SystemRoot\System32\cleanmgr.exe" -ArgumentList '/SAGERUN:1','/VERYLOWDISK' -NoNewWindow -Wait -PassThru
+        }
+
+        $result = Wait-Job -Job $job -Timeout $TimeoutSec
+
+        if ($null -eq $result -or $job.State -eq 'Running') {
+            Stop-Job -Job $job -Force | Out-Null
+            Remove-Job -Job $job -Force | Out-Null
+            throw "Disk Cleanup timed out after $TimeoutSec seconds."
+        }
+
+        $proc = Receive-Job -Job $job
+        Remove-Job -Job $job -Force | Out-Null
+
+        return @{
+            Success  = $true
+            ExitCode = $proc.ExitCode
+        }
+    }
+    catch {
+        return @{
+            Success = $false
+            Error   = $_.Exception.Message
+        }
+    }
 }
 
 function Invoke-TempCleanup {
-    $paths = @(
-        "$env:TEMP",
-        "$env:WINDIR\Temp",
-        'C:\Temp'
+    [int64]$totalSpaceFreed = 0
+    $cleanupResults = New-Object System.Collections.Generic.List[object]
+    $initialSpace = Get-DiskSpaceInfo -Path $env:SystemDrive
+
+    Write-Log 'Cleaning temporary files and caches...' 'INFO'
+
+    $windowsCleanup = Invoke-WindowsCleanup -TimeoutSec 300
+    if ($windowsCleanup.Success) {
+        Write-Log 'Windows Disk Cleanup completed successfully.' 'OK'
+        $cleanupResults.Add([PSCustomObject]@{
+            Path        = 'cleanmgr.exe'
+            Description = 'Windows Disk Cleanup'
+            ItemCount   = 0
+            SpaceFreed  = [int64]0
+            Status      = 'Success'
+            Message     = "Exit code $($windowsCleanup.ExitCode)"
+        }) | Out-Null
+    }
+    else {
+        Warn-Step -Name 'TempCleanup' -Reason "Windows Disk Cleanup failed: $($windowsCleanup.Error)"
+        $cleanupResults.Add([PSCustomObject]@{
+            Path        = 'cleanmgr.exe'
+            Description = 'Windows Disk Cleanup'
+            ItemCount   = 0
+            SpaceFreed  = [int64]0
+            Status      = 'Warning'
+            Message     = $windowsCleanup.Error
+        }) | Out-Null
+    }
+
+    $cleanupTargets = @(
+        @{ Path = 'C:\SWSetup'; Description = 'HP Software Setup'; ContentsOnly = $false },
+        @{ Path = 'C:\Temp'; Description = 'System Temp'; ContentsOnly = $false },
+        @{ Path = 'C:\system.sav'; Description = 'System Save'; ContentsOnly = $false },
+        @{ Path = 'C:\Windows\Temp'; Description = 'Windows Temp'; ContentsOnly = $true },
+        @{ Path = $env:TEMP; Description = 'User Temp'; ContentsOnly = $true },
+        @{ Path = "$env:LOCALAPPDATA\Temp"; Description = 'Local Temp'; ContentsOnly = $true },
+        @{ Path = 'C:\Windows\SoftwareDistribution\Download'; Description = 'Windows Update Cache'; ContentsOnly = $true },
+        @{ Path = 'C:\Windows\Prefetch'; Description = 'Windows Prefetch'; ContentsOnly = $true },
+        @{ Path = 'C:\Windows\Logs\CBS'; Description = 'CBS Logs'; ContentsOnly = $true },
+        @{ Path = "$env:LOCALAPPDATA\Microsoft\Windows\INetCache"; Description = 'Internet Cache'; ContentsOnly = $true },
+        @{ Path = "$env:LOCALAPPDATA\Microsoft\Windows\WebCache"; Description = 'Web Cache'; ContentsOnly = $true },
+        @{ Path = 'C:\ProgramData\Microsoft\Windows\WER\ReportQueue'; Description = 'Error Report Queue'; ContentsOnly = $true },
+        @{ Path = "$env:LOCALAPPDATA\CrashDumps"; Description = 'Crash Dumps'; ContentsOnly = $true },
+        @{ Path = "$env:LOCALAPPDATA\Microsoft\Windows\DeliveryOptimization\Cache"; Description = 'Delivery Optimization Cache'; ContentsOnly = $true }
     )
 
-    $cleanupResults = New-Object System.Collections.Generic.List[object]
-
-    foreach ($path in $paths) {
-        Write-Log "Cleaning temporary files in $path" 'INFO'
-        $result = Clear-DirectoryContent -Path $path -WarnOnly
-        $cleanupResults.Add($result) | Out-Null
-
-        if (-not $result.Exists) {
-            Write-Log "Path not found, skipping: $path" 'INFO'
-            continue
-        }
-
-        Write-Log ("Removed {0} item(s) from {1}. Failed removals: {2}" -f $result.RemovedCount, $path, $result.FailedCount) 'INFO'
+    if ($AggressiveCleanup) {
+        $cleanupTargets += @(
+            @{ Path = "$env:LOCALAPPDATA\D3DSCache"; Description = 'Direct3D Shader Cache'; ContentsOnly = $true },
+            @{ Path = "$env:LOCALAPPDATA\NVIDIA\DXCache"; Description = 'NVIDIA DX Cache'; ContentsOnly = $true },
+            @{ Path = "$env:LOCALAPPDATA\NVIDIA\GLCache"; Description = 'NVIDIA GL Cache'; ContentsOnly = $true }
+        )
     }
 
-    if ($AggressiveCleanup) {
-        $morePaths = @(
-            "$env:LOCALAPPDATA\Microsoft\Windows\INetCache",
-            "$env:LOCALAPPDATA\D3DSCache",
-            "$env:LOCALAPPDATA\NVIDIA\DXCache",
-            "$env:LOCALAPPDATA\NVIDIA\GLCache"
-        )
+    foreach ($target in $cleanupTargets) {
+        Write-Log "Cleaning $($target.Description) at $($target.Path)" 'INFO'
+        $result = Remove-FolderContents -Path $target.Path -Description $target.Description -ContentsOnly:$target.ContentsOnly
 
-        foreach ($path in $morePaths) {
-            Write-Log "Aggressive cleanup of $path" 'INFO'
-            $result = Clear-DirectoryContent -Path $path -WarnOnly
-            $cleanupResults.Add($result) | Out-Null
-
-            if (-not $result.Exists) {
-                Write-Log "Path not found, skipping: $path" 'INFO'
-                continue
+        if ($result.Success) {
+            if ($result.SpaceFreed -gt 0) {
+                $totalSpaceFreed += $result.SpaceFreed
+                $sizeText = if ($result.SpaceFreed -ge 1GB) {
+                    '{0} GB' -f [math]::Round($result.SpaceFreed / 1GB, 2)
+                }
+                else {
+                    '{0} MB' -f [math]::Round($result.SpaceFreed / 1MB, 1)
+                }
+                Write-Log "Cleaned $($target.Description): $sizeText freed across $($result.ItemCount) item(s)." 'OK'
+            }
+            else {
+                Write-Log "$($target.Description): $($result.Message)" 'INFO'
             }
 
-            Write-Log ("Removed {0} item(s) from {1}. Failed removals: {2}" -f $result.RemovedCount, $path, $result.FailedCount) 'INFO'
+            $cleanupResults.Add([PSCustomObject]@{
+                Path        = $target.Path
+                Description = $target.Description
+                ItemCount   = $result.ItemCount
+                SpaceFreed  = [int64]$result.SpaceFreed
+                Status      = 'Success'
+                Message     = $result.Message
+            }) | Out-Null
+        }
+        else {
+            Warn-Step -Name 'TempCleanup' -Reason "$($target.Description) failed: $($result.Message)"
+            $cleanupResults.Add([PSCustomObject]@{
+                Path        = $target.Path
+                Description = $target.Description
+                ItemCount   = 0
+                SpaceFreed  = [int64]0
+                Status      = 'Failed'
+                Message     = $result.Message
+            }) | Out-Null
         }
     }
 
-    $summaryData = [ordered]@{
-        PathsProcessed = $cleanupResults.Count
-        RemovedCount   = ($cleanupResults | Measure-Object -Property RemovedCount -Sum).Sum
-        FailedCount    = ($cleanupResults | Measure-Object -Property FailedCount -Sum).Sum
-        Paths          = (($cleanupResults | ForEach-Object {
-            "{0} [exists={1}, removed={2}, failed={3}]" -f $_.Path, $_.Exists, $_.RemovedCount, $_.FailedCount
-        }) -join '; ')
+    $finalSpace = Get-DiskSpaceInfo -Path $env:SystemDrive
+    $actualFreed = [int64]0
+    if ($initialSpace -and $finalSpace) {
+        $actualFreed = [int64]($finalSpace.FreeSpace - $initialSpace.FreeSpace)
     }
 
-    Add-DetailedResult -Step 'TempCleanup' -Status 'Info' -Message 'Temporary file cleanup completed.' -Data $summaryData
+    Add-DetailedResult -Step 'TempCleanup' -Status 'Info' -Message 'Enhanced temporary file cleanup completed.' -Data @{
+        EstimatedSpaceFreedMB = [math]::Round($totalSpaceFreed / 1MB, 2)
+        ActualSpaceFreedMB    = [math]::Round($actualFreed / 1MB, 2)
+        TargetsProcessed      = $cleanupResults.Count
+        ResultsJson           = ($cleanupResults | ForEach-Object {
+            [ordered]@{
+                Path         = $_.Path
+                Description  = $_.Description
+                ItemCount    = $_.ItemCount
+                SpaceFreedMB = [math]::Round(([double]$_.SpaceFreed) / 1MB, 2)
+                Status       = $_.Status
+                Message      = $_.Message
+            }
+        } | ConvertTo-Json -Compress)
+    }
 }
 
 function Invoke-RepairVolumeScan {
+
     $systemDrive = $env:SystemDrive.TrimEnd(':')
     Write-Log "Running Repair-Volume scan on $($env:SystemDrive)" 'INFO'
     $result = Repair-Volume -DriveLetter $systemDrive -Scan -ErrorAction Stop
