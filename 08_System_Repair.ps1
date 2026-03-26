@@ -1,6 +1,6 @@
 # =====================================================================
 # ScriptName: 08_System_Repair.ps1
-# ScriptVersion: 1.1
+# ScriptVersion: 1.2
 # LastUpdated: 2026-03-26
 # =====================================================================
 
@@ -437,31 +437,57 @@ function Clear-DirectoryContent {
         [switch]$WarnOnly
     )
 
-    if (-not (Test-Path -LiteralPath $Path)) {
-        return
+    $result = [ordered]@{
+        Path           = $Path
+        Exists         = $false
+        RemovedCount   = 0
+        FailedCount    = 0
+        FailedItems    = New-Object System.Collections.Generic.List[string]
     }
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return [PSCustomObject]$result
+    }
+
+    $result.Exists = $true
 
     Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue | ForEach-Object {
         try {
             Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction Stop
+            $result.RemovedCount++
         }
         catch {
+            $result.FailedCount++
+            $result.FailedItems.Add($_.FullName) | Out-Null
             if (-not $WarnOnly) {
                 throw
             }
         }
     }
+
+    return [PSCustomObject]$result
 }
 
 function Invoke-TempCleanup {
     $paths = @(
         "$env:TEMP",
-        "$env:WINDIR\Temp"
+        "$env:WINDIR\Temp",
+        'C:\Temp'
     )
+
+    $cleanupResults = New-Object System.Collections.Generic.List[object]
 
     foreach ($path in $paths) {
         Write-Log "Cleaning temporary files in $path" 'INFO'
-        Clear-DirectoryContent -Path $path -WarnOnly
+        $result = Clear-DirectoryContent -Path $path -WarnOnly
+        $cleanupResults.Add($result) | Out-Null
+
+        if (-not $result.Exists) {
+            Write-Log "Path not found, skipping: $path" 'INFO'
+            continue
+        }
+
+        Write-Log ("Removed {0} item(s) from {1}. Failed removals: {2}" -f $result.RemovedCount, $path, $result.FailedCount) 'INFO'
     }
 
     if ($AggressiveCleanup) {
@@ -474,11 +500,28 @@ function Invoke-TempCleanup {
 
         foreach ($path in $morePaths) {
             Write-Log "Aggressive cleanup of $path" 'INFO'
-            Clear-DirectoryContent -Path $path -WarnOnly
+            $result = Clear-DirectoryContent -Path $path -WarnOnly
+            $cleanupResults.Add($result) | Out-Null
+
+            if (-not $result.Exists) {
+                Write-Log "Path not found, skipping: $path" 'INFO'
+                continue
+            }
+
+            Write-Log ("Removed {0} item(s) from {1}. Failed removals: {2}" -f $result.RemovedCount, $path, $result.FailedCount) 'INFO'
         }
     }
 
-    Add-DetailedResult -Step 'TempCleanup' -Status 'Info' -Message 'Temporary file cleanup completed.'
+    $summaryData = [ordered]@{
+        PathsProcessed = $cleanupResults.Count
+        RemovedCount   = ($cleanupResults | Measure-Object -Property RemovedCount -Sum).Sum
+        FailedCount    = ($cleanupResults | Measure-Object -Property FailedCount -Sum).Sum
+        Paths          = (($cleanupResults | ForEach-Object {
+            "{0} [exists={1}, removed={2}, failed={3}]" -f $_.Path, $_.Exists, $_.RemovedCount, $_.FailedCount
+        }) -join '; ')
+    }
+
+    Add-DetailedResult -Step 'TempCleanup' -Status 'Info' -Message 'Temporary file cleanup completed.' -Data $summaryData
 }
 
 function Invoke-RepairVolumeScan {
