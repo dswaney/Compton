@@ -3357,7 +3357,7 @@ function Run-CorePostDeploymentTasks {
 function Show-Menu {
     Clear-Host
     Write-Host "╔══════════════════════════════════════════════════════════╗" -ForegroundColor Magenta
-    Write-Host "║              Compton College Tech Utils                  ║" -ForegroundColor Magenta
+    Write-Host "║              Compton College Tech Utils                ║" -ForegroundColor Magenta
     Write-Host "╚══════════════════════════════════════════════════════════╝" -ForegroundColor Magenta
     Write-Host ""
 
@@ -3393,10 +3393,10 @@ function Show-Menu {
 # ─────────────────────────────────────────────────────────────────────────────
 function Main {
     do {
-        Clear-Host  # <== Clear screen BEFORE showing the menu
         Show-Menu
-        $selection = Read-Host "Select an option"
-        switch ($selection) {
+        $choice = Read-Host "Enter your selection"
+
+        switch ($choice.ToUpperInvariant()) {
             "1" {
                 Clear-Host
                 New-MISAdminAccount
@@ -3407,111 +3407,108 @@ function Main {
                 Remove-BloatwareApps
                 Pause
             }
-			"3" {
-				Clear-Host
-				Apply-RecommendedRegistrySettings
-				Pause
-			}
-			"4" {
-				Clear-Host
-				Optimize-WindowsServices
-				Pause
-			}
-			"5" {
-				Clear-Host
-				Enable-PowerShellRemotingSafely
-				Pause
-			}
-			"6" {
-				Clear-Host
-				Configure-AutomaticTimeSync
-				Pause
-			}
-			"7" {
-				Clear-Host
-				Set-DesktopPowerSettings
-				Pause
-			}
-			"8" {
-				Clear-Host
-				Start-NetworkOptimization
-				Pause
-			}
-			"9" {
-				Clear-Host
-				Update-Applications
-				Pause
-			}
-			"10" {
-				Clear-Host
-				Update-HPDrivers
-				Pause
-			}
-			"11"{
-				Clear-Host
-				Update-WindowsOS
-				Pause
-			}
-			"12" {
-				Clear-Host
-				Run-DiskCleanup
-				Pause
-				}
-			"13" {
-				Clear-Host
-				Invoke-SystemMaintenance
-				Pause
-			}
-			"14" {
-				Clear-Host
-				Remove-UserProfilesClassroom
-				Pause
-			}
-			"15" {
-				Clear-Host
-				Apply-LoginScreenRegistryFixes
-				Pause
-			}
-			"16" {
-				Clear-Host
-				Set-DomainAutoLogin
-				# Get-AdminCredentials
-				Pause
-			}
-			"17" {
-				Clear-Host
-				Register-LabScheduledTasks
-				Pause
-			}
-			"18" {
-				Clear-Host
-				Set-OneDriveAutoLoginPolicy
-				Pause
-			}
-			"19" {
-				Clear-Host
-				Run-CorePostDeploymentTasks
-				Pause
-			}
-			"20" {
-				Clear-Host
-				Run-NetworkDiagnostics
-				Pause
-			}
-			
-			"Q" {
-				Clear-Host
-				Write-Host "Compton College Tech Utils has exited." -ForegroundColor Cyan
-				exit
-			}
-            default {
+            "3" {
+                Clear-Host
+                Apply-RecommendedRegistrySettings
+                Pause
+            }
+            "4" {
+                Clear-Host
+                Optimize-WindowsServices
+                Pause
+            }
+            "5" {
+                Clear-Host
+                Enable-PowerShellRemotingSafely
+                Pause
+            }
+            "6" {
+                Clear-Host
+                Configure-AutomaticTimeSync
+                Pause
+            }
+            "7" {
+                Clear-Host
+                Set-DesktopPowerSettings
+                Pause
+            }
+            "8" {
+                Clear-Host
+                Start-NetworkOptimization
+                Pause
+            }
+            "9" {
+                Clear-Host
+                Update-Applications
+                Pause
+            }
+            "10" {
+                Clear-Host
+                Update-HPDrivers
+                Pause
+            }
+            "11" {
+                Clear-Host
+                Update-WindowsOS
+                Pause
+            }
+            "12" {
+                Clear-Host
+                Run-DiskCleanup
+                Pause
+            }
+            "13" {
+                Clear-Host
+                Invoke-SystemMaintenance
+                Pause
+            }
+            "14" {
+                Clear-Host
+                Remove-UserProfilesClassroom
+                Pause
+            }
+            "15" {
+                Clear-Host
+                Apply-LoginScreenRegistryFixes
+                Pause
+            }
+            "16" {
+                Clear-Host
+                Set-DomainAutoLogin
+                Pause
+            }
+            "17" {
+                Clear-Host
+                Register-LabScheduledTasks
+                Pause
+            }
+            "18" {
+                Clear-Host
+                Set-OneDriveAutoLoginPolicy
+                Pause
+            }
+            "19" {
+                Clear-Host
+                Run-CorePostDeploymentTasks
+                Pause
+            }
+            "20" {
+                Clear-Host
+                Run-NetworkDiagnostics
+                Pause
+            }
+            "Q" {
+                Clear-Host
+                Write-Host "Compton College Tech Utils has exited." -ForegroundColor Cyan
+                exit
+            }
+            Default {
                 $global:LastStatus = "[ERROR] Invalid selection. Please try again."
                 Start-Sleep -Seconds 1
             }
         }
     } while ($true)
 }
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Entry Point
