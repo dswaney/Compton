@@ -1,6 +1,6 @@
 # =====================================================================
 # ScriptName: 07_Force_Reboot_Install_Updates.ps1
-# ScriptVersion: 1.5
+# ScriptVersion: 1.6
 # LastUpdated: 2026-03-24
 # =====================================================================
 
@@ -14,15 +14,18 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$script:RunStart = Get-Date
-$script:ComputerName = $env:COMPUTERNAME
-$script:StateFilePath = Join-Path $StateDirectory $StateFileName
-$script:YamlLogPath = $null
-$script:TextLogPath = $null
-$script:OverallResult = 'Unknown'
-$script:FailureMessage = $null
-$script:CurrentFlags = @()
-$script:ClearResults = @()
+$script:RunStart         = Get-Date
+$script:ComputerName     = $env:COMPUTERNAME
+$script:StateFilePath    = Join-Path $StateDirectory $StateFileName
+$script:YamlLogPath      = $null
+$script:OverallResult    = 'Unknown'
+$script:FailureMessage   = $null
+$script:CurrentFlags     = @()
+$script:ClearResults     = @()
+$script:ActionHistory    = @()
+$script:CurrentStage     = 0
+$script:RebootIssued     = $false
+$script:RebootReason     = $null
 
 function Ensure-Folder {
     param(
@@ -41,12 +44,10 @@ function Initialize-Paths {
 
     $timestamp = $script:RunStart.ToString('yyyy-MM-dd_HH-mm-ss')
     $baseName = "$($script:ComputerName)-ForceRebootInstallUpdates-$timestamp"
-
     $script:YamlLogPath = Join-Path $LogDirectory ($baseName + '.yaml')
-    $script:TextLogPath = Join-Path $LogDirectory 'Force-Reboot-Install-Updates.log'
 }
 
-function Write-Log {
+function Write-Status {
     param(
         [Parameter(Mandatory)]
         [string]$Message,
@@ -65,10 +66,10 @@ function Write-Log {
         'ERROR' { Write-Host $line -ForegroundColor Red }
     }
 
-    try {
-        Add-Content -Path $script:TextLogPath -Value $line -Encoding UTF8
-    }
-    catch {
+    $script:ActionHistory += [PSCustomObject]@{
+        Time    = $timestamp
+        Level   = $Level
+        Message = $Message
     }
 }
 
@@ -96,15 +97,17 @@ function ConvertTo-YamlScalar {
         return $Value.ToString().ToLowerInvariant()
     }
 
-    if ($Value -is [datetime]) {
-        return "'" + $Value.ToString('yyyy-MM-dd HH:mm:ss') + "'"
-    }
-
     if ($Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal]) {
         return [string]$Value
     }
 
+    if ($Value -is [datetime]) {
+        return "'" + $Value.ToString('yyyy-MM-dd HH:mm:ss') + "'"
+    }
+
     $text = [string]$Value
+    $text = $text -replace "`r", ' '
+    $text = $text -replace "`n", ' '
     $text = $text -replace "'", "''"
     return "'" + $text + "'"
 }
@@ -270,7 +273,7 @@ function Get-State {
         }
     }
     catch {
-        Write-Log "State file unreadable. Resetting state. Error: $($_.Exception.Message)" 'WARN'
+        Write-Status "State file unreadable. Resetting state. Error: $($_.Exception.Message)" 'WARN'
         [PSCustomObject]@{
             Stage     = 0
             FirstSeen = $null
@@ -303,11 +306,11 @@ function Reset-State {
     try {
         if (Test-Path -LiteralPath $script:StateFilePath) {
             Remove-Item -LiteralPath $script:StateFilePath -Force -ErrorAction Stop
-            Write-Log "Reset reboot state tracking." 'OK'
+            Write-Status "Reset reboot state tracking." 'OK'
         }
     }
     catch {
-        Write-Log "Failed to remove state file: $($_.Exception.Message)" 'WARN'
+        Write-Status "Failed to remove state file: $($_.Exception.Message)" 'WARN'
     }
 }
 
@@ -321,16 +324,16 @@ function Remove-RegistryKeySafe {
         if (Test-Path -LiteralPath $Path) {
             Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
             $script:ClearResults += New-ClearResult -Name $Name -Path $Path -Action 'RemoveKey' -Status 'Succeeded' -Message 'Registry key removed.'
-            Write-Log "Removed key for [$Name]: $Path" 'OK'
+            Write-Status "Removed key for [$Name]: $Path" 'OK'
         }
         else {
             $script:ClearResults += New-ClearResult -Name $Name -Path $Path -Action 'RemoveKey' -Status 'Skipped' -Message 'Registry key not present.'
-            Write-Log "Key already absent for [$Name]: $Path" 'INFO'
+            Write-Status "Key already absent for [$Name]: $Path" 'INFO'
         }
     }
     catch {
         $script:ClearResults += New-ClearResult -Name $Name -Path $Path -Action 'RemoveKey' -Status 'Failed' -Message $_.Exception.Message
-        Write-Log "Failed removing key for [$Name]: $($_.Exception.Message)" 'ERROR'
+        Write-Status "Failed removing key for [$Name]: $($_.Exception.Message)" 'ERROR'
     }
 }
 
@@ -347,21 +350,21 @@ function Remove-RegistryValueSafe {
             if ($null -ne $currentValue) {
                 Remove-ItemProperty -LiteralPath $Path -Name $ValueName -ErrorAction Stop
                 $script:ClearResults += New-ClearResult -Name $Name -Path "$Path\$ValueName" -Action 'RemoveValue' -Status 'Succeeded' -Message 'Registry value removed.'
-                Write-Log "Removed value for [$Name]: $Path\$ValueName" 'OK'
+                Write-Status "Removed value for [$Name]: $Path\$ValueName" 'OK'
             }
             else {
                 $script:ClearResults += New-ClearResult -Name $Name -Path "$Path\$ValueName" -Action 'RemoveValue' -Status 'Skipped' -Message 'Registry value not present.'
-                Write-Log "Value already absent for [$Name]: $Path\$ValueName" 'INFO'
+                Write-Status "Value already absent for [$Name]: $Path\$ValueName" 'INFO'
             }
         }
         else {
             $script:ClearResults += New-ClearResult -Name $Name -Path "$Path\$ValueName" -Action 'RemoveValue' -Status 'Skipped' -Message 'Registry path not present.'
-            Write-Log "Path absent for [$Name]: $Path" 'INFO'
+            Write-Status "Path absent for [$Name]: $Path" 'INFO'
         }
     }
     catch {
         $script:ClearResults += New-ClearResult -Name $Name -Path "$Path\$ValueName" -Action 'RemoveValue' -Status 'Failed' -Message $_.Exception.Message
-        Write-Log "Failed removing value for [$Name]: $($_.Exception.Message)" 'ERROR'
+        Write-Status "Failed removing value for [$Name]: $($_.Exception.Message)" 'ERROR'
     }
 }
 
@@ -381,17 +384,17 @@ function Set-RegistryValueSafe {
 
         New-ItemProperty -LiteralPath $Path -Name $ValueName -PropertyType $Type -Value $Value -Force | Out-Null
         $script:ClearResults += New-ClearResult -Name $Name -Path "$Path\$ValueName" -Action 'SetValue' -Status 'Succeeded' -Message "Set to $Value."
-        Write-Log "Set [$Name] value: $Path\$ValueName = $Value" 'OK'
+        Write-Status "Set [$Name] value: $Path\$ValueName = $Value" 'OK'
     }
     catch {
         $script:ClearResults += New-ClearResult -Name $Name -Path "$Path\$ValueName" -Action 'SetValue' -Status 'Failed' -Message $_.Exception.Message
-        Write-Log "Failed setting value for [$Name]: $($_.Exception.Message)" 'ERROR'
+        Write-Status "Failed setting value for [$Name]: $($_.Exception.Message)" 'ERROR'
     }
 }
 
 function Clear-PendingRebootFlags {
     $script:ClearResults = @()
-    Write-Log "Attempting to clear persistent reboot flags..." 'WARN'
+    Write-Status "Attempting to clear persistent reboot flags..." 'WARN'
 
     Remove-RegistryKeySafe   -Name 'WindowsUpdateRebootRequired'      -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
     Remove-RegistryKeySafe   -Name 'WindowsUpdatePostRebootReporting' -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\PostRebootReporting'
@@ -406,32 +409,29 @@ function Clear-PendingRebootFlags {
 }
 
 function Write-YamlLog {
-    param(
-        [int]$StageBeforeClear,
-        $FlagsBeforeClear,
-        $ClearResults
-    )
-
     try {
         $runEnd = Get-Date
         $duration = [math]::Round(($runEnd - $script:RunStart).TotalSeconds, 0)
-        $flags = @($FlagsBeforeClear)
-        $clear = @($ClearResults)
+        $flags = @($script:CurrentFlags)
+        $clear = @($script:ClearResults)
+        $actions = @($script:ActionHistory)
 
         $lines = New-Object System.Collections.Generic.List[string]
 
         $lines.Add("computer_name: $(ConvertTo-YamlScalar $script:ComputerName)") | Out-Null
         $lines.Add("script_name: '07_Force_Reboot_Install_Updates.ps1'") | Out-Null
-        $lines.Add("script_version: '1.5'") | Out-Null
+        $lines.Add("script_version: '1.6'") | Out-Null
         $lines.Add("run_started: $(ConvertTo-YamlScalar $script:RunStart)") | Out-Null
         $lines.Add("run_finished: $(ConvertTo-YamlScalar $runEnd)") | Out-Null
         $lines.Add("duration_seconds: $duration") | Out-Null
-        $lines.Add("stage_before_clear: $StageBeforeClear") | Out-Null
+        $lines.Add("stage: $($script:CurrentStage)") | Out-Null
+        $lines.Add("reboot_issued: $(ConvertTo-YamlScalar $script:RebootIssued)") | Out-Null
+        $lines.Add("reboot_reason: $(ConvertTo-YamlScalar $script:RebootReason)") | Out-Null
         $lines.Add("overall_result: $(ConvertTo-YamlScalar $script:OverallResult)") | Out-Null
         $lines.Add("failure_message: $(ConvertTo-YamlScalar $script:FailureMessage)") | Out-Null
         $lines.Add('') | Out-Null
 
-        $lines.Add('flags_still_present_before_clear:') | Out-Null
+        $lines.Add('flags_detected:') | Out-Null
         if ($flags.Count -gt 0) {
             foreach ($flag in $flags) {
                 $lines.Add('  -') | Out-Null
@@ -462,11 +462,24 @@ function Write-YamlLog {
             $lines.Add('  []') | Out-Null
         }
 
+        $lines.Add('') | Out-Null
+        $lines.Add('actions:') | Out-Null
+        if ($actions.Count -gt 0) {
+            foreach ($action in $actions) {
+                $lines.Add('  -') | Out-Null
+                $lines.Add("    time: $(ConvertTo-YamlScalar $action.Time)") | Out-Null
+                $lines.Add("    level: $(ConvertTo-YamlScalar $action.Level)") | Out-Null
+                $lines.Add("    message: $(ConvertTo-YamlScalar $action.Message)") | Out-Null
+            }
+        }
+        else {
+            $lines.Add('  []') | Out-Null
+        }
+
         Set-Content -Path $script:YamlLogPath -Value $lines -Encoding UTF8
-        Write-Log "YAML log written: $($script:YamlLogPath)" 'OK'
     }
     catch {
-        Write-Log "Failed to write YAML log: $($_.Exception.Message)" 'ERROR'
+        Write-Warning "Failed to write YAML log: $($_.Exception.Message)"
     }
 }
 
@@ -476,7 +489,11 @@ function Invoke-ForcedReboot {
         [string]$Reason
     )
 
-    Write-Log "Issuing forced reboot in $RebootDelaySeconds seconds. Reason: $Reason" 'WARN'
+    $script:RebootIssued = $true
+    $script:RebootReason = $Reason
+
+    Write-Status "Issuing forced reboot in $RebootDelaySeconds seconds. Reason: $Reason" 'WARN'
+    Write-YamlLog
 
     $arguments = @(
         '/r'
@@ -504,7 +521,7 @@ if (-not (Test-IsAdministrator)) {
     exit 1
 }
 
-Write-Log "Starting reboot flag evaluation..." 'INFO'
+Write-Status "Starting reboot flag evaluation..." 'INFO'
 
 try {
     $state = Get-State
@@ -518,9 +535,11 @@ try {
         $stage = 0
     }
 
+    $script:CurrentStage = $stage
+
     switch ($stage) {
         0 {
-            Write-Log "First pass detected. Forcing reboot regardless of flag state." 'WARN'
+            Write-Status "First pass detected. Forcing reboot regardless of flag state." 'WARN'
             Save-State -Stage 1 -FirstSeen ((Get-Date).ToString('o')) -LastRun ((Get-Date).ToString('o')) -LastFlags $flags
             $script:OverallResult = 'ForcedInitialReboot'
             Invoke-ForcedReboot -Reason 'Initial forced reboot for update cycle.'
@@ -528,9 +547,9 @@ try {
 
         1 {
             if ($flags.Count -gt 0) {
-                Write-Log "Second pass: reboot flags still detected. Issuing second reboot." 'WARN'
+                Write-Status "Second pass: reboot flags still detected. Issuing second reboot." 'WARN'
                 foreach ($flag in $flags) {
-                    Write-Log "Flag detected: $($flag.Name) | $($flag.Path) | $($flag.Details)" 'WARN'
+                    Write-Status "Flag detected: $($flag.Name) | $($flag.Path) | $($flag.Details)" 'WARN'
                 }
 
                 Save-State -Stage 2 -FirstSeen $state.FirstSeen -LastRun ((Get-Date).ToString('o')) -LastFlags $flags
@@ -538,38 +557,41 @@ try {
                 Invoke-ForcedReboot -Reason 'Reboot flags remain after initial reboot. Issuing second reboot.'
             }
             else {
-                Write-Log "Second pass: no reboot flags detected. Resetting state and exiting normally." 'OK'
+                Write-Status "Second pass: no reboot flags detected. Resetting state and exiting normally." 'OK'
                 Reset-State
                 $script:OverallResult = 'SecondPassNoFlags'
+                Write-YamlLog
                 exit 0
             }
         }
 
         2 {
             if ($flags.Count -gt 0) {
-                Write-Log "Third pass: reboot flags still present after two reboots. Logging and clearing." 'ERROR'
+                Write-Status "Third pass: reboot flags still present after two reboots. Logging and clearing." 'ERROR'
                 foreach ($flag in $flags) {
-                    Write-Log "Persistent flag: $($flag.Name) | $($flag.Path) | $($flag.Details)" 'ERROR'
+                    Write-Status "Persistent flag: $($flag.Name) | $($flag.Path) | $($flag.Details)" 'ERROR'
                 }
 
                 $script:OverallResult = 'FlagsPersistedAfterTwoReboots'
-                $clearResults = @(Clear-PendingRebootFlags)
-                Write-YamlLog -StageBeforeClear $stage -FlagsBeforeClear $flags -ClearResults $clearResults
+                [void](Clear-PendingRebootFlags)
+                Write-YamlLog
                 Reset-State
                 exit 2
             }
             else {
-                Write-Log "Third pass: no reboot flags detected. Resetting state and exiting normally." 'OK'
+                Write-Status "Third pass: no reboot flags detected. Resetting state and exiting normally." 'OK'
                 Reset-State
                 $script:OverallResult = 'ThirdPassNoFlags'
+                Write-YamlLog
                 exit 0
             }
         }
 
         default {
-            Write-Log "Unexpected state value [$stage]. Resetting state and starting over with forced initial reboot." 'WARN'
+            Write-Status "Unexpected state value [$stage]. Resetting state and starting over with forced initial reboot." 'WARN'
             Reset-State
             Save-State -Stage 1 -FirstSeen ((Get-Date).ToString('o')) -LastRun ((Get-Date).ToString('o')) -LastFlags $flags
+            $script:CurrentStage = 0
             $script:OverallResult = 'ForcedInitialRebootAfterStateReset'
             Invoke-ForcedReboot -Reason 'State reset occurred. Performing initial forced reboot for update cycle.'
         }
@@ -578,13 +600,7 @@ try {
 catch {
     $script:FailureMessage = $_.Exception.Message
     $script:OverallResult = 'Failed'
-    Write-Log "Script failed: $($_.Exception.Message)" 'ERROR'
-
-    try {
-        Write-YamlLog -StageBeforeClear 0 -FlagsBeforeClear $script:CurrentFlags -ClearResults $script:ClearResults
-    }
-    catch {
-    }
-
+    Write-Status "Script failed: $($_.Exception.Message)" 'ERROR'
+    Write-YamlLog
     exit 3
 }
