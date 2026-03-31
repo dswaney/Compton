@@ -1,5 +1,5 @@
-﻿# ScriptVersion: 1.0
-# LastUpdated: 2026-03-23
+# ScriptVersion: 1.1
+# LastUpdated: 2026-03-31
 
 [CmdletBinding()]
 param(
@@ -55,20 +55,119 @@ function Test-IsAdministrator {
     }
 }
 
-function Get-InstalledEdgeVersion {
-    $candidates = @(
-        "$env:ProgramFiles(x86)\Microsoft\Edge\Application\msedge.exe",
-        "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe"
+function ConvertTo-Version {
+    param(
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$Value
     )
 
-    foreach ($path in $candidates) {
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return $null
+    }
+
+    $match = [regex]::Match($Value, '\d+(?:\.\d+){1,3}')
+    if (-not $match.Success) {
+        return $null
+    }
+
+    try {
+        return [version]$match.Value
+    }
+    catch {
+        return $null
+    }
+}
+
+function Get-InstalledEdgeVersion {
+    $registryCandidates = @(
+        'HKLM:\SOFTWARE\Microsoft\Edge\BLBeacon',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Edge\BLBeacon',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft Edge',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft Edge'
+    )
+
+    foreach ($key in $registryCandidates) {
+        try {
+            if (Test-Path -LiteralPath $key) {
+                $item = Get-ItemProperty -LiteralPath $key -ErrorAction Stop
+                foreach ($propertyName in @('version', 'pv', 'DisplayVersion')) {
+                    $candidate = ConvertTo-Version -Value ($item.$propertyName)
+                    if ($candidate) {
+                        return $candidate
+                    }
+                }
+            }
+        }
+        catch {
+        }
+    }
+
+    $fileCandidates = @(
+        "$env:ProgramFiles(x86)\Microsoft\Edge\Application\msedge.exe",
+        "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe",
+        "$env:ProgramFiles(x86)\Microsoft\Edge\Application\msedge.dll",
+        "$env:ProgramFiles\Microsoft\Edge\Application\msedge.dll"
+    )
+
+    foreach ($path in $fileCandidates) {
         if (Test-Path -LiteralPath $path) {
             try {
-                return [version](Get-Item -LiteralPath $path).VersionInfo.ProductVersion
+                $item = Get-Item -LiteralPath $path -ErrorAction Stop
+                $candidate = ConvertTo-Version -Value $item.VersionInfo.ProductVersion
+                if ($candidate) {
+                    return $candidate
+                }
             }
             catch {
             }
         }
+    }
+
+    return $null
+}
+
+function Get-MsiProductVersion {
+    param(
+        [Parameter(Mandatory)][string]$Path
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return $null
+    }
+
+    $installer = $null
+    $database = $null
+    $view = $null
+    $record = $null
+
+    try {
+        $installer = New-Object -ComObject WindowsInstaller.Installer
+        $database = $installer.GetType().InvokeMember('OpenDatabase', 'InvokeMethod', $null, $installer, @($Path, 0))
+        $view = $database.GetType().InvokeMember('OpenView', 'InvokeMethod', $null, $database, @("SELECT `Value` FROM `Property` WHERE `Property`='ProductVersion'"))
+        $view.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $view, $null) | Out-Null
+        $record = $view.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $view, $null)
+
+        if ($record) {
+            $value = $record.GetType().InvokeMember('StringData', 'GetProperty', $null, $record, 1)
+            return (ConvertTo-Version -Value $value)
+        }
+    }
+    catch {
+        Write-Log "Could not read ProductVersion from MSI '$Path': $($_.Exception.Message)" 'WARN'
+    }
+    finally {
+        foreach ($comObject in @($record, $view, $database, $installer)) {
+            if ($null -ne $comObject) {
+                try {
+                    [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($comObject)
+                }
+                catch {
+                }
+            }
+        }
+        [GC]::Collect()
+        [GC]::WaitForPendingFinalizers()
     }
 
     return $null
@@ -196,11 +295,33 @@ if ($KillEdgeProcesses) {
 
 try {
     Download-File -Url $EdgeMsiUrl -Destination $EdgeMsiPath
+}
+catch {
+    Write-Log "Script failed during download: $($_.Exception.Message)" 'ERROR'
+    exit 2
+}
+
+$downloadedVersion = Get-MsiProductVersion -Path $EdgeMsiPath
+if ($downloadedVersion) {
+    Write-Log "Downloaded Edge MSI version: $downloadedVersion" 'INFO'
+}
+else {
+    Write-Log "Could not determine downloaded Edge MSI version before install." 'WARN'
+}
+
+if (-not $ForceReinstall -and $beforeVersion -and $downloadedVersion) {
+    if ($beforeVersion -ge $downloadedVersion) {
+        Write-Log "Installed Edge version ($beforeVersion) is already the same as or newer than the downloaded MSI version ($downloadedVersion). Skipping install." 'OK'
+        exit 0
+    }
+}
+
+try {
     $installExitCode = Install-EdgeMsi -MsiPath $EdgeMsiPath -MsiLog $MsiLogPath
 }
 catch {
-    Write-Log "Script failed: $($_.Exception.Message)" 'ERROR'
-    exit 2
+    Write-Log "Script failed during install: $($_.Exception.Message)" 'ERROR'
+    exit 3
 }
 
 Start-Sleep -Seconds 5
@@ -213,7 +334,30 @@ else {
     Write-Log "Could not detect Edge version after install." 'WARN'
 }
 
-if ($beforeVersion -and $afterVersion) {
+if ($beforeVersion -and $downloadedVersion) {
+    if ($beforeVersion -lt $downloadedVersion) {
+        Write-Log "Installed version was older than the downloaded version and an update was needed." 'INFO'
+    }
+    elseif ($beforeVersion -eq $downloadedVersion) {
+        Write-Log "Installed version already matched the downloaded MSI version before install." 'INFO'
+    }
+    else {
+        Write-Log "Installed version before update was newer than the downloaded MSI version. Review whether the download source is behind your installed build." 'WARN'
+    }
+}
+
+if ($afterVersion -and $downloadedVersion) {
+    if ($afterVersion -eq $downloadedVersion) {
+        Write-Log "Installed Edge version now matches the downloaded MSI version." 'OK'
+    }
+    elseif ($afterVersion -gt $downloadedVersion) {
+        Write-Log "Installed Edge version after update is newer than the downloaded MSI version. Edge Update may have advanced the build beyond the MSI version." 'WARN'
+    }
+    else {
+        Write-Log "Installed Edge version after update is still lower than the downloaded MSI version. Review MSI log: $MsiLogPath" 'WARN'
+    }
+}
+elseif ($beforeVersion -and $afterVersion) {
     if ($afterVersion -gt $beforeVersion) {
         Write-Log "Edge was upgraded successfully." 'OK'
     }
