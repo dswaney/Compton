@@ -1,10 +1,10 @@
 # =====================================================================
 # ScriptName: 02_Remove_User_Profiles.ps1
-# ScriptVersion: 1.2
+# ScriptVersion: 1.3
 # LastUpdated: 2026-03-31
 # =====================================================================
 
-[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Low')]
 param(
     [string[]]$ExcludedProfiles = @(
         'Default',
@@ -373,7 +373,7 @@ foreach ($profile in $allUserProfiles) {
     try {
         if ($PSCmdlet.ShouldProcess($targetDescription, 'Delete user profile')) {
             Write-Log "Deleting profile: $targetDescription" 'INFO'
-            Remove-CimInstance -InputObject $profile -ErrorAction Stop
+            Remove-CimInstance -InputObject $profile -Confirm:$false -ErrorAction Stop
             $script:Summary.DeletedProfiles++
             Write-Log "Successfully deleted profile: $profileName" 'OK'
 
