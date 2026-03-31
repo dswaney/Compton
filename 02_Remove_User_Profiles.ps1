@@ -1,6 +1,6 @@
 # =====================================================================
 # ScriptName: 02_Remove_User_Profiles.ps1
-# ScriptVersion: 1.3
+# ScriptVersion: 1.4
 # LastUpdated: 2026-03-31
 # =====================================================================
 
@@ -227,11 +227,26 @@ function Get-ProfileFolderName {
 function Get-ProfileAgeData {
     param(
         [Parameter(Mandatory)][string]$ProfilePath,
-        [AllowNull()][datetime]$LastUseTime
+        [AllowNull()]$LastUseTime = $null
     )
 
     $createdTime = $null
     $daysOnSystem = $null
+    $normalizedLastUseTime = $null
+
+    try {
+        if ($null -ne $LastUseTime -and -not [string]::IsNullOrWhiteSpace([string]$LastUseTime)) {
+            if ($LastUseTime -is [datetime]) {
+                $normalizedLastUseTime = $LastUseTime
+            }
+            else {
+                $normalizedLastUseTime = [Management.ManagementDateTimeConverter]::ToDateTime([string]$LastUseTime)
+            }
+        }
+    }
+    catch {
+        $normalizedLastUseTime = $null
+    }
 
     try {
         if (Test-Path -LiteralPath $ProfilePath) {
@@ -245,7 +260,7 @@ function Get-ProfileAgeData {
 
     return [PSCustomObject]@{
         CreatedTime  = $createdTime
-        LastUseTime  = $LastUseTime
+        LastUseTime  = $normalizedLastUseTime
         DaysOnSystem = $daysOnSystem
     }
 }
