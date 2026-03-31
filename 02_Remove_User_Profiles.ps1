@@ -1,7 +1,7 @@
 # =====================================================================
 # ScriptName: 02_Remove_User_Profiles.ps1
-# ScriptVersion: 1.1
-# LastUpdated: 2026-03-23
+# ScriptVersion: 1.2
+# LastUpdated: 2026-03-31
 # =====================================================================
 
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
@@ -364,7 +364,7 @@ foreach ($profile in $allUserProfiles) {
             }
         }
         catch {
-            Write-Log "Could not evaluate LastUseTime for $profileName: $($_.Exception.Message)" 'WARN'
+            Write-Log "Could not evaluate LastUseTime for ${profileName}: $($_.Exception.Message)" 'WARN'
         }
     }
 
