@@ -1,6 +1,6 @@
 # =====================================================================
 # ScriptName: Compton_Tech_Utils.ps1
-# ScriptVersion: 1.8.5
+# ScriptVersion: 1.8.6
 # LastUpdated: 2026-03-26
 # Notes: Merged working script body with startup self-update check and version header.
 # Notes: Master utility script with merged menu options and YAML logging.
@@ -1716,7 +1716,7 @@ function Optimize-WindowsServices {
             "SSDPSRV"                       = "Manual"
             "ScDeviceEnum"                  = "Manual"
             "SecurityHealthService"         = "Manual"
-            "Sense"                         = "Manual"
+            "Sense"                         = "Automatic"
             "SensorDataService"             = "Manual"
             "SensorService"                 = "Manual"
             "SensrSvc"                      = "Manual"
