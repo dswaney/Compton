@@ -1,5 +1,5 @@
-# ScriptVersion: 1.3
-# LastUpdated: 2026-04-02
+# ScriptVersion: 1.5
+# LastUpdated: 2026-04-03
 
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Low')]
 param(
@@ -9,6 +9,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$WindowsPowerShellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 
 function Write-Log {
     param(
@@ -49,33 +50,20 @@ function Test-IsAdministrator {
     }
 }
 
-function Invoke-Schtasks {
-    param(
-        [Parameter(Mandatory)][string[]]$Arguments,
-        [Parameter(Mandatory)][string]$Description
-    )
+function Get-TaskPrincipal {
+    return New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+}
 
-    $rendered = ($Arguments | ForEach-Object {
-        if ($_ -match '\s') { '"{0}"' -f $_ } else { $_ }
-    }) -join ' '
-
-    Write-Log "Running schtasks.exe $rendered" 'INFO'
-
-    $output = & schtasks.exe @Arguments 2>&1
-    $exitCode = $LASTEXITCODE
-
-    if ($output) {
-        foreach ($line in ($output | Out-String).Trim().Split([Environment]::NewLine, [StringSplitOptions]::RemoveEmptyEntries)) {
-            Write-Log "${Description}: $line" 'INFO'
-        }
-    }
-
-    if ($exitCode -ne 0) {
-        throw "schtasks.exe failed for $Description with exit code $exitCode."
-    }
+function Get-TaskSettings {
+    return New-ScheduledTaskSettingsSet `
+        -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries `
+        -StartWhenAvailable `
+        -ExecutionTimeLimit (New-TimeSpan -Hours 12)
 }
 
 function Remove-ExistingScheduledTasks {
+    [CmdletBinding(SupportsShouldProcess = $true)]
     param(
         [switch]$DeleteMicrosoftTasks
     )
@@ -119,6 +107,7 @@ function Remove-ExistingScheduledTasks {
 }
 
 function Register-WeeklyPowerShellTask {
+    [CmdletBinding(SupportsShouldProcess = $true)]
     param(
         [Parameter(Mandatory)][string]$TaskName,
         [Parameter(Mandatory)][string]$ScriptPath,
@@ -126,35 +115,41 @@ function Register-WeeklyPowerShellTask {
         [string]$ExtraArguments = ''
     )
 
+    if (-not (Test-Path -LiteralPath $WindowsPowerShellExe)) {
+        throw "Windows PowerShell executable not found: $WindowsPowerShellExe"
+    }
+
     if (-not (Test-Path -LiteralPath $ScriptPath)) {
         Write-Log "Script path does not currently exist, but the task will still be created: $ScriptPath" 'WARN'
     }
 
-    $taskCommand = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$ScriptPath`""
+    $argumentString = "-NoProfile -ExecutionPolicy Bypass -File `"$ScriptPath`""
     if (-not [string]::IsNullOrWhiteSpace($ExtraArguments)) {
-        $taskCommand = "$taskCommand $ExtraArguments"
+        $argumentString = "$argumentString $ExtraArguments"
     }
 
-    $arguments = @(
-        '/Create'
-        '/TN', $TaskName
-        '/TR', $taskCommand
-        '/SC', 'WEEKLY'
-        '/D', 'SUN'
-        '/ST', $StartTime
-        '/RL', 'HIGHEST'
-        '/RU', 'SYSTEM'
-        '/F'
-    )
+    $displayCommand = "$WindowsPowerShellExe $argumentString"
+    Write-Log "Registering task '$TaskName' with action: $displayCommand" 'INFO'
 
-    if ($PSCmdlet.ShouldProcess($TaskName, 'Create weekly scheduled task')) {
-        Invoke-Schtasks -Arguments $arguments -Description "Create task $TaskName"
-        Write-Log "Created task '$TaskName' for Sunday at $StartTime." 'OK'
+    try {
+        $action = New-ScheduledTaskAction -Execute $WindowsPowerShellExe -Argument $argumentString
+        $startAt = [datetime]::Today.Add([timespan]::Parse($StartTime))
+        $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday -WeeksInterval 1 -At $startAt
+        $principal = Get-TaskPrincipal
+        $settings = Get-TaskSettings
+
+        if ($PSCmdlet.ShouldProcess($TaskName, 'Register weekly scheduled task')) {
+            Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+            Write-Log "Created task '$TaskName' for Sunday at $StartTime." 'OK'
+        }
+    }
+    catch {
+        throw "Failed to create weekly task '$TaskName'. $($_.Exception.Message)"
     }
 }
 
-
 function Ensure-TimeSyncHelperScript {
+    [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$ScriptsDirectory
     )
@@ -194,29 +189,38 @@ exit 0
 }
 
 function Register-TimeSyncTask {
+    [CmdletBinding(SupportsShouldProcess = $true)]
     param(
         [Parameter(Mandatory)][string]$ScriptsDirectory,
         [string]$TaskName = '00. Sync System Time Every 4 Hours'
     )
 
+    if (-not (Test-Path -LiteralPath $WindowsPowerShellExe)) {
+        throw "Windows PowerShell executable not found: $WindowsPowerShellExe"
+    }
+
     $helperScriptPath = Ensure-TimeSyncHelperScript -ScriptsDirectory $ScriptsDirectory
-    $taskCommand = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$helperScriptPath`""
+    $argumentString = "-NoProfile -ExecutionPolicy Bypass -File `"$helperScriptPath`""
+    $displayCommand = "$WindowsPowerShellExe $argumentString"
+    Write-Log "Registering task '$TaskName' with action: $displayCommand" 'INFO'
 
-    $arguments = @(
-        '/Create'
-        '/TN', $TaskName
-        '/TR', $taskCommand
-        '/SC', 'HOURLY'
-        '/MO', '4'
-        '/ST', '00:00'
-        '/RL', 'HIGHEST'
-        '/RU', 'SYSTEM'
-        '/F'
-    )
+    try {
+        $action = New-ScheduledTaskAction -Execute $WindowsPowerShellExe -Argument $argumentString
+        $triggerTimes = @('00:00','04:00','08:00','12:00','16:00','20:00')
+        $triggers = foreach ($timeText in $triggerTimes) {
+            $atTime = [datetime]::Today.Add([timespan]::Parse($timeText))
+            New-ScheduledTaskTrigger -Daily -At $atTime -DaysInterval 1
+        }
+        $principal = Get-TaskPrincipal
+        $settings = Get-TaskSettings
 
-    if ($PSCmdlet.ShouldProcess($TaskName, 'Create time sync scheduled task')) {
-        Invoke-Schtasks -Arguments $arguments -Description "Create task $TaskName"
-        Write-Log "Created task '$TaskName' to sync time every 4 hours using helper script '$helperScriptPath'." 'OK'
+        if ($PSCmdlet.ShouldProcess($TaskName, 'Register time sync scheduled task')) {
+            Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $triggers -Principal $principal -Settings $settings -Force | Out-Null
+            Write-Log "Created task '$TaskName' to sync time every 4 hours using helper script '$helperScriptPath'." 'OK'
+        }
+    }
+    catch {
+        throw "Failed to create time sync task '$TaskName'. $($_.Exception.Message)"
     }
 }
 
@@ -247,6 +251,8 @@ Write-Log "Delete Microsoft tasks: $IncludeMicrosoftTasks" 'INFO'
 Write-Log 'Weekly tasks will be registered for Sunday, matching the batch file commands.' 'INFO'
 
 try {
+    Import-Module ScheduledTasks -ErrorAction Stop | Out-Null
+
     Remove-ExistingScheduledTasks -DeleteMicrosoftTasks:$IncludeMicrosoftTasks
 
     foreach ($task in $taskDefinitions) {
