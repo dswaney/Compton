@@ -1,7 +1,7 @@
 ﻿# =====================================================================
 # ScriptName: 00_Update-Scripts-FromGitHub.ps1
-# ScriptVersion: 1.6
-# LastUpdated: 2026-03-26
+# ScriptVersion: 1.7
+# LastUpdated: 2026-04-06
 # =====================================================================
 
 [CmdletBinding()]
