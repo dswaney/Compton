@@ -1,14 +1,14 @@
 # =====================================================================
 # ScriptName: 05_Weekend_HP_Drivers_Update.ps1
-# ScriptVersion: 1.1
-# LastUpdated: 2026-03-23
+# ScriptVersion: 1.4
+# LastUpdated: 2026-04-07
 # =====================================================================
 
 [CmdletBinding()]
 param(
-    [switch]$IncludeBIOS = $false,
+    [switch]$IncludeBIOS = $false, # Ignored in this hardened version; BIOS updates are blocked
     [switch]$IncludeSoftware = $false,
-    [switch]$SuspendBitLockerForBIOS = $false,
+    [switch]$SuspendBitLockerForBIOS = $false, # Ignored in this hardened version; BIOS updates are blocked
     [string]$WorkingRoot = 'C:\Temp\HPDrivers',
     [string]$LogPath = 'C:\Temp\HPDrivers\HP-Driver-Update.log',
     [string]$YamlLogFolder = 'C:\Logs',
@@ -158,7 +158,7 @@ function Write-YamlLog {
 
         $yamlLines.Add('computer_name: ' + (ConvertTo-YamlSafeValue $script:ComputerName)) | Out-Null
         $yamlLines.Add('script_name: "05_Weekend_HP_Drivers_Update.ps1"') | Out-Null
-        $yamlLines.Add('script_version: "1.1"') | Out-Null
+        $yamlLines.Add('script_version: "1.4"') | Out-Null
         $yamlLines.Add('run_started: ' + (ConvertTo-YamlSafeValue ($script:RunStart.ToString('yyyy-MM-dd HH:mm:ss')))) | Out-Null
         $yamlLines.Add('run_finished: ' + (ConvertTo-YamlSafeValue ($runEnd.ToString('yyyy-MM-dd HH:mm:ss')))) | Out-Null
         $yamlLines.Add('duration_seconds: ' + $duration) | Out-Null
@@ -422,7 +422,7 @@ function Get-HPSoftpaqCategories {
     $categories = @('Driver')
 
     if ($IncludeBIOS) {
-        $categories += 'BIOS'
+        Write-Log "IncludeBIOS was requested, but this script is hardened to block BIOS updates. BIOS updates will not be installed." 'WARN'
     }
 
     if ($IncludeSoftware) {
@@ -456,6 +456,55 @@ function Get-DriverList {
     return @($list)
 }
 
+
+function Exclude-BiosAndFirmwareSoftpaqs {
+    param([object[]]$Softpaqs)
+
+    if (-not $Softpaqs) {
+        return @()
+    }
+
+    $blockedPattern = '(?i)\b(BIOS|Firmware|UEFI|System\s+Firmware|Embedded\s+Controller|EC\s+Firmware|Thunderbolt\s+Firmware|Dock\s+Firmware)\b'
+    $allowed = @()
+
+    foreach ($item in $Softpaqs) {
+        $category = ''
+        $name = ''
+        $id = ''
+        $version = ''
+
+        if ($null -ne $item) {
+            if ($item.PSObject.Properties.Name -contains 'Category' -and $null -ne $item.Category) {
+                $category = [string]$item.Category
+            }
+            if ($item.PSObject.Properties.Name -contains 'Name' -and $null -ne $item.Name) {
+                $name = [string]$item.Name
+            }
+            if ($item.PSObject.Properties.Name -contains 'Id' -and $null -ne $item.Id) {
+                $id = [string]$item.Id
+            }
+            if ($item.PSObject.Properties.Name -contains 'Version' -and $null -ne $item.Version) {
+                $version = [string]$item.Version
+            }
+        }
+
+        $isBlocked = $false
+        if ($category -match '(?i)\bBIOS\b' -or $category -match '(?i)\bFirmware\b' -or $name -match $blockedPattern) {
+            $isBlocked = $true
+        }
+
+        if ($isBlocked) {
+            Write-Log "Blocking BIOS/Firmware SoftPaq: [$id] $name (Category: $category)" 'WARN'
+            Add-InstalledSoftPaqResult -Id $id -Name $name -Version $version -Status 'Blocked' -Message 'Skipped because BIOS/Firmware updates are not allowed in this script'
+        }
+        else {
+            $allowed += $item
+        }
+    }
+
+    return $allowed
+}
+
 function Install-SoftpaqList {
     param([object[]]$Softpaqs)
 
@@ -480,28 +529,10 @@ function Install-SoftpaqList {
 }
 
 function Suspend-BitLockerIfNeeded {
-    if (-not $SuspendBitLockerForBIOS) {
-        return
+    if ($SuspendBitLockerForBIOS) {
+        Write-Log "SuspendBitLockerForBIOS was requested, but this script is hardened to block BIOS updates. BitLocker suspend will not be used." 'WARN'
     }
-
-    if (-not $IncludeBIOS) {
-        Write-Log "SuspendBitLockerForBIOS was requested, but IncludeBIOS is not enabled. Skipping BitLocker suspend." 'WARN'
-        return
-    }
-
-    try {
-        $vol = Get-BitLockerVolume -MountPoint 'C:'
-        if ($vol.VolumeStatus -ne 'FullyDecrypted') {
-            Suspend-BitLocker -MountPoint 'C:' -RebootCount 1
-            Write-Log "BitLocker suspended for one reboot." 'OK'
-        }
-        else {
-            Write-Log "BitLocker is not active on C:. No suspend needed." 'INFO'
-        }
-    }
-    catch {
-        Write-Log "Could not evaluate or suspend BitLocker: $($_.Exception.Message)" 'WARN'
-    }
+    return
 }
 
 function Remove-WorkingFolderRobust {
@@ -575,6 +606,7 @@ try {
     Set-Location -Path $WorkingRoot
 
     $softpaqs = Get-DriverList
+    $softpaqs = @(Exclude-BiosAndFirmwareSoftpaqs -Softpaqs $softpaqs)
     if ($softpaqs.Count -eq 0) {
         $CleanupOk = Remove-WorkingFolderRobust -Path $WorkingRoot -RetryCount $CleanupRetryCount -RetryDelaySeconds $CleanupRetryDelaySeconds
         $script:CleanupResult = $CleanupOk
