@@ -1,7 +1,7 @@
 # =====================================================================
 # ScriptName: Compton_Tech_Utils.ps1
-# ScriptVersion: 1.8.6
-# LastUpdated: 2026-03-26
+# ScriptVersion: 1.8.7
+# LastUpdated: 2026-04-07
 # Notes: Merged working script body with startup self-update check and version header.
 # Notes: Master utility script with merged menu options and YAML logging.
 # =====================================================================
@@ -9,9 +9,9 @@
 
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Startup Self-Update Check
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 function Get-LocalScriptVersion {
     param(
         [Parameter(Mandatory)][string]$ScriptPath
@@ -151,9 +151,9 @@ function Invoke-StartupSelfUpdate {
     }
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Compton College Tech Utils - Modular PowerShell Menu
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Set execution policy and global preferences
 try {
     Set-ExecutionPolicy RemoteSigned -Scope LocalMachine -Force -ErrorAction SilentlyContinue
@@ -205,9 +205,9 @@ function Write-StatusLog {
     Write-Host "[$timestamp] $Message" -ForegroundColor $color
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # System Configuration Functions
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 function Set-SystemSecurity {
     <#
@@ -227,9 +227,9 @@ function Set-SystemSecurity {
         
         if ($currentUAC.EnableLUA -ne 1) {
             Set-ItemProperty -Path $uacPath -Name "EnableLUA" -Value 1 -Type DWord
-            Write-StatusLog "✅ UAC enabled successfully" -Level "Success"
+            Write-StatusLog "[OK] UAC enabled successfully" -Level "Success"
         } else {
-            Write-StatusLog "ℹ UAC already enabled" -Level "Info"
+            Write-StatusLog "[INFO] UAC already enabled" -Level "Info"
         }
         
         # Configure IPv6 (Consider if complete disable is necessary)
@@ -241,9 +241,9 @@ function Set-SystemSecurity {
         $currentIPv6 = Get-ItemProperty -Path $ipv6Path -Name "DisabledComponents" -ErrorAction SilentlyContinue
         if ($currentIPv6.DisabledComponents -ne 0xFF) {
             Set-ItemProperty -Path $ipv6Path -Name "DisabledComponents" -Value 0xFF -Type DWord
-            Write-StatusLog "⚠ IPv6 disabled - restart required for full effect" -Level "Warning"
+            Write-StatusLog "[WARN] IPv6 disabled - restart required for full effect" -Level "Warning"
         } else {
-            Write-StatusLog "ℹ IPv6 already disabled" -Level "Info"
+            Write-StatusLog "[INFO] IPv6 already disabled" -Level "Info"
         }
         
         # Enable TLS 1.2 and 1.3 if available
@@ -259,13 +259,13 @@ function Set-SystemSecurity {
         # Try to enable TLS 1.3 if supported
         try {
             [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor $tls13
-            Write-StatusLog "✅ TLS 1.2 and 1.3 enabled" -Level "Success"
+            Write-StatusLog "[OK] TLS 1.2 and 1.3 enabled" -Level "Success"
         } catch {
-            Write-StatusLog "✅ TLS 1.2 enabled (TLS 1.3 not available)" -Level "Success"
+            Write-StatusLog "[OK] TLS 1.2 enabled (TLS 1.3 not available)" -Level "Success"
         }
         
     } catch {
-        Write-StatusLog "❌ Failed to configure system security: $($_.Exception.Message)" -Level "Error"
+        Write-StatusLog "[ERROR] Failed to configure system security: $($_.Exception.Message)" -Level "Error"
         throw
     }
 }
@@ -288,7 +288,7 @@ function Test-MISAdminStatus {
         $misAdmin = Get-LocalUser -Name "MISAdmin" -ErrorAction SilentlyContinue
         
         if (-not $misAdmin) {
-            Write-StatusLog "❌ MISAdmin account not found" -Level "Error"
+            Write-StatusLog "[ERROR] MISAdmin account not found" -Level "Error"
             return @{
                 Exists = $false
                 PasswordNeverExpires = $false
@@ -308,32 +308,32 @@ function Test-MISAdminStatus {
         if (-not $misAdmin.PasswordNeverExpires) {
             try {
                 Set-LocalUser -Name "MISAdmin" -PasswordNeverExpires $true
-                Write-StatusLog "⚙ PasswordNeverExpires set for MISAdmin" -Level "Success"
+                Write-StatusLog "[CONFIG] PasswordNeverExpires set for MISAdmin" -Level "Success"
                 $accountInfo.PasswordNeverExpires = $true
             } catch {
-                Write-StatusLog "❌ Failed to update MISAdmin password policy: $($_.Exception.Message)" -Level "Error"
+                Write-StatusLog "[ERROR] Failed to update MISAdmin password policy: $($_.Exception.Message)" -Level "Error"
                 throw
             }
         } else {
-            Write-StatusLog "✅ MISAdmin exists with correct password policy" -Level "Success"
+            Write-StatusLog "[OK] MISAdmin exists with correct password policy" -Level "Success"
         }
         
         # Check if account is enabled
         if (-not $misAdmin.Enabled) {
-            Write-StatusLog "⚠ MISAdmin account is disabled" -Level "Warning"
+            Write-StatusLog "[WARN] MISAdmin account is disabled" -Level "Warning"
         }
         
         return $accountInfo
         
     } catch {
-        Write-StatusLog "❌ Error checking MISAdmin status: $($_.Exception.Message)" -Level "Error"
+        Write-StatusLog "[ERROR] Error checking MISAdmin status: $($_.Exception.Message)" -Level "Error"
         throw
     }
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Initialization
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 function Initialize-System {
     <#
@@ -360,7 +360,7 @@ function Initialize-System {
         }
         
     } catch {
-        Write-StatusLog "❌ System initialization failed: $($_.Exception.Message)" -Level "Error"
+        Write-StatusLog "[ERROR] System initialization failed: $($_.Exception.Message)" -Level "Error"
         throw
     }
 }
@@ -381,9 +381,9 @@ try {
     exit 1
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Option 1 - Create MISAdmin Local Admin Account
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 function Test-SecureStringsEqual {
     param(
         [Parameter(Mandatory)][securestring]$A,
@@ -437,20 +437,20 @@ function Get-SecurePassword {
         try {
             $p1 = Read-Host "Enter password for '$AccountName'" -AsSecureString
             $p2 = Read-Host "Confirm password for '$AccountName'" -AsSecureString
-            if (-not $p1 -or -not $p2) { Write-StatusLog "❌ Empty password not allowed" -Level "Error"; continue }
+            if (-not $p1 -or -not $p2) { Write-StatusLog "[ERROR] Empty password not allowed" -Level "Error"; continue }
             $p1txt = (New-Object PSCredential 'u',$p1).GetNetworkCredential().Password
-            if ([string]::IsNullOrWhiteSpace($p1txt)) { Write-StatusLog "❌ Password cannot be blank/whitespace" -Level "Error"; $p1txt = $null; continue }
+            if ([string]::IsNullOrWhiteSpace($p1txt)) { Write-StatusLog "[ERROR] Password cannot be blank/whitespace" -Level "Error"; $p1txt = $null; continue }
             $p1txt = $null
-            if (-not (Test-SecEq $p1 $p2)) { Write-StatusLog "❌ Passwords do not match" -Level "Error"; continue }
-            Write-StatusLog "✅ Password validated successfully" -Level "Success"
+            if (-not (Test-SecEq $p1 $p2)) { Write-StatusLog "[ERROR] Passwords do not match" -Level "Error"; continue }
+            Write-StatusLog "[OK] Password validated successfully" -Level "Success"
             return $p1
         } catch {
-            Write-StatusLog "❌ Password prompt failed: $($_.Exception.Message)" -Level "Error"
+            Write-StatusLog "[ERROR] Password prompt failed: $($_.Exception.Message)" -Level "Error"
         } finally {
             [System.GC]::Collect()
         }
     } while ($attempt -lt $MaxAttempts)
-    Write-StatusLog "❌ Maximum password attempts exceeded" -Level "Error"
+    Write-StatusLog "[ERROR] Maximum password attempts exceeded" -Level "Error"
     return $null
 } # end Get-SecurePassword
 
@@ -466,21 +466,21 @@ function Test-AdminGroupMembership {
             if ($m.Name -ieq $machineQualified -or $m.Name -ieq $AccountName) { $isMember = $true; break }
         }
         if ($isMember) {
-            Write-StatusLog "✅ Account has administrative privileges" -Level "Success"
+            Write-StatusLog "[OK] Account has administrative privileges" -Level "Success"
         } else {
-            Write-StatusLog "⚠ Account missing administrative privileges" -Level "Warning"
+            Write-StatusLog "[WARN] Account missing administrative privileges" -Level "Warning"
             try {
                 Add-LocalGroupMember -Group "Administrators" -Member $AccountName -ErrorAction Stop
-                Write-StatusLog "✅ Account added to Administrators group" -Level "Success"
+                Write-StatusLog "[OK] Account added to Administrators group" -Level "Success"
                 return $true
             } catch {
-                Write-StatusLog "❌ Failed to add account to Administrators group: $($_.Exception.Message)" -Level "Error"
+                Write-StatusLog "[ERROR] Failed to add account to Administrators group: $($_.Exception.Message)" -Level "Error"
                 return $false
             }
         }
         return $isMember
     } catch {
-        Write-StatusLog "❌ Error checking admin group membership: $($_.Exception.Message)" -Level "Error"
+        Write-StatusLog "[ERROR] Error checking admin group membership: $($_.Exception.Message)" -Level "Error"
         return $false
     }
 } # end Test-AdminGroupMembership
@@ -513,24 +513,24 @@ function New-LocalAdminAccount {
 
         $result.AccountCreated = $true
         $result.PasswordConfigured = $true
-        Write-StatusLog "✅ Account '$AccountName' created successfully" -Level "Success"
+        Write-StatusLog "[OK] Account '$AccountName' created successfully" -Level "Success"
 
         Add-LocalGroupMember -Group "Administrators" -Member $AccountName -ErrorAction Stop
         $result.AdminRights = $true
-        Write-StatusLog "✅ Account added to Administrators group" -Level "Success"
+        Write-StatusLog "[OK] Account added to Administrators group" -Level "Success"
 
         $createdAccount = Get-LocalUser -Name $AccountName
-        Write-StatusLog "✅ Account verification completed" -Level "Success"
-        Write-Host "   • Password Never Expires: $($createdAccount.PasswordNeverExpires)" -ForegroundColor Green
-        Write-Host "   • Account Never Expires: $(-not $createdAccount.AccountExpires)" -ForegroundColor Green
-        Write-Host "   • Account Enabled: $($createdAccount.Enabled)" -ForegroundColor Green
+        Write-StatusLog "[OK] Account verification completed" -Level "Success"
+        Write-Host "   - Password Never Expires: $($createdAccount.PasswordNeverExpires)" -ForegroundColor Green
+        Write-Host "   - Account Never Expires: $(-not $createdAccount.AccountExpires)" -ForegroundColor Green
+        Write-Host "   - Account Enabled: $($createdAccount.Enabled)" -ForegroundColor Green
 
-        $global:LastStatus = "✅ MISAdmin account created and configured successfully"
+        $global:LastStatus = "[OK] MISAdmin account created and configured successfully"
     } catch {
         $errorMsg = "Failed to create account: $($_.Exception.Message)"
-        Write-StatusLog "❌ $errorMsg" -Level "Error"
+        Write-StatusLog "[ERROR] $errorMsg" -Level "Error"
         $result.Errors += $errorMsg
-        $global:LastStatus = "❌ Failed to create MISAdmin account"
+        $global:LastStatus = "[ERROR] Failed to create MISAdmin account"
     }
     return $result
 } # end New-LocalAdminAccount
@@ -557,20 +557,20 @@ function New-MISAdminAccount {
         $existingAccount = Get-LocalUser -Name $AccountName -ErrorAction SilentlyContinue
         if ($existingAccount) {
             $result.AccountExists = $true
-            Write-StatusLog "✅ Account '$AccountName' already exists" -Level "Success"
+            Write-StatusLog "[OK] Account '$AccountName' already exists" -Level "Success"
 
             if (-not $existingAccount.PasswordNeverExpires) {
                 try {
                     Set-LocalUser -Name $AccountName -PasswordNeverExpires $true
-                    Write-StatusLog "⚙ Password policy updated: PasswordNeverExpires enabled" -Level "Success"
+                    Write-StatusLog "[CONFIG] Password policy updated: PasswordNeverExpires enabled" -Level "Success"
                     $result.PasswordConfigured = $true
                 } catch {
                     $errorMsg = "Failed to update password policy: $($_.Exception.Message)"
-                    Write-StatusLog "❌ $errorMsg" -Level "Error"
+                    Write-StatusLog "[ERROR] $errorMsg" -Level "Error"
                     $result.Errors += $errorMsg
                 }
             } else {
-                Write-StatusLog "✅ Password policy already configured correctly" -Level "Success"
+                Write-StatusLog "[OK] Password policy already configured correctly" -Level "Success"
                 $result.PasswordConfigured = $true
             }
 
@@ -581,10 +581,10 @@ function New-MISAdminAccount {
                 if ($newPassword) {
                     try {
                         Set-LocalUser -Name $AccountName -Password $newPassword -ErrorAction Stop
-                        Write-StatusLog "✅ Password reset completed" -Level "Success"
+                        Write-StatusLog "[OK] Password reset completed" -Level "Success"
                     } catch {
                         $errorMsg = "Failed to reset password: $($_.Exception.Message)"
-                        Write-StatusLog "❌ $errorMsg" -Level "Error"
+                        Write-StatusLog "[ERROR] $errorMsg" -Level "Error"
                         $result.Errors += $errorMsg
                     }
                 } else {
@@ -593,29 +593,29 @@ function New-MISAdminAccount {
             }
 
             $global:LastStatus = if ($result.Errors.Count -eq 0) {
-                "✅ MISAdmin account validated and configured"
+                "[OK] MISAdmin account validated and configured"
             } else {
-                "⚠ MISAdmin account exists but has configuration issues"
+                "[WARN] MISAdmin account exists but has configuration issues"
             }
         } else {
-            Write-StatusLog "⚠ Account '$AccountName' not found. Initiating creation process..." -Level "Warning"
+            Write-StatusLog "[WARN] Account '$AccountName' not found. Initiating creation process..." -Level "Warning"
             $result = New-LocalAdminAccount -AccountName $AccountName
         }
     } catch {
         $errorMsg = "Critical error processing MISAdmin account: $($_.Exception.Message)"
-        Write-StatusLog "❌ $errorMsg" -Level "Error"
+        Write-StatusLog "[ERROR] $errorMsg" -Level "Error"
         $result.Errors += $errorMsg
-        $global:LastStatus = "❌ Failed to process MISAdmin account"
+        $global:LastStatus = "[ERROR] Failed to process MISAdmin account"
     }
     return $result
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Option 2 - Remove Bloatware
-# ─────────────────────────────────────────────────────────────────────────────
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Option 2 - Remove Bloatware
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 function Remove-BloatwareApps {
     <#
     .SYNOPSIS
@@ -667,7 +667,7 @@ function Remove-BloatwareApps {
     }
     
     try {
-        Write-Host "🔍 Starting bloatware removal process..." -ForegroundColor Cyan
+        Write-Host "[SCAN] Starting bloatware removal process..." -ForegroundColor Cyan
         
         # Default bloatware list - organized by category
         $defaultBloatware = @{
@@ -719,11 +719,11 @@ function Remove-BloatwareApps {
         # Update total apps count
         $results.TotalApps = $appsToRemove.Count
         
-        Write-Host "📦 Processing $($results.TotalApps) bloatware applications..." -ForegroundColor Cyan
+        Write-Host "[PKG] Processing $($results.TotalApps) bloatware applications..." -ForegroundColor Cyan
         
         if ($results.TotalApps -eq 0) {
-            Write-Host "⚠ No applications specified for removal" -ForegroundColor Yellow
-            $global:LastStatus = "⚠ No bloatware applications specified for removal"
+            Write-Host "[WARN] No applications specified for removal" -ForegroundColor Yellow
+            $global:LastStatus = "[WARN] No bloatware applications specified for removal"
             return $results
         }
         
@@ -743,18 +743,18 @@ function Remove-BloatwareApps {
                     "Success" {
                         $results.SuccessfulRemovals += $removalResult.PackagesRemoved
                         $results.RemovedApps += $appName
-                        Write-Host "✅ Successfully removed '$appName' ($($removalResult.PackagesRemoved) package(s))" -ForegroundColor Green
+                        Write-Host "[OK] Successfully removed '$appName' ($($removalResult.PackagesRemoved) package(s))" -ForegroundColor Green
                     }
                     "NotFound" {
                         $results.NotFound++
                         $results.NotFoundApps += $appName
-                        Write-Host "ℹ '$appName' not found on system" -ForegroundColor Gray
+                        Write-Host "[INFO] '$appName' not found on system" -ForegroundColor Gray
                     }
                     "Failed" {
                         $results.FailedRemovals++
                         $results.FailedApps += $appName
                         $results.Errors += $removalResult.Error
-                        Write-Host "❌ Failed to remove '$appName': $($removalResult.Error)" -ForegroundColor Red
+                        Write-Host "[ERROR] Failed to remove '$appName': $($removalResult.Error)" -ForegroundColor Red
                     }
                 }
                 
@@ -763,7 +763,7 @@ function Remove-BloatwareApps {
                     $provisionedResult = Remove-ProvisionedAppPackage -AppName $appName
                     if ($provisionedResult.Removed) {
                         $results.ProvisionedRemoved++
-                        Write-Host "🔧 Removed provisioned package for '$appName'" -ForegroundColor Green
+                        Write-Host "[TOOLS] Removed provisioned package for '$appName'" -ForegroundColor Green
                     }
                 }
                 
@@ -772,7 +772,7 @@ function Remove-BloatwareApps {
                 $results.FailedApps += $appName
                 $errorMsg = "Unexpected error removing '$appName': $($_.Exception.Message)"
                 $results.Errors += $errorMsg
-                Write-Host "❌ $errorMsg" -ForegroundColor Red
+                Write-Host "[ERROR] $errorMsg" -ForegroundColor Red
             }
         }
         
@@ -783,15 +783,15 @@ function Remove-BloatwareApps {
         
         # Set global status
         if ($WhatIfPreference) {
-            $global:LastStatus = "📋 Bloatware scan completed - $($results.TotalApps) apps analyzed"
+            $global:LastStatus = "[REPORT] Bloatware scan completed - $($results.TotalApps) apps analyzed"
         } else {
-            $global:LastStatus = "✅ Bloatware removal completed - $($results.SuccessfulRemovals) packages removed"
+            $global:LastStatus = "[OK] Bloatware removal completed - $($results.SuccessfulRemovals) packages removed"
         }
         
     } catch {
-        Write-Host "❌ Critical error during bloatware removal: $_" -ForegroundColor Red
+        Write-Host "[ERROR] Critical error during bloatware removal: $_" -ForegroundColor Red
         $results.Errors += "Critical error: $($_.Exception.Message)"
-        $global:LastStatus = "❌ Bloatware removal failed: $_"
+        $global:LastStatus = "[ERROR] Bloatware removal failed: $_"
     }
     
     return $results
@@ -851,12 +851,12 @@ function Remove-AppxPackageSafe {
                 } else {
                     Remove-AppxPackage -Package $package.PackageFullName -ErrorAction Stop
                     $packagesRemoved++
-                    Write-Host "   ✓ Removed: $($package.Name) - $userInfo" -ForegroundColor Green
+                    Write-Host "   [OK] Removed: $($package.Name) - $userInfo" -ForegroundColor Green
                 }
                 
             } catch {
                 $errorMsg = "Failed to remove package '$($package.Name)' for $userInfo`: $($_.Exception.Message)"
-                Write-Host "   ⚠ $errorMsg" -ForegroundColor Yellow
+                Write-Host "   [WARN] $errorMsg" -ForegroundColor Yellow
                 
                 # Continue with other packages even if one fails
                 if (-not $result.Error) {
@@ -968,7 +968,7 @@ function Show-RemovalSummary {
     if ($Results.FailedApps -and $Results.FailedApps.Count -gt 0) {
         Write-Host "`nFailed Applications:" -ForegroundColor Red
         foreach ($app in $Results.FailedApps) {
-            Write-Host "  • $app" -ForegroundColor Red
+            Write-Host "  - $app" -ForegroundColor Red
         }
     }
     
@@ -976,15 +976,15 @@ function Show-RemovalSummary {
     if ($Results.RemovedApps -and $Results.RemovedApps.Count -gt 0 -and $Results.RemovedApps.Count -le 10) {
         Write-Host "`nSuccessfully Removed:" -ForegroundColor Green
         foreach ($app in $Results.RemovedApps) {
-            Write-Host "  • $app" -ForegroundColor Green
+            Write-Host "  - $app" -ForegroundColor Green
         }
     }
     
     Write-Host "="*60 -ForegroundColor Cyan
 }
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Option 3 - Recommended Registry Settings
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 function Apply-RecommendedRegistrySettings {
     <#
     .SYNOPSIS
@@ -1147,7 +1147,7 @@ function Apply-RecommendedRegistrySettings {
         $results.BackupCreated = New-RegistryBackup
     }
 
-    Write-Host "`n🔧 Applying $($results.TotalSettings) registry settings..." -ForegroundColor Cyan
+    Write-Host "`n[TOOLS] Applying $($results.TotalSettings) registry settings..." -ForegroundColor Cyan
 
     # Progress tracking
     $currentSetting = 0
@@ -1165,21 +1165,21 @@ function Apply-RecommendedRegistrySettings {
                 "Success" {
                     $results.SuccessfulChanges++
                     $results.ChangedSettings += "$($setting.Path)\$($setting.Name)"
-                    Write-StatusLog "✅ $($setting.Description)" -Level "Success"
+                    Write-StatusLog "[OK] $($setting.Description)" -Level "Success"
                 }
                 "Unchanged" {
                     $results.SkippedSettings++
-                    Write-StatusLog "ℹ $($setting.Description) (already set)" -Level "Info"
+                    Write-StatusLog "[INFO] $($setting.Description) (already set)" -Level "Info"
                 }
                 "Skipped" {
                     $results.SkippedSettings++
-                    Write-StatusLog "⚠ $($setting.Description) skipped - $($applyResult.Error)" -Level "Warning"
+                    Write-StatusLog "[WARN] $($setting.Description) skipped - $($applyResult.Error)" -Level "Warning"
                 }
                 "Failed" {
                     $results.FailedChanges++
                     $results.FailedSettings += $setting.Description
                     $results.Errors += $applyResult.Error
-                    Write-StatusLog "❌ Failed: $($setting.Description) - $($applyResult.Error)" -Level "Error"
+                    Write-StatusLog "[ERROR] Failed: $($setting.Description) - $($applyResult.Error)" -Level "Error"
                 }
             }
 
@@ -1188,7 +1188,7 @@ function Apply-RecommendedRegistrySettings {
             $results.FailedSettings += $setting.Description
             $errorMsg = "Unexpected error applying '$($setting.Description)': $($_.Exception.Message)"
             $results.Errors += $errorMsg
-            Write-StatusLog "❌ $errorMsg" -Level "Error"
+            Write-StatusLog "[ERROR] $errorMsg" -Level "Error"
         }
     }
 
@@ -1199,9 +1199,9 @@ function Apply-RecommendedRegistrySettings {
 
     # Set global status
     $global:LastStatus = if ($results.FailedChanges -eq 0) {
-        "✅ Registry settings applied successfully ($($results.SuccessfulChanges) changes)"
+        "[OK] Registry settings applied successfully ($($results.SuccessfulChanges) changes)"
     } else {
-        "⚠ Registry settings applied with $($results.FailedChanges) failures"
+        "[WARN] Registry settings applied with $($results.FailedChanges) failures"
     }
 
     return $results
@@ -1468,11 +1468,11 @@ function New-RegistryBackup {
             reg.exe export $key $keyBackupPath /y 2>$null | Out-Null
         }
 
-        Write-StatusLog "✅ Registry backup created successfully" -Level "Success"
+        Write-StatusLog "[OK] Registry backup created successfully" -Level "Success"
         return $true
 
     } catch {
-        Write-StatusLog "❌ Failed to create registry backup: $($_.Exception.Message)" -Level "Error"
+        Write-StatusLog "[ERROR] Failed to create registry backup: $($_.Exception.Message)" -Level "Error"
         return $false
     }
 }
@@ -1531,7 +1531,7 @@ function Show-RegistrySettingsSummary {
     if ($Results.FailedSettings.Count -gt 0) {
         Write-Host "`nFailed Settings:" -ForegroundColor Red
         $Results.FailedSettings | ForEach-Object {
-            Write-Host "  • $_" -ForegroundColor Red
+            Write-Host "  - $_" -ForegroundColor Red
         }
     }
 
@@ -1544,9 +1544,9 @@ function Show-RegistrySettingsSummary {
 # Apply-RecommendedRegistrySettings -SettingsCategory UI
 # Apply-RecommendedRegistrySettings -WhatIf
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Option 4 - Optimize Windows Services
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 function Optimize-WindowsServices {
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -1943,7 +1943,7 @@ function Optimize-WindowsServices {
         $results.BackupCreated = New-ServiceConfigurationBackup
     }
 
-    Write-Host "`n⚙️ Optimizing $($results.TotalServices) Windows services..." -ForegroundColor Cyan
+    Write-Host "`n[CONFIG] Optimizing $($results.TotalServices) Windows services..." -ForegroundColor Cyan
 
     $currentService = 0
     $statusStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
@@ -1975,7 +1975,7 @@ function Optimize-WindowsServices {
                 "Success" {
                     $results.SuccessfulChanges++
                     $results.ChangedServices += $service.Key
-                    Write-StatusLog "✅ $($service.Key) → $($service.Value)" -Level "Success"
+                    Write-StatusLog "[OK] $($service.Key) -> $($service.Value)" -Level "Success"
 
                     if ($configResult.WasRunning) {
                         $results.RunningServiceChanges++
@@ -1994,22 +1994,22 @@ function Optimize-WindowsServices {
                 }
                 "Unchanged" {
                     $results.SkippedServices++
-                    Write-StatusLog "ℹ $($service.Key) already set to $($service.Value)" -Level "Info"
+                    Write-StatusLog "[INFO] $($service.Key) already set to $($service.Value)" -Level "Info"
                 }
                 "Skipped" {
                     $results.SkippedServices++
-                    Write-StatusLog "⚠ $($service.Key) skipped - $($configResult.Error)" -Level "Warning"
+                    Write-StatusLog "[WARN] $($service.Key) skipped - $($configResult.Error)" -Level "Warning"
                 }
                 "NotFound" {
                     $results.NotFoundCount++
                     $results.NotFoundServices += $service.Key
-                    Write-StatusLog "⚠ Service '$($service.Key)' not found" -Level "Warning"
+                    Write-StatusLog "[WARN] Service '$($service.Key)' not found" -Level "Warning"
                 }
                 "Failed" {
                     $results.FailedChanges++
                     $results.FailedServices += $service.Key
                     $results.Errors += $configResult.Error
-                    Write-StatusLog "❌ Failed to configure '$($service.Key)': $($configResult.Error)" -Level "Error"
+                    Write-StatusLog "[ERROR] Failed to configure '$($service.Key)': $($configResult.Error)" -Level "Error"
                 }
             }
 
@@ -2018,7 +2018,7 @@ function Optimize-WindowsServices {
             $results.FailedServices += $service.Key
             $errorMsg = "Unexpected error configuring '$($service.Key)': $($_.Exception.Message)"
             $results.Errors += $errorMsg
-            Write-StatusLog "❌ $errorMsg" -Level "Error"
+            Write-StatusLog "[ERROR] $errorMsg" -Level "Error"
         }
     }
 
@@ -2027,9 +2027,9 @@ function Optimize-WindowsServices {
     Show-ServiceOptimizationSummary -Results $results -Category $ServiceCategory
 
     $global:LastStatus = if ($results.FailedChanges -eq 0) {
-        "✅ Service optimization completed ($($results.SuccessfulChanges) services configured)"
+        "[OK] Service optimization completed ($($results.SuccessfulChanges) services configured)"
     } else {
-        "⚠ Service optimization completed with $($results.FailedChanges) failures"
+        "[WARN] Service optimization completed with $($results.FailedChanges) failures"
     }
 
     return $results
@@ -2214,7 +2214,7 @@ function Set-ServiceStartupSafe {
                     }
 
                     if ($WhatIfPreference) {
-                        Write-Host "   Would set: $matchName → $StartupType" -ForegroundColor Yellow
+                        Write-Host "   Would set: $matchName -> $StartupType" -ForegroundColor Yellow
                         $successCount++
                         continue
                     }
@@ -2307,7 +2307,7 @@ function Set-ServiceStartupSafe {
         }
 
         if ($WhatIfPreference) {
-            Write-Host "   Would set: $ServiceName → $StartupType" -ForegroundColor Yellow
+            Write-Host "   Would set: $ServiceName -> $StartupType" -ForegroundColor Yellow
             $result.Status = "Success"
             return $result
         }
@@ -2373,11 +2373,11 @@ function New-ServiceConfigurationBackup {
         $services = Get-CimInstance Win32_Service | Select-Object Name, StartMode, State, DisplayName
         $services | Export-Csv -Path $backupPath -NoTypeInformation
 
-        Write-StatusLog "✅ Service backup created successfully ($($services.Count) services)" -Level "Success"
+        Write-StatusLog "[OK] Service backup created successfully ($($services.Count) services)" -Level "Success"
         return $true
 
     } catch {
-        Write-StatusLog "❌ Failed to create service backup: $($_.Exception.Message)" -Level "Error"
+        Write-StatusLog "[ERROR] Failed to create service backup: $($_.Exception.Message)" -Level "Error"
         return $false
     }
 }
@@ -2430,14 +2430,14 @@ function Show-ServiceOptimizationSummary {
     if ($Results.FailedServices.Count -gt 0) {
         Write-Host "`nFailed Services:" -ForegroundColor Red
         $Results.FailedServices | ForEach-Object {
-            Write-Host "  • $_" -ForegroundColor Red
+            Write-Host "  - $_" -ForegroundColor Red
         }
     }
 
     if ($Results.RunningServices.Count -gt 0 -and $Results.RunningServices.Count -le 10) {
         Write-Host "`nRunning Services Modified:" -ForegroundColor Yellow
         $Results.RunningServices | ForEach-Object {
-            Write-Host "  • $_" -ForegroundColor Yellow
+            Write-Host "  - $_" -ForegroundColor Yellow
         }
         Write-Host "Note: These services may require a restart to fully apply changes." -ForegroundColor Yellow
     }
@@ -2541,7 +2541,7 @@ function Get-ServiceOptimizationReport {
 
         $report | Out-File -FilePath $OutputPath -Encoding UTF8
 
-        Write-StatusLog "✅ Service report generated: $OutputPath" -Level "Success"
+        Write-StatusLog "[OK] Service report generated: $OutputPath" -Level "Success"
 
         return @{
             ReportPath = $OutputPath
@@ -2552,7 +2552,7 @@ function Get-ServiceOptimizationReport {
         }
 
     } catch {
-        Write-StatusLog "❌ Failed to generate service report: $($_.Exception.Message)" -Level "Error"
+        Write-StatusLog "[ERROR] Failed to generate service report: $($_.Exception.Message)" -Level "Error"
         return $null
     }
 }
@@ -2564,9 +2564,9 @@ function Get-ServiceOptimizationReport {
 # Optimize-WindowsServices -ServiceCategory Essential -Force
 # Get-ServiceOptimizationReport
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Option 5 - Enable PowerShell Remote Management
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 function Enable-PowerShellRemotingSafely {
     <#
     .SYNOPSIS
@@ -2704,16 +2704,16 @@ function Enable-PowerShellRemotingSafely {
         
         # Set global status
         $global:LastStatus = if ($results.Errors.Count -eq 0) {
-            "✅ PowerShell Remoting enabled and secured successfully"
+            "[OK] PowerShell Remoting enabled and secured successfully"
         } else {
-            "⚠ PowerShell Remoting configured with $($results.Errors.Count) issues"
+            "[WARN] PowerShell Remoting configured with $($results.Errors.Count) issues"
         }
         
     } catch {
         $errorMsg = "Critical error during PowerShell Remoting configuration: $($_.Exception.Message)"
-        Write-StatusLog "❌ $errorMsg" -Level "Error"
+        Write-StatusLog "[ERROR] $errorMsg" -Level "Error"
         $results.Errors += $errorMsg
-        $global:LastStatus = "❌ Failed to configure PowerShell Remoting"
+        $global:LastStatus = "[ERROR] Failed to configure PowerShell Remoting"
     }
     
     return $results
@@ -2747,25 +2747,25 @@ function Set-WinRMServiceConfiguration {
         if ($service.StartType -ne 'Automatic') {
             Set-Service -Name WinRM -StartupType Automatic -ErrorAction Stop
             $result.StartupTypeSet = $true
-            Write-StatusLog "✅ WinRM service set to Automatic startup" -Level "Success"
+            Write-StatusLog "[OK] WinRM service set to Automatic startup" -Level "Success"
         } else {
-            Write-StatusLog "ℹ WinRM service already set to Automatic startup" -Level "Info"
+            Write-StatusLog "[INFO] WinRM service already set to Automatic startup" -Level "Info"
         }
         
         # Start the service if not running
         if ($service.Status -ne 'Running') {
             Start-Service -Name WinRM -ErrorAction Stop
             $result.ServiceStarted = $true
-            Write-StatusLog "✅ WinRM service started" -Level "Success"
+            Write-StatusLog "[OK] WinRM service started" -Level "Success"
         } else {
-            Write-StatusLog "ℹ WinRM service already running" -Level "Info"
+            Write-StatusLog "[INFO] WinRM service already running" -Level "Info"
         }
         
         $result.Success = $true
         
     } catch {
         $result.Error = "Failed to configure WinRM service: $($_.Exception.Message)"
-        Write-StatusLog "❌ $($result.Error)" -Level "Error"
+        Write-StatusLog "[ERROR] $($result.Error)" -Level "Error"
     }
     
     return $result
@@ -2796,18 +2796,18 @@ function Enable-PSRemotingConfiguration {
         # Check if remoting is already enabled
         $remotingStatus = Get-PSSessionConfiguration -ErrorAction SilentlyContinue
         if ($remotingStatus) {
-            Write-StatusLog "ℹ PowerShell Remoting appears to be already enabled" -Level "Info"
+            Write-StatusLog "[INFO] PowerShell Remoting appears to be already enabled" -Level "Info"
         }
         
         # Enable PowerShell Remoting
         Enable-PSRemoting -SkipNetworkProfileCheck -Force -ErrorAction Stop
         $result.RemotingEnabled = $true
         $result.Success = $true
-        Write-StatusLog "✅ PowerShell Remoting enabled successfully" -Level "Success"
+        Write-StatusLog "[OK] PowerShell Remoting enabled successfully" -Level "Success"
         
     } catch {
         $result.Error = "Failed to enable PowerShell Remoting: $($_.Exception.Message)"
-        Write-StatusLog "❌ $($result.Error)" -Level "Error"
+        Write-StatusLog "[ERROR] $($result.Error)" -Level "Error"
     }
     
     return $result
@@ -2841,7 +2841,7 @@ function Set-WinRMFirewallConfiguration {
         
         if (-not $winrmRules) {
             $result.Error = "No Windows Remote Management firewall rules found"
-            Write-StatusLog "⚠ No WinRM firewall rules found on this system" -Level "Warning"
+            Write-StatusLog "[WARN] No WinRM firewall rules found on this system" -Level "Warning"
             return $result
         }
         
@@ -2849,10 +2849,10 @@ function Set-WinRMFirewallConfiguration {
             if ($rule.Enabled -eq 'False') {
                 Enable-NetFirewallRule -Name $rule.Name -ErrorAction Stop
                 $result.RulesEnabled += $rule.DisplayName
-                Write-StatusLog "✅ Enabled firewall rule: $($rule.DisplayName)" -Level "Success"
+                Write-StatusLog "[OK] Enabled firewall rule: $($rule.DisplayName)" -Level "Success"
             } else {
                 $result.RulesAlreadyEnabled += $rule.DisplayName
-                Write-StatusLog "ℹ Firewall rule already enabled: $($rule.DisplayName)" -Level "Info"
+                Write-StatusLog "[INFO] Firewall rule already enabled: $($rule.DisplayName)" -Level "Info"
             }
         }
         
@@ -2860,7 +2860,7 @@ function Set-WinRMFirewallConfiguration {
         
     } catch {
         $result.Error = "Failed to configure firewall rules: $($_.Exception.Message)"
-        Write-StatusLog "❌ $($result.Error)" -Level "Error"
+        Write-StatusLog "[ERROR] $($result.Error)" -Level "Error"
     }
     
     return $result
@@ -2897,7 +2897,7 @@ function Set-UACTokenFilterPolicy {
         $result.PreviousValue = $currentValue.$valueName
         
         if ($currentValue.$valueName -eq 1) {
-            Write-StatusLog "ℹ LocalAccountTokenFilterPolicy already set correctly" -Level "Info"
+            Write-StatusLog "[INFO] LocalAccountTokenFilterPolicy already set correctly" -Level "Info"
             $result.Success = $true
             return $result
         }
@@ -2910,11 +2910,11 @@ function Set-UACTokenFilterPolicy {
         Set-ItemProperty -Path $registryPath -Name $valueName -Value 1 -Type DWord -ErrorAction Stop
         $result.PolicySet = $true
         $result.Success = $true
-        Write-StatusLog "✅ LocalAccountTokenFilterPolicy configured for WinRM elevation" -Level "Success"
+        Write-StatusLog "[OK] LocalAccountTokenFilterPolicy configured for WinRM elevation" -Level "Success"
         
     } catch {
         $result.Error = "Failed to set UAC Token Filter Policy: $($_.Exception.Message)"
-        Write-StatusLog "❌ $($result.Error)" -Level "Error"
+        Write-StatusLog "[ERROR] $($result.Error)" -Level "Error"
     }
     
     return $result
@@ -2957,7 +2957,7 @@ function Set-WinRMTrustedHosts {
         $result.PreviousValue = $currentTrustedHosts
         
         if ($currentTrustedHosts -eq $TrustedHosts) {
-            Write-StatusLog "ℹ WinRM trusted hosts already configured correctly" -Level "Info"
+            Write-StatusLog "[INFO] WinRM trusted hosts already configured correctly" -Level "Info"
             $result.Success = $true
             return $result
         }
@@ -2966,11 +2966,11 @@ function Set-WinRMTrustedHosts {
         Set-Item WSMan:\localhost\Client\TrustedHosts -Value $TrustedHosts -Force -ErrorAction Stop
         $result.TrustedHostsSet = $true
         $result.Success = $true
-        Write-StatusLog "✅ WinRM trusted hosts configured: $TrustedHosts" -Level "Success"
+        Write-StatusLog "[OK] WinRM trusted hosts configured: $TrustedHosts" -Level "Success"
         
     } catch {
         $result.Error = "Failed to set trusted hosts: $($_.Exception.Message)"
-        Write-StatusLog "❌ $($result.Error)" -Level "Error"
+        Write-StatusLog "[ERROR] $($result.Error)" -Level "Error"
     }
     
     return $result
@@ -3018,9 +3018,9 @@ function Set-PSRemotingSecurityConfiguration {
         
         if ($result.DomainJoined) {
             $baseSDDL += '(A;;GA;;;DA)'  # Add Domain Admins
-            Write-StatusLog "ℹ Domain-joined system detected - including Domain Admins" -Level "Info"
+            Write-StatusLog "[INFO] Domain-joined system detected - including Domain Admins" -Level "Info"
         } else {
-            Write-StatusLog "ℹ Workgroup system detected - Local Admins only" -Level "Info"
+            Write-StatusLog "[INFO] Workgroup system detected - Local Admins only" -Level "Info"
         }
         
         # Add additional users if specified
@@ -3028,9 +3028,9 @@ function Set-PSRemotingSecurityConfiguration {
             try {
                 $sid = (New-Object System.Security.Principal.NTAccount($user)).Translate([System.Security.Principal.SecurityIdentifier]).Value
                 $baseSDDL += "(A;;GA;;;$sid)"
-                Write-StatusLog "ℹ Added user/group to security descriptor: $user" -Level "Info"
+                Write-StatusLog "[INFO] Added user/group to security descriptor: $user" -Level "Info"
             } catch {
-                Write-StatusLog "⚠ Failed to resolve SID for user/group: $user" -Level "Warning"
+                Write-StatusLog "[WARN] Failed to resolve SID for user/group: $user" -Level "Warning"
             }
         }
         
@@ -3043,22 +3043,22 @@ function Set-PSRemotingSecurityConfiguration {
             try {
                 Set-PSSessionConfiguration -Name $endpoint.Name -SecurityDescriptorSddl $baseSDDL -Force -ErrorAction Stop
                 $result.SecuredEndpoints += $endpoint.Name
-                Write-StatusLog "✅ Secured endpoint: $($endpoint.Name)" -Level "Success"
+                Write-StatusLog "[OK] Secured endpoint: $($endpoint.Name)" -Level "Success"
             } catch {
-                Write-StatusLog "❌ Failed to secure endpoint '$($endpoint.Name)': $($_.Exception.Message)" -Level "Error"
+                Write-StatusLog "[ERROR] Failed to secure endpoint '$($endpoint.Name)': $($_.Exception.Message)" -Level "Error"
                 $result.Error = "Failed to secure some endpoints"
             }
         }
         
         # Restart WinRM to apply security changes
         Restart-Service -Name WinRM -ErrorAction Stop
-        Write-StatusLog "✅ WinRM service restarted to apply security changes" -Level "Success"
+        Write-StatusLog "[OK] WinRM service restarted to apply security changes" -Level "Success"
         
         $result.Success = ($result.SecuredEndpoints.Count -gt 0)
         
     } catch {
         $result.Error = "Failed to apply security configuration: $($_.Exception.Message)"
-        Write-StatusLog "❌ $($result.Error)" -Level "Error"
+        Write-StatusLog "[ERROR] $($result.Error)" -Level "Error"
     }
     
     return $result
@@ -3112,7 +3112,7 @@ function Get-PSRemotingConfigurationSummary {
         }
         
     } catch {
-        Write-StatusLog "⚠ Error gathering configuration summary: $($_.Exception.Message)" -Level "Warning"
+        Write-StatusLog "[WARN] Error gathering configuration summary: $($_.Exception.Message)" -Level "Warning"
     }
     
     return $summary
@@ -3140,20 +3140,20 @@ function Show-PSRemotingConfigurationSummary {
     Write-Host "="*60 -ForegroundColor Cyan
     
     Write-Host "WinRM Service Configured: " -NoNewline
-    Write-Host $(if($Results.WinRMConfigured){"✅ Yes"}else{"❌ No"}) -ForegroundColor $(if($Results.WinRMConfigured){"Green"}else{"Red"})
+    Write-Host $(if($Results.WinRMConfigured){"[OK] Yes"}else{"[ERROR] No"}) -ForegroundColor $(if($Results.WinRMConfigured){"Green"}else{"Red"})
     
     Write-Host "Firewall Configured: " -NoNewline
-    Write-Host $(if($Results.FirewallConfigured){"✅ Yes"}else{"⚠ Skipped/Failed"}) -ForegroundColor $(if($Results.FirewallConfigured){"Green"}else{"Yellow"})
+    Write-Host $(if($Results.FirewallConfigured){"[OK] Yes"}else{"[WARN] Skipped/Failed"}) -ForegroundColor $(if($Results.FirewallConfigured){"Green"}else{"Yellow"})
     
     Write-Host "UAC Policy Configured: " -NoNewline
-    Write-Host $(if($Results.UACPolicyConfigured){"✅ Yes"}else{"❌ No"}) -ForegroundColor $(if($Results.UACPolicyConfigured){"Green"}else{"Red"})
+    Write-Host $(if($Results.UACPolicyConfigured){"[OK] Yes"}else{"[ERROR] No"}) -ForegroundColor $(if($Results.UACPolicyConfigured){"Green"}else{"Red"})
     
     Write-Host "Security Lockdown Applied: " -NoNewline
-    Write-Host $(if($Results.SecurityConfigured){"✅ Yes"}else{"⚠ Skipped/Failed"}) -ForegroundColor $(if($Results.SecurityConfigured){"Green"}else{"Yellow"})
+    Write-Host $(if($Results.SecurityConfigured){"[OK] Yes"}else{"[WARN] Skipped/Failed"}) -ForegroundColor $(if($Results.SecurityConfigured){"Green"}else{"Yellow"})
     
     if ($Results.TrustedHostsConfigured) {
         Write-Host "Trusted Hosts Configured: " -NoNewline
-        Write-Host "✅ Yes" -ForegroundColor Green
+        Write-Host "[OK] Yes" -ForegroundColor Green
     }
     
     Write-Host "Domain Status: " -NoNewline
@@ -3162,14 +3162,14 @@ function Show-PSRemotingConfigurationSummary {
     if ($Results.EndpointsSecured.Count -gt 0) {
         Write-Host "`nSecured Endpoints:" -ForegroundColor Green
         $Results.EndpointsSecured | ForEach-Object {
-            Write-Host "  • $_" -ForegroundColor Green
+            Write-Host "  - $_" -ForegroundColor Green
         }
     }
     
     if ($Results.Errors.Count -gt 0) {
         Write-Host "`nConfiguration Issues:" -ForegroundColor Red
         $Results.Errors | ForEach-Object {
-            Write-Host "  • $_" -ForegroundColor Red
+            Write-Host "  - $_" -ForegroundColor Red
         }
     }
     
@@ -3181,9 +3181,9 @@ function Show-PSRemotingConfigurationSummary {
 # Enable-PowerShellRemotingSafely -AllowedUsers @("DOMAIN\PowerUsers") -TrustedHosts "192.168.1.*"
 # Enable-PowerShellRemotingSafely -WhatIf
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Option 6 - Configure Automatic Time Sync
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 function Invoke-TimeSyncConfigurationPass {
     <#
@@ -3416,9 +3416,9 @@ function Configure-AutomaticTimeSync {
         $results.DomainEnvironment = $computerSystem.PartOfDomain
 
         if ($results.DomainEnvironment) {
-            Write-StatusLog "ℹ Domain environment detected - will configure for domain time sync" -Level "Info"
+            Write-StatusLog "[INFO] Domain environment detected - will configure for domain time sync" -Level "Info"
         } else {
-            Write-StatusLog "ℹ Workgroup environment detected - will use external NTP servers" -Level "Info"
+            Write-StatusLog "[INFO] Workgroup environment detected - will use external NTP servers" -Level "Info"
         }
 
         # First pass
@@ -3442,7 +3442,7 @@ function Configure-AutomaticTimeSync {
         # Retry once if needed
         if (Test-TimeSyncRetryNeeded -Results $results -TimeZone:$TimeZone -ValidateAccuracy:$ValidateAccuracy) {
             $results.RetryAttempted = $true
-            Write-StatusLog "⚠ Initial time sync configuration did not fully succeed. Waiting 10 seconds and retrying once..." -Level "Warning"
+            Write-StatusLog "[WARN] Initial time sync configuration did not fully succeed. Waiting 10 seconds and retrying once..." -Level "Warning"
             Start-Sleep -Seconds 10
 
             $pass2 = Invoke-TimeSyncConfigurationPass `
@@ -3464,9 +3464,9 @@ function Configure-AutomaticTimeSync {
 
             if (-not (Test-TimeSyncRetryNeeded -Results $results -TimeZone:$TimeZone -ValidateAccuracy:$ValidateAccuracy)) {
                 $results.RetrySucceeded = $true
-                Write-StatusLog "✅ Time sync configuration succeeded on retry." -Level "Success"
+                Write-StatusLog "[OK] Time sync configuration succeeded on retry." -Level "Success"
             } else {
-                Write-StatusLog "⚠ Time sync configuration still has issues after retry." -Level "Warning"
+                Write-StatusLog "[WARN] Time sync configuration still has issues after retry." -Level "Warning"
             }
         }
 
@@ -3479,19 +3479,19 @@ function Configure-AutomaticTimeSync {
         # Set global status
         $global:LastStatus = if ($results.Errors.Count -eq 0) {
             if ($results.RetrySucceeded) {
-                "✅ Time synchronization configured successfully after retry"
+                "[OK] Time synchronization configured successfully after retry"
             } else {
-                "✅ Time synchronization configured successfully"
+                "[OK] Time synchronization configured successfully"
             }
         } else {
-            "⚠ Time synchronization configured with $($results.Errors.Count) issues"
+            "[WARN] Time synchronization configured with $($results.Errors.Count) issues"
         }
 
     } catch {
         $errorMsg = "Critical error during time sync configuration: $($_.Exception.Message)"
-        Write-StatusLog "❌ $errorMsg" -Level "Error"
+        Write-StatusLog "[ERROR] $errorMsg" -Level "Error"
         $results.Errors += $errorMsg
-        $global:LastStatus = "❌ Failed to configure time synchronization"
+        $global:LastStatus = "[ERROR] Failed to configure time synchronization"
     }
 
     return $results
@@ -3538,7 +3538,7 @@ function Set-NTPConfiguration {
 
         if ($DomainEnvironment) {
             # In domain environment, configure for domain hierarchy
-            Write-StatusLog "ℹ Configuring for domain time hierarchy" -Level "Info"
+            Write-StatusLog "[INFO] Configuring for domain time hierarchy" -Level "Info"
             $ntpServerList = $NTPServers -join " "
 
             # Configure as NTP client with domain hierarchy
@@ -3547,7 +3547,7 @@ function Set-NTPConfiguration {
 
         } else {
             # In workgroup environment, use manual peer list
-            Write-StatusLog "ℹ Configuring for workgroup manual peer list" -Level "Info"
+            Write-StatusLog "[INFO] Configuring for workgroup manual peer list" -Level "Info"
             $ntpServerList = $NTPServers -join " "
 
             # Configure as NTP client with manual peer list
@@ -3571,22 +3571,22 @@ function Set-NTPConfiguration {
                 break
             }
 
-            Write-StatusLog "⚠ NTP configuration verification attempt $i failed. Waiting before retry..." -Level "Warning"
+            Write-StatusLog "[WARN] NTP configuration verification attempt $i failed. Waiting before retry..." -Level "Warning"
             Start-Sleep -Seconds 3
         }
 
         if ($verified) {
             $result.Success = $true
             $result.ConfiguredServers = $NTPServers
-            Write-StatusLog "✅ NTP servers configured: $($NTPServers -join ', ')" -Level "Success"
+            Write-StatusLog "[OK] NTP servers configured: $($NTPServers -join ', ')" -Level "Success"
         } else {
             $result.Error = "w32tm configuration command failed with exit code: $lastExitCodeSeen"
-            Write-StatusLog "⚠ $($result.Error)" -Level "Warning"
+            Write-StatusLog "[WARN] $($result.Error)" -Level "Warning"
         }
 
     } catch {
         $result.Error = "Failed to configure NTP servers: $($_.Exception.Message)"
-        Write-StatusLog "❌ $($result.Error)" -Level "Error"
+        Write-StatusLog "[ERROR] $($result.Error)" -Level "Error"
     }
 
     return $result
@@ -3623,22 +3623,22 @@ function Set-W32TimeServiceConfiguration {
         if ($w32timeService.StartType -ne 'Automatic') {
             Set-Service -Name W32Time -StartupType Automatic -ErrorAction Stop
             $result.StartupTypeSet = $true
-            Write-StatusLog "✅ W32Time service set to Automatic startup" -Level "Success"
+            Write-StatusLog "[OK] W32Time service set to Automatic startup" -Level "Success"
         } else {
-            Write-StatusLog "ℹ W32Time service already set to Automatic startup" -Level "Info"
+            Write-StatusLog "[INFO] W32Time service already set to Automatic startup" -Level "Info"
         }
 
         # Start service if not running
         if ($w32timeService.Status -ne 'Running') {
             Start-Service -Name W32Time -ErrorAction Stop
             $result.ServiceStarted = $true
-            Write-StatusLog "✅ W32Time service started" -Level "Success"
+            Write-StatusLog "[OK] W32Time service started" -Level "Success"
         }
 
         # Restart service to apply new configuration
         Restart-Service -Name W32Time -Force -ErrorAction Stop
         $result.ServiceRestarted = $true
-        Write-StatusLog "✅ W32Time service restarted to apply configuration" -Level "Success"
+        Write-StatusLog "[OK] W32Time service restarted to apply configuration" -Level "Success"
 
         # Wait for service to fully start
         Start-Sleep -Seconds 3
@@ -3647,7 +3647,7 @@ function Set-W32TimeServiceConfiguration {
 
     } catch {
         $result.Error = "Failed to configure W32Time service: $($_.Exception.Message)"
-        Write-StatusLog "❌ $($result.Error)" -Level "Error"
+        Write-StatusLog "[ERROR] $($result.Error)" -Level "Error"
     }
 
     return $result
@@ -3682,7 +3682,7 @@ function Invoke-InitialTimeSync {
         $result.TimeBefore = Get-Date
 
         # Perform synchronization
-        Write-StatusLog "ℹ Initiating time synchronization..." -Level "Info"
+        Write-StatusLog "[INFO] Initiating time synchronization..." -Level "Info"
         $syncOutput = & w32tm /resync /force 2>&1
         $result.SyncAttempted = $true
 
@@ -3702,19 +3702,19 @@ function Invoke-InitialTimeSync {
             }
 
             $result.Success = $true
-            Write-StatusLog "✅ Initial time synchronization completed" -Level "Success"
+            Write-StatusLog "[OK] Initial time synchronization completed" -Level "Success"
 
             if ($result.SyncSource) {
-                Write-StatusLog "ℹ Sync source: $($result.SyncSource)" -Level "Info"
+                Write-StatusLog "[INFO] Sync source: $($result.SyncSource)" -Level "Info"
             }
         } else {
             $result.Error = "Time sync command failed. Output: $syncOutput"
-            Write-StatusLog "⚠ Time sync may have failed: $($result.Error)" -Level "Warning"
+            Write-StatusLog "[WARN] Time sync may have failed: $($result.Error)" -Level "Warning"
         }
 
     } catch {
         $result.Error = "Failed to perform initial time sync: $($_.Exception.Message)"
-        Write-StatusLog "❌ $($result.Error)" -Level "Error"
+        Write-StatusLog "[ERROR] $($result.Error)" -Level "Error"
     }
 
     return $result
@@ -3764,9 +3764,9 @@ function Set-TimeSyncScheduledTask {
             if (-not $taskInfo.Enabled) {
                 Enable-ScheduledTask -TaskName $result.TaskName -ErrorAction Stop
                 $result.TaskEnabled = $true
-                Write-StatusLog "✅ Enabled existing time sync scheduled task" -Level "Success"
+                Write-StatusLog "[OK] Enabled existing time sync scheduled task" -Level "Success"
             } else {
-                Write-StatusLog "ℹ Time sync scheduled task already exists and is enabled" -Level "Info"
+                Write-StatusLog "[INFO] Time sync scheduled task already exists and is enabled" -Level "Info"
             }
 
             $result.Success = $true
@@ -3774,7 +3774,7 @@ function Set-TimeSyncScheduledTask {
         }
 
         # Create new scheduled task
-        Write-StatusLog "ℹ Creating scheduled task for automatic time synchronization..." -Level "Info"
+        Write-StatusLog "[INFO] Creating scheduled task for automatic time synchronization..." -Level "Info"
 
         # Create task action
         $action = New-ScheduledTaskAction -Execute 'w32tm.exe' -Argument '/resync /force'
@@ -3810,11 +3810,11 @@ function Set-TimeSyncScheduledTask {
 
         $result.TaskCreated = $true
         $result.Success = $true
-        Write-StatusLog "✅ Created scheduled task: '$($result.TaskName)' (every $SyncInterval hours)" -Level "Success"
+        Write-StatusLog "[OK] Created scheduled task: '$($result.TaskName)' (every $SyncInterval hours)" -Level "Success"
 
     } catch {
         $result.Error = "Failed to configure scheduled task: $($_.Exception.Message)"
-        Write-StatusLog "❌ $($result.Error)" -Level "Error"
+        Write-StatusLog "[ERROR] $($result.Error)" -Level "Error"
     }
 
     return $result
@@ -3854,28 +3854,28 @@ function Set-AutomaticTimeZone {
             if (Test-Path $regPath) {
                 Set-ItemProperty -Path $regPath -Name "Start" -Value 3 -ErrorAction Stop
                 $result.AutomaticEnabled = $true
-                Write-StatusLog "✅ Automatic time zone updates enabled" -Level "Success"
+                Write-StatusLog "[OK] Automatic time zone updates enabled" -Level "Success"
             }
         } catch {
-            Write-StatusLog "⚠ Could not enable automatic time zone: $($_.Exception.Message)" -Level "Warning"
+            Write-StatusLog "[WARN] Could not enable automatic time zone: $($_.Exception.Message)" -Level "Warning"
         }
 
         # Attempt to detect and set correct time zone based on location
         try {
             $location = Get-WinHomeLocation -ErrorAction SilentlyContinue
             if ($location) {
-                Write-StatusLog "ℹ Current location detected: $($location.HomeLocation)" -Level "Info"
+                Write-StatusLog "[INFO] Current location detected: $($location.HomeLocation)" -Level "Info"
             }
         } catch {
-            Write-StatusLog "ℹ Could not detect location for time zone setting" -Level "Info"
+            Write-StatusLog "[INFO] Could not detect location for time zone setting" -Level "Info"
         }
 
         $result.Success = $true
-        Write-StatusLog "✅ Time zone configuration completed" -Level "Success"
+        Write-StatusLog "[OK] Time zone configuration completed" -Level "Success"
 
     } catch {
         $result.Error = "Failed to configure time zone: $($_.Exception.Message)"
-        Write-StatusLog "❌ $($result.Error)" -Level "Error"
+        Write-StatusLog "[ERROR] $($result.Error)" -Level "Error"
     }
 
     return $result
@@ -3912,28 +3912,28 @@ function Test-TimeAccuracy {
         # Query W32Time for current sync status
         $w32tmStatus = & w32tm /query /status 2>$null
         if ($LASTEXITCODE -eq 0) {
-            Write-StatusLog "✅ W32Time service is responding normally" -Level "Success"
+            Write-StatusLog "[OK] W32Time service is responding normally" -Level "Success"
 
             # Parse last sync time
             $lastSyncLine = $w32tmStatus | Where-Object { $_ -match "Last Successful Sync Time:" }
             if ($lastSyncLine) {
-                Write-StatusLog "ℹ $($lastSyncLine.Trim())" -Level "Info"
+                Write-StatusLog "[INFO] $($lastSyncLine.Trim())" -Level "Info"
             }
 
             # Check if time is within reasonable tolerance
             # For this validation, we'll consider the system accurate if w32tm reports success
             $result.AccuracyWithinTolerance = $true
             $result.Success = $true
-            Write-StatusLog "✅ Time synchronization appears to be working correctly" -Level "Success"
+            Write-StatusLog "[OK] Time synchronization appears to be working correctly" -Level "Success"
 
         } else {
             $result.Error = "W32Time status query failed"
-            Write-StatusLog "⚠ Could not validate time accuracy - W32Time status unavailable" -Level "Warning"
+            Write-StatusLog "[WARN] Could not validate time accuracy - W32Time status unavailable" -Level "Warning"
         }
 
     } catch {
         $result.Error = "Failed to validate time accuracy: $($_.Exception.Message)"
-        Write-StatusLog "❌ $($result.Error)" -Level "Error"
+        Write-StatusLog "[ERROR] $($result.Error)" -Level "Error"
     }
 
     return $result
@@ -3996,7 +3996,7 @@ function Get-TimeSyncConfigurationSummary {
         }
 
     } catch {
-        Write-StatusLog "⚠ Error gathering time sync configuration summary: $($_.Exception.Message)" -Level "Warning"
+        Write-StatusLog "[WARN] Error gathering time sync configuration summary: $($_.Exception.Message)" -Level "Warning"
     }
 
     return $summary
@@ -4027,42 +4027,42 @@ function Show-TimeSyncConfigurationSummary {
     Write-Host $(if($Results.DomainEnvironment){"Domain-joined"}else{"Workgroup"}) -ForegroundColor White
 
     Write-Host "NTP Configured: " -NoNewline
-    Write-Host $(if($Results.NTPConfigured){"✅ Yes"}else{"❌ No"}) -ForegroundColor $(if($Results.NTPConfigured){"Green"}else{"Red"})
+    Write-Host $(if($Results.NTPConfigured){"[OK] Yes"}else{"[ERROR] No"}) -ForegroundColor $(if($Results.NTPConfigured){"Green"}else{"Red"})
 
     Write-Host "Service Configured: " -NoNewline
-    Write-Host $(if($Results.ServiceConfigured){"✅ Yes"}else{"❌ No"}) -ForegroundColor $(if($Results.ServiceConfigured){"Green"}else{"Red"})
+    Write-Host $(if($Results.ServiceConfigured){"[OK] Yes"}else{"[ERROR] No"}) -ForegroundColor $(if($Results.ServiceConfigured){"Green"}else{"Red"})
 
     Write-Host "Initial Sync Completed: " -NoNewline
-    Write-Host $(if($Results.InitialSyncCompleted){"✅ Yes"}else{"❌ No"}) -ForegroundColor $(if($Results.InitialSyncCompleted){"Green"}else{"Red"})
+    Write-Host $(if($Results.InitialSyncCompleted){"[OK] Yes"}else{"[ERROR] No"}) -ForegroundColor $(if($Results.InitialSyncCompleted){"Green"}else{"Red"})
 
     Write-Host "Scheduled Task Configured: " -NoNewline
-    Write-Host $(if($Results.ScheduledTaskConfigured){"✅ Yes"}else{"⚠ Skipped/Failed"}) -ForegroundColor $(if($Results.ScheduledTaskConfigured){"Green"}else{"Yellow"})
+    Write-Host $(if($Results.ScheduledTaskConfigured){"[OK] Yes"}else{"[WARN] Skipped/Failed"}) -ForegroundColor $(if($Results.ScheduledTaskConfigured){"Green"}else{"Yellow"})
 
     if ($Results.ContainsKey('RetryAttempted')) {
         Write-Host "Retry Attempted: " -NoNewline
-        Write-Host $(if($Results.RetryAttempted){"✅ Yes"}else{"No"}) -ForegroundColor $(if($Results.RetryAttempted){"Yellow"}else{"White"})
+        Write-Host $(if($Results.RetryAttempted){"[OK] Yes"}else{"No"}) -ForegroundColor $(if($Results.RetryAttempted){"Yellow"}else{"White"})
     }
 
     if ($Results.ContainsKey('RetrySucceeded') -and $Results.RetrySucceeded) {
         Write-Host "Retry Succeeded: " -NoNewline
-        Write-Host "✅ Yes" -ForegroundColor Green
+        Write-Host "[OK] Yes" -ForegroundColor Green
     }
 
     if ($Results.TimeZoneConfigured) {
         Write-Host "Time Zone Configured: " -NoNewline
-        Write-Host "✅ Yes" -ForegroundColor Green
+        Write-Host "[OK] Yes" -ForegroundColor Green
     }
 
     if ($Results.AccuracyValidated) {
         Write-Host "Time Accuracy Validated: " -NoNewline
-        Write-Host "✅ Yes" -ForegroundColor Green
+        Write-Host "[OK] Yes" -ForegroundColor Green
     }
 
     # Show NTP servers if configured
     if ($Results.TimeSyncDetails.NTPServers) {
         Write-Host "`nConfigured NTP Servers:" -ForegroundColor Green
         $Results.TimeSyncDetails.NTPServers | ForEach-Object {
-            Write-Host "  • $_" -ForegroundColor Green
+            Write-Host "  - $_" -ForegroundColor Green
         }
     }
 
@@ -4075,7 +4075,7 @@ function Show-TimeSyncConfigurationSummary {
     if ($Results.Errors.Count -gt 0) {
         Write-Host "`nConfiguration Issues:" -ForegroundColor Red
         $Results.Errors | ForEach-Object {
-            Write-Host "  • $_" -ForegroundColor Red
+            Write-Host "  - $_" -ForegroundColor Red
         }
     }
 
@@ -4087,9 +4087,9 @@ function Show-TimeSyncConfigurationSummary {
 # Configure-AutomaticTimeSync -NTPServers @("pool.ntp.org", "time.windows.com") -SyncInterval 6
 # Configure-AutomaticTimeSync -TimeZone -ValidateAccuracy -WhatIf
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Winget Dependencies
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 $script:WingetPrereqsInstalled = $false
 
 function Ensure-WingetDependenciesReady {
@@ -4222,16 +4222,16 @@ function Ensure-WingetDependenciesReady {
         # Update global flag on success
         if ($results.Success) {
             $script:WingetPrereqsInstalled = $true
-            $global:LastStatus = "✅ Winget dependencies configured successfully"
+            $global:LastStatus = "[OK] Winget dependencies configured successfully"
         } else {
-            $global:LastStatus = "⚠ Winget dependencies configured with $($results.Errors.Count) issues"
+            $global:LastStatus = "[WARN] Winget dependencies configured with $($results.Errors.Count) issues"
         }
         
     } catch {
         $errorMsg = "Critical error during Winget dependencies setup: $($_.Exception.Message)"
-        Write-StatusLog "❌ $errorMsg" -Level "Error"
+        Write-StatusLog "[ERROR] $errorMsg" -Level "Error"
         $results.Errors += $errorMsg
-        $global:LastStatus = "❌ Failed to configure Winget dependencies"
+        $global:LastStatus = "[ERROR] Failed to configure Winget dependencies"
     }
     
     return $results
@@ -4274,18 +4274,18 @@ function Set-SecureConnectionSettings {
         
         [Net.ServicePointManager]::SecurityProtocol = $requiredProtocols
         $result.TLSConfigured = $true
-        Write-StatusLog "✅ Secure TLS protocols configured" -Level "Success"
+        Write-StatusLog "[OK] Secure TLS protocols configured" -Level "Success"
         
         # Set connection limit for better download performance
         [Net.ServicePointManager]::DefaultConnectionLimit = 64
         $result.ConnectionLimitSet = $true
-        Write-StatusLog "✅ Connection limit optimized for downloads" -Level "Success"
+        Write-StatusLog "[OK] Connection limit optimized for downloads" -Level "Success"
         
         $result.Success = $true
         
     } catch {
         $result.Error = "Failed to configure secure connections: $($_.Exception.Message)"
-        Write-StatusLog "❌ $($result.Error)" -Level "Error"
+        Write-StatusLog "[ERROR] $($result.Error)" -Level "Error"
     }
     
     return $result
@@ -4334,7 +4334,7 @@ function Get-ExistingWingetComponents {
         Write-StatusLog "Component status - VCLibs: $($components.VCLibs), UI.Xaml: $($components.UIXaml), AppInstaller: $($components.AppInstaller), Winget: $($components.Winget)" -Level "Info"
         
     } catch {
-        Write-StatusLog "⚠ Error checking existing components: $($_.Exception.Message)" -Level "Warning"
+        Write-StatusLog "[WARN] Error checking existing components: $($_.Exception.Message)" -Level "Warning"
     }
     
     return $components
@@ -4481,7 +4481,7 @@ function Install-WingetDependencies {
             
             if (-not $downloadResult.Success) {
                 $result.Errors += $downloadResult.Error
-                Write-StatusLog "❌ Failed to download $($source.Name): $($downloadResult.Error)" -Level "Error"
+                Write-StatusLog "[ERROR] Failed to download $($source.Name): $($downloadResult.Error)" -Level "Error"
             }
         }
         
@@ -4492,7 +4492,7 @@ function Install-WingetDependencies {
             
             if (-not $downloadResult.Success -or -not (Test-Path $source.Path)) {
                 $result.Skipped += $source.Name
-                Write-StatusLog "⚠ Skipping installation of $($source.Name) - download failed" -Level "Warning"
+                Write-StatusLog "[WARN] Skipping installation of $($source.Name) - download failed" -Level "Warning"
                 continue
             }
             
@@ -4501,16 +4501,16 @@ function Install-WingetDependencies {
                 
                 if ($installResult.Success) {
                     $result.Installed += $source.Name
-                    Write-StatusLog "✅ Successfully installed: $($source.Name)" -Level "Success"
+                    Write-StatusLog "[OK] Successfully installed: $($source.Name)" -Level "Success"
                 } else {
                     $result.Errors += $installResult.Error
-                    Write-StatusLog "❌ Failed to install $($source.Name): $($installResult.Error)" -Level "Error"
+                    Write-StatusLog "[ERROR] Failed to install $($source.Name): $($installResult.Error)" -Level "Error"
                 }
                 
             } catch {
                 $errorMsg = "Unexpected error installing $($source.Name): $($_.Exception.Message)"
                 $result.Errors += $errorMsg
-                Write-StatusLog "❌ $errorMsg" -Level "Error"
+                Write-StatusLog "[ERROR] $errorMsg" -Level "Error"
             } finally {
                 # Clean up downloaded file
                 if (Test-Path $source.Path) {
@@ -4569,7 +4569,7 @@ function Invoke-SecureDownload {
                 $result.Method = "BITS"
                 $result.Success = $true
             } catch {
-                Write-StatusLog "⚠ BITS download failed, trying HTTP method" -Level "Warning"
+                Write-StatusLog "[WARN] BITS download failed, trying HTTP method" -Level "Warning"
             }
         }
         
@@ -4602,7 +4602,7 @@ function Invoke-SecureDownload {
                 $result.Success = $false
                 $result.Error = "Downloaded file is too small (likely an error page)"
             } else {
-                Write-StatusLog "✅ Downloaded $($Source.Name) ($($fileInfo.Length) bytes) using $($result.Method)" -Level "Success"
+                Write-StatusLog "[OK] Downloaded $($Source.Name) ($($fileInfo.Length) bytes) using $($result.Method)" -Level "Success"
             }
         } elseif ($result.Success) {
             $result.Success = $false
@@ -4703,13 +4703,13 @@ function Set-WingetSources {
                 winget source add --name msstore --arg "https://storeedgefd.dsx.mp.microsoft.com/v9.0" --accept-source-agreements 2>$null
                 if ($LASTEXITCODE -eq 0) {
                     $result.SourcesAdded += "msstore"
-                    Write-StatusLog "✅ Added Microsoft Store source to Winget" -Level "Success"
+                    Write-StatusLog "[OK] Added Microsoft Store source to Winget" -Level "Success"
                 }
             } else {
-                Write-StatusLog "ℹ Microsoft Store source already configured" -Level "Info"
+                Write-StatusLog "[INFO] Microsoft Store source already configured" -Level "Info"
             }
         } catch {
-            Write-StatusLog "⚠ Failed to add Microsoft Store source: $($_.Exception.Message)" -Level "Warning"
+            Write-StatusLog "[WARN] Failed to add Microsoft Store source: $($_.Exception.Message)" -Level "Warning"
         }
         
         # Update sources
@@ -4717,17 +4717,17 @@ function Set-WingetSources {
             winget source update 2>$null
             if ($LASTEXITCODE -eq 0) {
                 $result.SourcesUpdated = $true
-                Write-StatusLog "✅ Winget sources updated" -Level "Success"
+                Write-StatusLog "[OK] Winget sources updated" -Level "Success"
             }
         } catch {
-            Write-StatusLog "⚠ Failed to update Winget sources: $($_.Exception.Message)" -Level "Warning"
+            Write-StatusLog "[WARN] Failed to update Winget sources: $($_.Exception.Message)" -Level "Warning"
         }
         
         $result.Success = $true
         
     } catch {
         $result.Error = "Failed to configure Winget sources: $($_.Exception.Message)"
-        Write-StatusLog "❌ $($result.Error)" -Level "Error"
+        Write-StatusLog "[ERROR] $($result.Error)" -Level "Error"
     }
     
     return $result
@@ -4762,14 +4762,14 @@ function Set-PowerShellGalleryConfiguration {
             if ($psGallery -and $psGallery.InstallationPolicy -ne 'Trusted') {
                 Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction Stop
                 $result.PSGalleryTrusted = $true
-                Write-StatusLog "✅ PowerShell Gallery set as trusted repository" -Level "Success"
+                Write-StatusLog "[OK] PowerShell Gallery set as trusted repository" -Level "Success"
             } else {
-                Write-StatusLog "ℹ PowerShell Gallery already trusted" -Level "Info"
+                Write-StatusLog "[INFO] PowerShell Gallery already trusted" -Level "Info"
                 $result.PSGalleryTrusted = $true
             }
         } catch {
             $result.Error = "Failed to configure PowerShell Gallery: $($_.Exception.Message)"
-            Write-StatusLog "❌ $($result.Error)" -Level "Error"
+            Write-StatusLog "[ERROR] $($result.Error)" -Level "Error"
         }
         
         # Install/Update NuGet provider
@@ -4780,20 +4780,20 @@ function Set-PowerShellGalleryConfiguration {
             if (-not $nugetProvider -or $nugetProvider.Version -lt $minimumVersion) {
                 Install-PackageProvider -Name NuGet -MinimumVersion $minimumVersion -Force -ErrorAction Stop
                 $result.NuGetInstalled = $true
-                Write-StatusLog "✅ NuGet package provider installed/updated" -Level "Success"
+                Write-StatusLog "[OK] NuGet package provider installed/updated" -Level "Success"
             } else {
-                Write-StatusLog "ℹ NuGet package provider already up to date" -Level "Info"
+                Write-StatusLog "[INFO] NuGet package provider already up to date" -Level "Info"
                 $result.NuGetInstalled = $true
             }
         } catch {
-            Write-StatusLog "⚠ Failed to install NuGet provider: $($_.Exception.Message)" -Level "Warning"
+            Write-StatusLog "[WARN] Failed to install NuGet provider: $($_.Exception.Message)" -Level "Warning"
         }
         
         $result.Success = ($result.PSGalleryTrusted -and $result.NuGetInstalled)
         
     } catch {
         $result.Error = "Failed to configure PowerShell Gallery: $($_.Exception.Message)"
-        Write-StatusLog "❌ $($result.Error)" -Level "Error"
+        Write-StatusLog "[ERROR] $($result.Error)" -Level "Error"
     }
     
     return $result
@@ -4823,7 +4823,7 @@ function Test-WingetInstallation {
             if ($LASTEXITCODE -eq 0 -and $wingetOutput) {
                 $result.WingetAvailable = $true
                 $result.Version = $wingetOutput.Trim()
-                Write-StatusLog "✅ Winget is functional (version: $($result.Version))" -Level "Success"
+                Write-StatusLog "[OK] Winget is functional (version: $($result.Version))" -Level "Success"
             }
         } catch {
             $result.Error = "Winget command test failed: $($_.Exception.Message)"
@@ -4835,10 +4835,10 @@ function Test-WingetInstallation {
                 $sources = winget source list 2>$null
                 $result.SourcesConfigured = ($LASTEXITCODE -eq 0 -and $sources)
                 if ($result.SourcesConfigured) {
-                    Write-StatusLog "✅ Winget sources are configured" -Level "Success"
+                    Write-StatusLog "[OK] Winget sources are configured" -Level "Success"
                 }
             } catch {
-                Write-StatusLog "⚠ Could not verify Winget sources" -Level "Warning"
+                Write-StatusLog "[WARN] Could not verify Winget sources" -Level "Warning"
             }
         }
         
@@ -4877,7 +4877,7 @@ function Show-WingetPrerequisitesSummary {
         Write-Host "Already Configured" -ForegroundColor Yellow
     } else {
         Write-Host "Security Configured: " -NoNewline
-        Write-Host $(if($Results.SecurityConfigured){"✅ Yes"}else{"❌ No"}) -ForegroundColor $(if($Results.SecurityConfigured){"Green"}else{"Red"})
+        Write-Host $(if($Results.SecurityConfigured){"[OK] Yes"}else{"[ERROR] No"}) -ForegroundColor $(if($Results.SecurityConfigured){"Green"}else{"Red"})
         
         Write-Host "Components Installed: " -NoNewline
         Write-Host $Results.ComponentsInstalled.Count -ForegroundColor Green
@@ -4886,23 +4886,23 @@ function Show-WingetPrerequisitesSummary {
         Write-Host $Results.ComponentsSkipped.Count -ForegroundColor Yellow
         
         Write-Host "Winget Sources Configured: " -NoNewline
-        Write-Host $(if($Results.SourcesConfigured){"✅ Yes"}else{"❌ No"}) -ForegroundColor $(if($Results.SourcesConfigured){"Green"}else{"Red"})
+        Write-Host $(if($Results.SourcesConfigured){"[OK] Yes"}else{"[ERROR] No"}) -ForegroundColor $(if($Results.SourcesConfigured){"Green"}else{"Red"})
         
         Write-Host "PowerShell Gallery Configured: " -NoNewline
-        Write-Host $(if($Results.PSGalleryConfigured){"✅ Yes"}else{"❌ No"}) -ForegroundColor $(if($Results.PSGalleryConfigured){"Green"}else{"Red"})
+        Write-Host $(if($Results.PSGalleryConfigured){"[OK] Yes"}else{"[ERROR] No"}) -ForegroundColor $(if($Results.PSGalleryConfigured){"Green"}else{"Red"})
     }
     
     if ($Results.ComponentsInstalled.Count -gt 0) {
         Write-Host "`nInstalled Components:" -ForegroundColor Green
         $Results.ComponentsInstalled | ForEach-Object {
-            Write-Host "  • $_" -ForegroundColor Green
+            Write-Host "  - $_" -ForegroundColor Green
         }
     }
     
     if ($Results.Errors.Count -gt 0) {
         Write-Host "`nIssues Encountered:" -ForegroundColor Red
         $Results.Errors | ForEach-Object {
-            Write-Host "  • $_" -ForegroundColor Red
+            Write-Host "  - $_" -ForegroundColor Red
         }
     }
     
@@ -4914,11 +4914,11 @@ function Show-WingetPrerequisitesSummary {
 # Ensure-WingetDependenciesReady -Force -UseOfficialSources
 # Ensure-WingetDependenciesReady -WhatIf
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Option 9 - Application Updates
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 function Update-Applications {
     [CmdletBinding()]
     param(
@@ -5003,7 +5003,7 @@ function Test-IsNoiseLine {
     $trimmed = $Line.Trim()
 
     if ($trimmed -match '^[\-/\\|]+$') { return $true }
-    if ($trimmed -match 'Γû') { return $true }
+    if ($trimmed -match 'Gu') { return $true }
     if ($trimmed -match '^\d+%$') { return $true }
     if ($trimmed -match '^\d+(\.\d+)?\s*(KB|MB|GB)\s*/\s*\d+(\.\d+)?\s*(KB|MB|GB)$') { return $true }
 
@@ -5445,9 +5445,9 @@ finally {
 }
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Option 10 - HP Driver Updates
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 function Update-HPDrivers {
     <#
@@ -5462,9 +5462,9 @@ function Update-HPDrivers {
     [CmdletBinding()]
     param(
 
-    [switch]$IncludeBIOS = $false,
+    [switch]$IncludeBIOS = $true,
     [switch]$IncludeSoftware = $false,
-    [switch]$SuspendBitLockerForBIOS = $false,
+    [switch]$SuspendBitLockerForBIOS = $true,
     [string]$WorkingRoot = 'C:\Temp\HPDrivers',
     [string]$YamlLogFolder = 'C:\Logs',
     [int]$CleanupRetryCount = 12,
@@ -5603,7 +5603,7 @@ function Write-YamlLog {
 
         $yamlLines.Add('computer_name: ' + (ConvertTo-YamlSafeValue $script:ComputerName)) | Out-Null
         $yamlLines.Add('script_name: "05_Weekend_HP_Drivers_Update.ps1"') | Out-Null
-        $yamlLines.Add('script_version: "1.1"') | Out-Null
+        $yamlLines.Add('script_version: "1.2"') | Out-Null
         $yamlLines.Add('run_started: ' + (ConvertTo-YamlSafeValue ($script:RunStart.ToString('yyyy-MM-dd HH:mm:ss')))) | Out-Null
         $yamlLines.Add('run_finished: ' + (ConvertTo-YamlSafeValue ($runEnd.ToString('yyyy-MM-dd HH:mm:ss')))) | Out-Null
         $yamlLines.Add('duration_seconds: ' + $duration) | Out-Null
@@ -5880,6 +5880,7 @@ function Get-HPSoftpaqCategories {
 function Get-DriverList {
     $categories = Get-HPSoftpaqCategories
     Write-Log "Querying HP SoftPaq list for categories: $($categories -join ', ')" 'INFO'
+    Write-Log "BIOS category is enabled by default so Flash BIOS firmware updates can be downloaded and installed when applicable." 'INFO'
 
     $list = Get-SoftpaqList -Category $categories
 
@@ -5888,14 +5889,27 @@ function Get-DriverList {
         return @()
     }
 
+    $biosCount = 0
+
     foreach ($item in $list) {
         $category = $null
         if ($item.PSObject.Properties.Name -contains 'Category') {
             $category = [string]$item.Category
         }
 
+        if ($category -match 'BIOS') {
+            $biosCount++
+        }
+
         Add-DetectedSoftPaq -Id ([string]$item.Id) -Name ([string]$item.Name) -Version ([string]$item.Version) -Category $category
-        Write-Log "Detected: [$($item.Id)] $($item.Name) Version $($item.Version)" 'INFO'
+        Write-Log "Detected: [$($item.Id)] $($item.Name) Version $($item.Version) Category [$category]" 'INFO'
+    }
+
+    if ($biosCount -gt 0) {
+        Write-Log "Detected $biosCount applicable BIOS/Flash BIOS firmware SoftPaq update(s)." 'INFO'
+    }
+    else {
+        Write-Log "No applicable BIOS/Flash BIOS firmware SoftPaq updates were detected." 'INFO'
     }
 
     return @($list)
@@ -5908,10 +5922,28 @@ function Install-SoftpaqList {
 
     foreach ($item in $Softpaqs) {
         try {
-            Write-Log "Installing SoftPaq [$($item.Id)] $($item.Name)..." 'INFO'
+            $category = $null
+            if ($item.PSObject.Properties.Name -contains 'Category') {
+                $category = [string]$item.Category
+            }
+
+            if ($category -match 'BIOS') {
+                Write-Log "Downloading and installing Flash BIOS firmware SoftPaq [$($item.Id)] $($item.Name)..." 'INFO'
+            }
+            else {
+                Write-Log "Installing SoftPaq [$($item.Id)] $($item.Name)..." 'INFO'
+            }
+
             Get-Softpaq -Number $item.Id -Action SilentInstall | Out-Null
-            Write-Log "Installed SoftPaq [$($item.Id)] $($item.Name)." 'OK'
-            Add-InstalledSoftPaqResult -Id ([string]$item.Id) -Name ([string]$item.Name) -Version ([string]$item.Version) -Status 'Succeeded' -Message 'Installed successfully'
+
+            if ($category -match 'BIOS') {
+                Write-Log "Installed Flash BIOS firmware SoftPaq [$($item.Id)] $($item.Name). A reboot may be required to complete flashing." 'OK'
+                Add-InstalledSoftPaqResult -Id ([string]$item.Id) -Name ([string]$item.Name) -Version ([string]$item.Version) -Status 'Succeeded' -Message 'Flash BIOS firmware installed successfully; reboot may be required'
+            }
+            else {
+                Write-Log "Installed SoftPaq [$($item.Id)] $($item.Name)." 'OK'
+                Add-InstalledSoftPaqResult -Id ([string]$item.Id) -Name ([string]$item.Name) -Version ([string]$item.Version) -Status 'Succeeded' -Message 'Installed successfully'
+            }
         }
         catch {
             $msg = $_.Exception.Message
@@ -6076,9 +6108,9 @@ else {
 }
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Option 11 - Windows Updates
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 function Update-WindowsOS {
     <#
     .SYNOPSIS
@@ -6188,7 +6220,7 @@ function Update-WindowsOS {
             $results.RestorePointCreated = $restoreResult.Success
             
             if (-not $restoreResult.Success) {
-                Write-StatusLog "⚠ Failed to create restore point: $($restoreResult.Error)" -Level "Warning"
+                Write-StatusLog "[WARN] Failed to create restore point: $($restoreResult.Error)" -Level "Warning"
             }
         }
         
@@ -6225,7 +6257,7 @@ function Update-WindowsOS {
         
         if ($results.AvailableUpdates.Count -eq 0) {
             Write-StatusLog "No Windows updates available for installation" -Level "Info"
-            $global:LastStatus = "✅ Windows is up to date"
+            $global:LastStatus = "[OK] Windows is up to date"
             return $results
         }
         
@@ -6268,20 +6300,20 @@ function Update-WindowsOS {
         $failCount = $results.FailedUpdates.Count
         
         if ($results.RebootRequired -and -not $AllowReboot) {
-            Write-StatusLog "⚠ System restart required to complete updates" -Level "Warning"
+            Write-StatusLog "[WARN] System restart required to complete updates" -Level "Warning"
         }
         
         $global:LastStatus = if ($failCount -eq 0) {
-            "✅ Windows updates completed successfully ($successCount updates)"
+            "[OK] Windows updates completed successfully ($successCount updates)"
         } else {
-            "⚠ Windows updates completed with $failCount failures ($successCount successful)"
+            "[WARN] Windows updates completed with $failCount failures ($successCount successful)"
         }
         
     } catch {
         $errorMsg = "Critical error during Windows updates: $($_.Exception.Message)"
-        Write-StatusLog "❌ $errorMsg" -Level "Error"
+        Write-StatusLog "[ERROR] $errorMsg" -Level "Error"
         $results.Errors += $errorMsg
-        $global:LastStatus = "❌ Windows updates failed"
+        $global:LastStatus = "[ERROR] Windows updates failed"
     } finally {
         $results.UpdateDuration = (Get-Date) - $startTime
     }
@@ -6322,7 +6354,7 @@ function Ensure-WindowsUpdatePrerequisites {
             $result.Errors += "Insufficient disk space: $freeSpaceGB GB available (minimum 10GB required)"
         } else {
             $result.DiskSpaceAvailable = $true
-            Write-StatusLog "✅ Sufficient disk space available: $freeSpaceGB GB" -Level "Success"
+            Write-StatusLog "[OK] Sufficient disk space available: $freeSpaceGB GB" -Level "Success"
         }
         
         # Ensure Winget dependencies
@@ -6343,13 +6375,13 @@ function Ensure-WindowsUpdatePrerequisites {
             try {
                 Install-Module -Name "PSWindowsUpdate" -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
                 $result.PSWindowsUpdateInstalled = $true
-                Write-StatusLog "✅ PSWindowsUpdate module installed successfully" -Level "Success"
+                Write-StatusLog "[OK] PSWindowsUpdate module installed successfully" -Level "Success"
             } catch {
                 $result.Errors += "Failed to install PSWindowsUpdate module: $($_.Exception.Message)"
             }
         } else {
             $result.PSWindowsUpdateInstalled = $true
-            Write-StatusLog "✅ PSWindowsUpdate module already available" -Level "Success"
+            Write-StatusLog "[OK] PSWindowsUpdate module already available" -Level "Success"
             
             # Check for updates
             try {
@@ -6359,17 +6391,17 @@ function Ensure-WindowsUpdatePrerequisites {
                 if ($latestVersion -and $currentVersion.Version -lt $latestVersion.Version) {
                     Write-StatusLog "Updating PSWindowsUpdate module..." -Level "Info"
                     Update-Module -Name "PSWindowsUpdate" -Force -ErrorAction Stop
-                    Write-StatusLog "✅ PSWindowsUpdate module updated successfully" -Level "Success"
+                    Write-StatusLog "[OK] PSWindowsUpdate module updated successfully" -Level "Success"
                 }
             } catch {
-                Write-StatusLog "⚠ Could not check for PSWindowsUpdate module updates: $($_.Exception.Message)" -Level "Warning"
+                Write-StatusLog "[WARN] Could not check for PSWindowsUpdate module updates: $($_.Exception.Message)" -Level "Warning"
             }
         }
         
         # Import the module
         try {
             Import-Module -Name "PSWindowsUpdate" -Force -ErrorAction Stop
-            Write-StatusLog "✅ PSWindowsUpdate module imported successfully" -Level "Success"
+            Write-StatusLog "[OK] PSWindowsUpdate module imported successfully" -Level "Success"
         } catch {
             $result.Errors += "Failed to import PSWindowsUpdate module: $($_.Exception.Message)"
         }
@@ -6384,7 +6416,7 @@ function Ensure-WindowsUpdatePrerequisites {
                 if ($service.Status -ne 'Running') {
                     try {
                         Start-Service -Name $serviceName -ErrorAction Stop
-                        Write-StatusLog "✅ Started service: $serviceName" -Level "Success"
+                        Write-StatusLog "[OK] Started service: $serviceName" -Level "Success"
                     } catch {
                         $result.Errors += "Failed to start service $serviceName`: $($_.Exception.Message)"
                     }
@@ -6442,13 +6474,13 @@ function Reset-GroupPolicyConfiguration {
                 
                 Remove-Item -Path $gpPath -Recurse -Force -ErrorAction Stop
                 $result.FolderRemoved = $true
-                Write-StatusLog "✅ Group Policy folder removed successfully" -Level "Success"
+                Write-StatusLog "[OK] Group Policy folder removed successfully" -Level "Success"
             } catch {
                 $result.Errors += "Failed to remove Group Policy folder: $($_.Exception.Message)"
-                Write-StatusLog "❌ Failed to remove Group Policy folder: $($_.Exception.Message)" -Level "Error"
+                Write-StatusLog "[ERROR] Failed to remove Group Policy folder: $($_.Exception.Message)" -Level "Error"
             }
         } else {
-            Write-StatusLog "ℹ Group Policy folder not found, skipping removal" -Level "Info"
+            Write-StatusLog "[INFO] Group Policy folder not found, skipping removal" -Level "Info"
             $result.FolderRemoved = $true  # Consider this successful
         }
         
@@ -6460,14 +6492,14 @@ function Reset-GroupPolicyConfiguration {
             
             if ($exitCode -eq 0) {
                 $result.PolicyUpdated = $true
-                Write-StatusLog "✅ Group Policy update completed successfully" -Level "Success"
+                Write-StatusLog "[OK] Group Policy update completed successfully" -Level "Success"
             } else {
                 $result.Errors += "gpupdate failed with exit code: $exitCode. Output: $gpupdateResult"
-                Write-StatusLog "❌ Group Policy update failed with exit code: $exitCode" -Level "Error"
+                Write-StatusLog "[ERROR] Group Policy update failed with exit code: $exitCode" -Level "Error"
             }
         } catch {
             $result.Errors += "Failed to execute gpupdate: $($_.Exception.Message)"
-            Write-StatusLog "❌ Failed to execute gpupdate: $($_.Exception.Message)" -Level "Error"
+            Write-StatusLog "[ERROR] Failed to execute gpupdate: $($_.Exception.Message)" -Level "Error"
         }
         
         $result.Success = $result.FolderRemoved -and $result.PolicyUpdated
@@ -6537,15 +6569,15 @@ function Reset-WindowsUpdateComponents {
                     $output = Receive-Job $job
                     $result.ComponentsReset = $true
                     $result.Success = $true
-                    Write-StatusLog "✅ Windows Update components reset successfully" -Level "Success"
+                    Write-StatusLog "[OK] Windows Update components reset successfully" -Level "Success"
                 } else {
                     Stop-Job $job -Force
                     $result.Errors += "Windows Update component reset timed out after $MaxTimeout minutes"
-                    Write-StatusLog "❌ Component reset timed out after $MaxTimeout minutes" -Level "Error"
+                    Write-StatusLog "[ERROR] Component reset timed out after $MaxTimeout minutes" -Level "Error"
                 }
             } catch {
                 $result.Errors += "Failed to reset Windows Update components: $($_.Exception.Message)"
-                Write-StatusLog "❌ Failed to reset components: $($_.Exception.Message)" -Level "Error"
+                Write-StatusLog "[ERROR] Failed to reset components: $($_.Exception.Message)" -Level "Error"
             } finally {
                 Remove-Job $job -Force -ErrorAction SilentlyContinue
             }
@@ -6585,7 +6617,7 @@ function Reset-WUComponentsManually {
                 Stop-Service -Name $service -Force -ErrorAction Stop
                 Write-StatusLog "Stopped service: $service" -Level "Info"
             } catch {
-                Write-StatusLog "⚠ Could not stop service $service`: $($_.Exception.Message)" -Level "Warning"
+                Write-StatusLog "[WARN] Could not stop service $service`: $($_.Exception.Message)" -Level "Warning"
             }
         }
         
@@ -6601,7 +6633,7 @@ function Reset-WUComponentsManually {
                     Get-ChildItem -Path $path -Recurse | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
                     Write-StatusLog "Cleared cache: $path" -Level "Info"
                 } catch {
-                    Write-StatusLog "⚠ Could not clear cache $path`: $($_.Exception.Message)" -Level "Warning"
+                    Write-StatusLog "[WARN] Could not clear cache $path`: $($_.Exception.Message)" -Level "Warning"
                 }
             }
         }
@@ -6618,7 +6650,7 @@ function Reset-WUComponentsManually {
         
         $result.ComponentsReset = $true
         $result.Success = $true
-        Write-StatusLog "✅ Manual Windows Update component reset completed" -Level "Success"
+        Write-StatusLog "[OK] Manual Windows Update component reset completed" -Level "Success"
         
     } catch {
         $result.Errors += "Manual component reset failed: $($_.Exception.Message)"
@@ -6687,7 +6719,7 @@ function Get-AvailableWindowsUpdates {
         }
         catch {
             $result.Errors += "Failed to query Windows Update: $($_.Exception.Message)"
-            Write-StatusLog "❌ Windows Update query failed: $($_.Exception.Message)" -Level "Error"
+            Write-StatusLog "[ERROR] Windows Update query failed: $($_.Exception.Message)" -Level "Error"
             return $result
         }
         
@@ -6812,7 +6844,7 @@ function Get-AvailableWindowsUpdates {
             }
             catch {
                 $result.Errors += "Error processing update: $($_.Exception.Message)"
-                Write-StatusLog "⚠ Error processing update: $($_.Exception.Message)" -Level "Warning"
+                Write-StatusLog "[WARN] Error processing update: $($_.Exception.Message)" -Level "Warning"
                 
                 # Add a minimal entry for the failed update so it doesn't get lost
                 $result.Updates += @{
@@ -6836,7 +6868,7 @@ function Get-AvailableWindowsUpdates {
         
     } catch {
         $result.Errors += "Failed to discover Windows updates: $($_.Exception.Message)"
-        Write-StatusLog "❌ Update discovery failed: $($_.Exception.Message)" -Level "Error"
+        Write-StatusLog "[ERROR] Update discovery failed: $($_.Exception.Message)" -Level "Error"
     } finally {
         $result.DiscoveryDuration = (Get-Date) - $discoveryStart
     }
@@ -6879,7 +6911,7 @@ function Show-WindowsUpdatePlan {
         Write-Host "`nSECURITY UPDATES ($($securityUpdates.Count)):" -ForegroundColor Red
         $securityUpdates | ForEach-Object {
             $sizeText = if ($_.Size) { " - $([math]::Round($_.Size / 1MB, 1)) MB" } else { "" }
-            Write-Host "  🔴 $($_.Title) (KB$($_.KB))$sizeText" -ForegroundColor Red
+            Write-Host "  [RED] $($_.Title) (KB$($_.KB))$sizeText" -ForegroundColor Red
         }
     }
     
@@ -6887,7 +6919,7 @@ function Show-WindowsUpdatePlan {
         Write-Host "`nCRITICAL UPDATES ($($criticalUpdates.Count)):" -ForegroundColor Yellow
         $criticalUpdates | ForEach-Object {
             $sizeText = if ($_.Size) { " - $([math]::Round($_.Size / 1MB, 1)) MB" } else { "" }
-            Write-Host "  🟡 $($_.Title) (KB$($_.KB))$sizeText" -ForegroundColor Yellow
+            Write-Host "  [YELLOW] $($_.Title) (KB$($_.KB))$sizeText" -ForegroundColor Yellow
         }
     }
     
@@ -6895,7 +6927,7 @@ function Show-WindowsUpdatePlan {
         Write-Host "`nSTANDARD UPDATES ($($normalUpdates.Count)):" -ForegroundColor Green
         $normalUpdates | ForEach-Object {
             $sizeText = if ($_.Size) { " - $([math]::Round($_.Size / 1MB, 1)) MB" } else { "" }
-            Write-Host "  🟢 $($_.Title) (KB$($_.KB))$sizeText" -ForegroundColor Green
+            Write-Host "  [GREEN] $($_.Title) (KB$($_.KB))$sizeText" -ForegroundColor Green
         }
     }
     
@@ -6904,7 +6936,7 @@ function Show-WindowsUpdatePlan {
     Write-Host "Total Updates: $($Updates.Count)" -ForegroundColor White
     
     if ($rebootRequired.Count -gt 0) {
-        Write-Host "`n⚠️  WARNING: $($rebootRequired.Count) update(s) will require system restart!" -ForegroundColor Yellow
+        Write-Host "`n[WARN]  WARNING: $($rebootRequired.Count) update(s) will require system restart!" -ForegroundColor Yellow
     }
     
     Write-Host "="*100 -ForegroundColor Cyan
@@ -6954,7 +6986,7 @@ function Install-WindowsUpdatesSecurely {
         return $result
     }
     
-    Write-Host "`n🔄 Installing $($Updates.Count) Windows updates..." -ForegroundColor Cyan
+    Write-Host "`n[RESTART] Installing $($Updates.Count) Windows updates..." -ForegroundColor Cyan
     
     try {
         # Install updates with progress tracking
@@ -6975,7 +7007,7 @@ function Install-WindowsUpdatesSecurely {
         }
         catch {
             $result.Errors += "Failed to execute Install-WindowsUpdate: $($_.Exception.Message)"
-            Write-StatusLog "❌ Install-WindowsUpdate failed: $($_.Exception.Message)" -Level "Error"
+            Write-StatusLog "[ERROR] Install-WindowsUpdate failed: $($_.Exception.Message)" -Level "Error"
             return $result
         }
         
@@ -7019,25 +7051,25 @@ function Install-WindowsUpdatesSecurely {
                             $result.RebootRequired = $true
                         }
                         
-                        Write-StatusLog "✅ Installed: $title" -Level "Success"
+                        Write-StatusLog "[OK] Installed: $title" -Level "Success"
                     } else {
                         $result.Failed += $processedResult
-                        Write-StatusLog "❌ Failed: $title - $status" -Level "Error"
+                        Write-StatusLog "[ERROR] Failed: $title - $status" -Level "Error"
                     }
                 }
                 catch {
                     $result.Errors += "Error processing update result: $($_.Exception.Message)"
-                    Write-StatusLog "⚠ Error processing update result: $($_.Exception.Message)" -Level "Warning"
+                    Write-StatusLog "[WARN] Error processing update result: $($_.Exception.Message)" -Level "Warning"
                 }
             }
         } else {
-            Write-StatusLog "⚠ No installation results returned" -Level "Warning"
+            Write-StatusLog "[WARN] No installation results returned" -Level "Warning"
             $result.Errors += "No installation results returned from Install-WindowsUpdate"
         }
         
     } catch {
         $result.Errors += "Windows update installation failed: $($_.Exception.Message)"
-        Write-StatusLog "❌ Update installation failed: $($_.Exception.Message)" -Level "Error"
+        Write-StatusLog "[ERROR] Update installation failed: $($_.Exception.Message)" -Level "Error"
     }
     
     return $result
@@ -7087,8 +7119,8 @@ function Install-WindowsUpdatesSecurely {
         return $result
     }
     
-    Write-Host "`n🔄 Installing $($Updates.Count) Windows updates..." -ForegroundColor Cyan
-    Write-Host "📊 Progress will be shown below - installation may take several minutes..." -ForegroundColor Yellow
+    Write-Host "`n[RESTART] Installing $($Updates.Count) Windows updates..." -ForegroundColor Cyan
+    Write-Host "[SUMMARY] Progress will be shown below - installation may take several minutes..." -ForegroundColor Yellow
     
     try {
         # Install updates with progress tracking
@@ -7104,7 +7136,7 @@ function Install-WindowsUpdatesSecurely {
         }
         
         # Create a background job for installation with timeout monitoring
-        Write-StatusLog "🚀 Starting Windows Update installation process..." -Level "Info"
+        Write-StatusLog "[START] Starting Windows Update installation process..." -Level "Info"
         
         $installJob = Start-Job -ScriptBlock {
             param($installParams)
@@ -7123,9 +7155,9 @@ function Install-WindowsUpdatesSecurely {
         $lastStatusTime = Get-Date
         $statusUpdateInterval = 30 # seconds
         
-        Write-Host "⏱️  Installation started at $($startTime.ToString('HH:mm:ss'))" -ForegroundColor Cyan
-        Write-Host "⌛ Maximum timeout: $timeoutMinutes minutes" -ForegroundColor Gray
-        Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor Cyan
+        Write-Host "[TIMER]  Installation started at $($startTime.ToString('HH:mm:ss'))" -ForegroundColor Cyan
+        Write-Host "[WAIT] Maximum timeout: $timeoutMinutes minutes" -ForegroundColor Gray
+        Write-Host "------------------------------------------------------------------------------------------------------" -ForegroundColor Cyan
         
         while ($installJob.State -eq 'Running') {
             $currentTime = Get-Date
@@ -7136,19 +7168,19 @@ function Install-WindowsUpdatesSecurely {
                 $elapsedMinutes = [math]::Round($elapsed.TotalMinutes, 1)
                 $remainingMinutes = [math]::Max(0, $timeoutMinutes - $elapsed.TotalMinutes)
                 
-                Write-Host "🔄 Still installing... Elapsed: $elapsedMinutes min | Remaining timeout: $([math]::Round($remainingMinutes, 1)) min" -ForegroundColor Yellow
+                Write-Host "[RESTART] Still installing... Elapsed: $elapsedMinutes min | Remaining timeout: $([math]::Round($remainingMinutes, 1)) min" -ForegroundColor Yellow
                 
                 # Check Windows Update service status
                 $wuService = Get-Service -Name 'wuauserv' -ErrorAction SilentlyContinue
                 if ($wuService) {
-                    $serviceStatus = if ($wuService.Status -eq 'Running') { "✅ Running" } else { "⚠️ $($wuService.Status)" }
+                    $serviceStatus = if ($wuService.Status -eq 'Running') { "[OK] Running" } else { "[WARN] $($wuService.Status)" }
                     Write-Host "   Windows Update Service: $serviceStatus" -ForegroundColor Gray
                 }
                 
                 # Check for any pending reboots
                 $rebootPending = Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired" -ErrorAction SilentlyContinue
                 if ($rebootPending) {
-                    Write-Host "   ⚠️ Reboot required flag detected" -ForegroundColor Yellow
+                    Write-Host "   [WARN] Reboot required flag detected" -ForegroundColor Yellow
                 }
                 
                 $lastStatusTime = $currentTime
@@ -7156,7 +7188,7 @@ function Install-WindowsUpdatesSecurely {
             
             # Check for timeout
             if ($elapsed.TotalMinutes -gt $timeoutMinutes) {
-                Write-Host "⏰ Installation timeout reached ($timeoutMinutes minutes)" -ForegroundColor Red
+                Write-Host "[TIME] Installation timeout reached ($timeoutMinutes minutes)" -ForegroundColor Red
                 Stop-Job $installJob -Force
                 Remove-Job $installJob -Force
                 $result.Errors += "Installation timed out after $timeoutMinutes minutes"
@@ -7171,22 +7203,22 @@ function Install-WindowsUpdatesSecurely {
         $endTime = Get-Date
         $totalTime = $endTime - $startTime
         
-        Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor Cyan
-        Write-Host "✅ Installation process completed in $([math]::Round($totalTime.TotalMinutes, 1)) minutes" -ForegroundColor Green
+        Write-Host "------------------------------------------------------------------------------------------------------" -ForegroundColor Cyan
+        Write-Host "[OK] Installation process completed in $([math]::Round($totalTime.TotalMinutes, 1)) minutes" -ForegroundColor Green
         
         if ($installJob.State -eq 'Completed') {
             try {
                 $installationResults = Receive-Job $installJob -ErrorAction Stop
-                Write-StatusLog "📋 Processing installation results..." -Level "Info"
+                Write-StatusLog "[REPORT] Processing installation results..." -Level "Info"
             }
             catch {
                 $result.Errors += "Failed to receive job results: $($_.Exception.Message)"
-                Write-StatusLog "❌ Failed to get installation results: $($_.Exception.Message)" -Level "Error"
+                Write-StatusLog "[ERROR] Failed to get installation results: $($_.Exception.Message)" -Level "Error"
                 return $result
             }
         } else {
             $result.Errors += "Installation job failed with state: $($installJob.State)"
-            Write-StatusLog "❌ Installation job failed with state: $($installJob.State)" -Level "Error"
+            Write-StatusLog "[ERROR] Installation job failed with state: $($installJob.State)" -Level "Error"
             
             # Try to get any error output
             try {
@@ -7207,7 +7239,7 @@ function Install-WindowsUpdatesSecurely {
         
         # Process results with safe property access
         if ($installationResults) {
-            Write-Host "📊 Processing $($installationResults.Count) installation results..." -ForegroundColor Cyan
+            Write-Host "[SUMMARY] Processing $($installationResults.Count) installation results..." -ForegroundColor Cyan
             
             $processedCount = 0
             foreach ($updateResult in $installationResults) {
@@ -7251,36 +7283,36 @@ function Install-WindowsUpdatesSecurely {
                             $result.RebootRequired = $true
                         }
                         
-                        Write-StatusLog "✅ Installed: $title" -Level "Success"
+                        Write-StatusLog "[OK] Installed: $title" -Level "Success"
                     } else {
                         $result.Failed += $processedResult
-                        Write-StatusLog "❌ Failed: $title - $status" -Level "Error"
+                        Write-StatusLog "[ERROR] Failed: $title - $status" -Level "Error"
                     }
                 }
                 catch {
                     $result.Errors += "Error processing update result: $($_.Exception.Message)"
-                    Write-StatusLog "⚠ Error processing update result: $($_.Exception.Message)" -Level "Warning"
+                    Write-StatusLog "[WARN] Error processing update result: $($_.Exception.Message)" -Level "Warning"
                 }
             }
             
             Write-Progress -Activity "Processing Results" -Completed
             
         } else {
-            Write-StatusLog "⚠ No installation results returned" -Level "Warning"
+            Write-StatusLog "[WARN] No installation results returned" -Level "Warning"
             $result.Errors += "No installation results returned from Install-WindowsUpdate"
         }
         
         # Final status summary
-        Write-Host "`n📋 INSTALLATION SUMMARY:" -ForegroundColor Cyan
-        Write-Host "   ✅ Successfully installed: $($result.Installed.Count)" -ForegroundColor Green
-        Write-Host "   ❌ Failed installations: $($result.Failed.Count)" -ForegroundColor Red
-        Write-Host "   🔐 Security updates: $($result.SecurityUpdates.Count)" -ForegroundColor Yellow
-        Write-Host "   🔄 Reboot required: $(if($result.RebootRequired){'Yes'}else{'No'})" -ForegroundColor $(if($result.RebootRequired){'Yellow'}else{'Green'})
-        Write-Host "   ⏱️ Total time: $([math]::Round($totalTime.TotalMinutes, 1)) minutes" -ForegroundColor White
+        Write-Host "`n[REPORT] INSTALLATION SUMMARY:" -ForegroundColor Cyan
+        Write-Host "   [OK] Successfully installed: $($result.Installed.Count)" -ForegroundColor Green
+        Write-Host "   [ERROR] Failed installations: $($result.Failed.Count)" -ForegroundColor Red
+        Write-Host "   [LOCK] Security updates: $($result.SecurityUpdates.Count)" -ForegroundColor Yellow
+        Write-Host "   [RESTART] Reboot required: $(if($result.RebootRequired){'Yes'}else{'No'})" -ForegroundColor $(if($result.RebootRequired){'Yellow'}else{'Green'})
+        Write-Host "   [TIMER] Total time: $([math]::Round($totalTime.TotalMinutes, 1)) minutes" -ForegroundColor White
         
     } catch {
         $result.Errors += "Windows update installation failed: $($_.Exception.Message)"
-        Write-StatusLog "❌ Update installation failed: $($_.Exception.Message)" -Level "Error"
+        Write-StatusLog "[ERROR] Update installation failed: $($_.Exception.Message)" -Level "Error"
     }
     
     return $result
@@ -7345,15 +7377,15 @@ function Test-PostUpdateSystemHealth {
                 }
             }
         } catch {
-            Write-StatusLog "⚠ Could not check event log for errors: $($_.Exception.Message)" -Level "Warning"
+            Write-StatusLog "[WARN] Could not check event log for errors: $($_.Exception.Message)" -Level "Warning"
         }
         
         $result.SystemStable = $result.ServicesRunning -and ($result.EventLogErrors.Count -eq 0)
         
         if ($result.SystemStable) {
-            Write-StatusLog "✅ Post-update system health validation passed" -Level "Success"
+            Write-StatusLog "[OK] Post-update system health validation passed" -Level "Success"
         } else {
-            Write-StatusLog "⚠ Post-update system health validation found issues" -Level "Warning"
+            Write-StatusLog "[WARN] Post-update system health validation found issues" -Level "Warning"
         }
         
     } catch {
@@ -7387,15 +7419,15 @@ function Show-WindowsUpdateSummary {
     # Safe property access with null checks
     Write-Host "Prerequisites Ready: " -NoNewline
     $prereqReady = if ($Results.ContainsKey('PrerequisitesReady')) { $Results.PrerequisitesReady } else { $false }
-    Write-Host $(if($prereqReady){"✅ Yes"}else{"❌ No"}) -ForegroundColor $(if($prereqReady){"Green"}else{"Red"})
+    Write-Host $(if($prereqReady){"[OK] Yes"}else{"[ERROR] No"}) -ForegroundColor $(if($prereqReady){"Green"}else{"Red"})
     
     Write-Host "Group Policy Reset: " -NoNewline
     $gpReset = if ($Results.ContainsKey('GroupPolicyReset')) { $Results.GroupPolicyReset } else { $false }
-    Write-Host $(if($gpReset){"✅ Yes"}else{"⚠ Skipped/Failed"}) -ForegroundColor $(if($gpReset){"Green"}else{"Yellow"})
+    Write-Host $(if($gpReset){"[OK] Yes"}else{"[WARN] Skipped/Failed"}) -ForegroundColor $(if($gpReset){"Green"}else{"Yellow"})
     
     Write-Host "Components Reset: " -NoNewline
     $compReset = if ($Results.ContainsKey('ComponentsReset')) { $Results.ComponentsReset } else { $false }
-    Write-Host $(if($compReset){"✅ Yes"}else{"⚠ Skipped/Failed"}) -ForegroundColor $(if($compReset){"Green"}else{"Yellow"})
+    Write-Host $(if($compReset){"[OK] Yes"}else{"[WARN] Skipped/Failed"}) -ForegroundColor $(if($compReset){"Green"}else{"Yellow"})
     
     Write-Host "Available Updates: " -NoNewline
     $availableCount = if ($Results.ContainsKey('AvailableUpdates') -and $Results.AvailableUpdates) { $Results.AvailableUpdates.Count } else { 0 }
@@ -7415,12 +7447,12 @@ function Show-WindowsUpdateSummary {
     
     if ($Results.ContainsKey('RestorePointCreated') -and $Results.RestorePointCreated) {
         Write-Host "Restore Point Created: " -NoNewline
-        Write-Host "✅ Yes" -ForegroundColor Green
+        Write-Host "[OK] Yes" -ForegroundColor Green
     }
     
     Write-Host "Reboot Required: " -NoNewline
     $rebootRequired = if ($Results.ContainsKey('RebootRequired')) { $Results.RebootRequired } else { $false }
-    Write-Host $(if($rebootRequired){"⚠ Yes"}else{"✅ No"}) -ForegroundColor $(if($rebootRequired){"Yellow"}else{"Green"})
+    Write-Host $(if($rebootRequired){"[WARN] Yes"}else{"[OK] No"}) -ForegroundColor $(if($rebootRequired){"Yellow"}else{"Green"})
     
     Write-Host "Total Duration: " -NoNewline
     $duration = if ($Results.ContainsKey('UpdateDuration') -and $Results.UpdateDuration) { 
@@ -7434,7 +7466,7 @@ function Show-WindowsUpdateSummary {
     if ($Results.ContainsKey('SystemValidation') -and $Results.SystemValidation -and $Results.SystemValidation.ContainsKey('SystemStable')) {
         Write-Host "System Health: " -NoNewline
         $systemStable = $Results.SystemValidation.SystemStable
-        Write-Host $(if($systemStable){"✅ Stable"}else{"⚠ Issues Detected"}) -ForegroundColor $(if($systemStable){"Green"}else{"Yellow"})
+        Write-Host $(if($systemStable){"[OK] Stable"}else{"[WARN] Issues Detected"}) -ForegroundColor $(if($systemStable){"Green"}else{"Yellow"})
         
         if ($Results.SystemValidation.ContainsKey('DiskSpaceAfter')) {
             Write-Host "Disk Space After: " -NoNewline
@@ -7446,10 +7478,10 @@ function Show-WindowsUpdateSummary {
     if ($Results.ContainsKey('InstalledUpdates') -and $Results.InstalledUpdates -and $Results.InstalledUpdates.Count -gt 0) {
         Write-Host "`nSuccessfully Installed Updates:" -ForegroundColor Green
         $Results.InstalledUpdates | ForEach-Object {
-            $securityIcon = if ($_.IsSecurity) { "🔐" } else { "📦" }
-            $rebootIcon = if ($_.RebootRequired) { "🔄" } else { "" }
+            $securityIcon = if ($_.IsSecurity) { "[LOCK]" } else { "[PKG]" }
+            $rebootIcon = if ($_.RebootRequired) { "[RESTART]" } else { "" }
             $sizeText = if ($_.Size) { " ($([math]::Round($_.Size / 1MB, 1)) MB)" } else { "" }
-            Write-Host "  ✅ $securityIcon $($_.Title) ($($_.KB))$sizeText $rebootIcon" -ForegroundColor Green
+            Write-Host "  [OK] $securityIcon $($_.Title) ($($_.KB))$sizeText $rebootIcon" -ForegroundColor Green
         }
     }
     
@@ -7457,7 +7489,7 @@ function Show-WindowsUpdateSummary {
     if ($Results.ContainsKey('FailedUpdates') -and $Results.FailedUpdates -and $Results.FailedUpdates.Count -gt 0) {
         Write-Host "`nFailed Update Installations:" -ForegroundColor Red
         $Results.FailedUpdates | ForEach-Object {
-            Write-Host "  ❌ $($_.Title) ($($_.KB)): $($_.Status)" -ForegroundColor Red
+            Write-Host "  [ERROR] $($_.Title) ($($_.KB)): $($_.Status)" -ForegroundColor Red
         }
     }
     
@@ -7470,13 +7502,13 @@ function Show-WindowsUpdateSummary {
         
         Write-Host "`nRecent System Errors:" -ForegroundColor Yellow
         $Results.SystemValidation.EventLogErrors | ForEach-Object {
-            Write-Host "  ⚠ [$($_.TimeCreated.ToString('HH:mm:ss'))] Event $($_.Id): $($_.Message)" -ForegroundColor Yellow
+            Write-Host "  [WARN] [$($_.TimeCreated.ToString('HH:mm:ss'))] Event $($_.Id): $($_.Message)" -ForegroundColor Yellow
         }
     }
     
     # Show restart recommendation
     if ($rebootRequired) {
-        Write-Host "`n🔄 IMPORTANT: System restart required to complete update installation" -ForegroundColor Yellow
+        Write-Host "`n[RESTART] IMPORTANT: System restart required to complete update installation" -ForegroundColor Yellow
         Write-Host "   Some updates may not be fully functional until restart is performed." -ForegroundColor Yellow
     }
     
@@ -7484,7 +7516,7 @@ function Show-WindowsUpdateSummary {
     if ($Results.ContainsKey('Errors') -and $Results.Errors -and $Results.Errors.Count -gt 0) {
         Write-Host "`nIssues Encountered:" -ForegroundColor Red
         $Results.Errors | ForEach-Object {
-            Write-Host "  • $_" -ForegroundColor Red
+            Write-Host "  - $_" -ForegroundColor Red
         }
     }
     
@@ -7492,9 +7524,9 @@ function Show-WindowsUpdateSummary {
 }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Option 12 - Disk Cleanup
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 function Run-DiskCleanup {
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -7627,7 +7659,7 @@ function Remove-FolderContents {
     }
     
     try {
-        Write-LogEntry "      📂 Analyzing $Description..." 'PROGRESS' -NoNewline
+        Write-LogEntry "      [DIR] Analyzing $Description..." 'PROGRESS' -NoNewline
         
         # Speed: Get size before deletion with better error handling
         [int64]$sizeBefore = 0
@@ -7673,18 +7705,18 @@ function Remove-FolderContents {
         }
         
         if ($PSCmdlet.ShouldProcess($Path, "Clean folder contents")) {
-            Write-LogEntry "      🗑️  Cleaning $Description..." 'PROGRESS'
+            Write-LogEntry "      [REMOVE]  Cleaning $Description..." 'PROGRESS'
             
             if ($ContentsOnly) {
                 # Speed: Check PowerShell version for parallel support
                 if ($PSVersionTable.PSVersion.Major -ge 7) {
                     # PowerShell 7+ with parallel processing (simplified progress)
-                    Write-LogEntry "      🗑️  Processing $itemCount items in parallel..." 'PROGRESS'
+                    Write-LogEntry "      [REMOVE]  Processing $itemCount items in parallel..." 'PROGRESS'
                     Get-ChildItem -Path $Path -Force -ErrorAction Stop | 
                         ForEach-Object -Parallel {
                             Remove-Item -Path $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
                         } -ThrottleLimit 5 -ErrorAction SilentlyContinue
-                    Write-LogEntry "      ✅ Parallel cleanup completed" 'PROGRESS'
+                    Write-LogEntry "      [OK] Parallel cleanup completed" 'PROGRESS'
                 } else {
                     # Windows PowerShell 5.1 compatible method with progress
                     $items = Get-ChildItem -Path $Path -Force -ErrorAction Stop
@@ -7714,7 +7746,7 @@ function Remove-FolderContents {
                     }
                 }
             } else {
-                Write-LogEntry "      🗑️  Removing entire folder..." 'PROGRESS'
+                Write-LogEntry "      [REMOVE]  Removing entire folder..." 'PROGRESS'
                 Remove-Item -Path $Path -Recurse -Force -ErrorAction Stop
             }
             
@@ -7764,7 +7796,7 @@ function Remove-FolderContents {
                 throw "Windows Disk Cleanup utility not found"
             }
             
-            Write-LogEntry "      🔄 Starting Windows Disk Cleanup (timeout: ${TimeoutSec}s)..." 'PROGRESS'
+            Write-LogEntry "      [RESTART] Starting Windows Disk Cleanup (timeout: ${TimeoutSec}s)..." 'PROGRESS'
             
             # Speed: Use job for timeout control
             $job = Start-Job -ScriptBlock {
@@ -7782,7 +7814,7 @@ function Remove-FolderContents {
                 # Show progress every 10 seconds
                 if ($elapsed % 10 -eq 0) {
                     $remainingTime = $TimeoutSec - $elapsed
-                    Write-LogEntry "      ⏳ Cleanup in progress... (${elapsed}s elapsed, ${remainingTime}s remaining)" 'PROGRESS'
+                    Write-LogEntry "      [PENDING] Cleanup in progress... (${elapsed}s elapsed, ${remainingTime}s remaining)" 'PROGRESS'
                 }
             }
             
@@ -7790,7 +7822,7 @@ function Remove-FolderContents {
             
             if ($null -eq $result -or $job.State -eq 'Running') {
                 Stop-Job -Job $job -Force
-                Write-LogEntry "      ⚠️  Cleanup timed out, stopping process..." 'PROGRESS'
+                Write-LogEntry "      [WARN]  Cleanup timed out, stopping process..." 'PROGRESS'
                 throw "Disk Cleanup timed out after $TimeoutSec seconds"
             }
             
@@ -7805,7 +7837,7 @@ function Remove-FolderContents {
     }
 
     try {
-        Write-LogEntry "`n🧹 Starting Disk Cleanup Operations..." 'OPERATION'
+        Write-LogEntry "`n[CLEAN] Starting Disk Cleanup Operations..." 'OPERATION'
         
         # Get initial disk space
         $initialSpace = Get-DiskSpaceInfo "C:\"
@@ -7815,19 +7847,19 @@ function Remove-FolderContents {
 
         # Phase 1: Windows System Cleanup
         if (-not $SkipSystemCleanup) {
-            Write-LogEntry "`n🗑️ Running Windows Disk Cleanup..." 'OPERATION'
+            Write-LogEntry "`n[REMOVE] Running Windows Disk Cleanup..." 'OPERATION'
             
             $cleanupResult = Invoke-WindowsCleanup -TimeoutSec $TimeoutSeconds
             if ($cleanupResult.Success) {
-                Write-LogEntry "✔ Windows Disk Cleanup completed successfully" 'SUCCESS'
+                Write-LogEntry "[OK] Windows Disk Cleanup completed successfully" 'SUCCESS'
             } else {
-                Write-LogEntry "⚠ Windows Disk Cleanup failed: $($cleanupResult.Error)" 'WARNING'
+                Write-LogEntry "[WARN] Windows Disk Cleanup failed: $($cleanupResult.Error)" 'WARNING'
             }
         }
 
         # Phase 2: Manual Temp Folder Cleanup
         if (-not $SkipTempFolders) {
-            Write-LogEntry "`n🧽 Cleaning temporary folders..." 'OPERATION'
+            Write-LogEntry "`n[WIPE] Cleaning temporary folders..." 'OPERATION'
             
             # Speed: Define cleanup targets with priorities
             $cleanupTargets = @(
@@ -7858,7 +7890,7 @@ function Remove-FolderContents {
                         } else { 
                             "$([math]::Round($result.SpaceFreed / 1MB, 1)) MB" 
                         }
-                        Write-LogEntry "   ✔ Cleaned $($target.Description): $sizeText freed" 'SUCCESS'
+                        Write-LogEntry "   [OK] Cleaned $($target.Description): $sizeText freed" 'SUCCESS'
                         
                         if ($null -eq $script:cleanedPaths) {
                             $script:cleanedPaths = New-Object System.Collections.ArrayList
@@ -7869,10 +7901,10 @@ function Remove-FolderContents {
                             SpaceFreed = $result.SpaceFreed
                         })
                     } else {
-                        Write-LogEntry "   ⏭ $($target.Description): $($result.Message)" 'INFO'
+                        Write-LogEntry "   [SKIP] $($target.Description): $($result.Message)" 'INFO'
                     }
                 } else {
-                    Write-LogEntry "   ⚠ Failed to clean $($target.Description): $($result.Message)" 'WARNING'
+                    Write-LogEntry "   [WARN] Failed to clean $($target.Description): $($result.Message)" 'WARNING'
                     
                     if ($null -eq $script:failedPaths) {
                         $script:failedPaths = New-Object System.Collections.ArrayList
@@ -7888,18 +7920,18 @@ function Remove-FolderContents {
 
         # Phase 3: SSD Trim Optimization
         if (-not $SkipSSDTrim) {
-            Write-LogEntry "`n💾 Performing SSD optimization..." 'OPERATION'
+            Write-LogEntry "`n[SAVE] Performing SSD optimization..." 'OPERATION'
             
             try {
                 $sysDriveLetter = Get-SystemDrive
                 
-                Write-LogEntry "      🔍 Checking drive $sysDriveLetter..." 'PROGRESS'
+                Write-LogEntry "      [SCAN] Checking drive $sysDriveLetter..." 'PROGRESS'
                 
                 # Security: Verify drive exists and is ready
                 $drive = Get-Volume -DriveLetter $sysDriveLetter -ErrorAction Stop
                 
                 if ($PSCmdlet.ShouldProcess("Drive $sysDriveLetter", "Perform SSD Trim")) {
-                    Write-LogEntry "      ⚡ Starting TRIM operation on drive $sysDriveLetter..." 'PROGRESS'
+                    Write-LogEntry "      [FAST] Starting TRIM operation on drive $sysDriveLetter..." 'PROGRESS'
                     
                     # Speed: Run trim operation with progress monitoring
                     $trimJob = Start-Job -ScriptBlock {
@@ -7915,7 +7947,7 @@ function Remove-FolderContents {
                         $elapsed += 5
                         
                         if ($elapsed % 15 -eq 0) {
-                            Write-LogEntry "      ⏳ TRIM in progress... (${elapsed}s elapsed)" 'PROGRESS'
+                            Write-LogEntry "      [PENDING] TRIM in progress... (${elapsed}s elapsed)" 'PROGRESS'
                         }
                     }
                     
@@ -7923,16 +7955,16 @@ function Remove-FolderContents {
                     
                     if ($null -ne $trimResult) {
                         Remove-Job -Job $trimJob -Force
-                        Write-LogEntry "   ✔ SSD Trim completed successfully on drive $sysDriveLetter" 'SUCCESS'
+                        Write-LogEntry "   [OK] SSD Trim completed successfully on drive $sysDriveLetter" 'SUCCESS'
                     } else {
                         Stop-Job -Job $trimJob -Force
                         Remove-Job -Job $trimJob -Force
-                        Write-LogEntry "   ⚠ SSD Trim timed out on drive $sysDriveLetter" 'WARNING'
+                        Write-LogEntry "   [WARN] SSD Trim timed out on drive $sysDriveLetter" 'WARNING'
                     }
                 }
                 
             } catch {
-                Write-LogEntry "   ⚠ SSD Trim failed: $_" 'WARNING'
+                Write-LogEntry "   [WARN] SSD Trim failed: $_" 'WARNING'
             }
         }
 
@@ -7946,13 +7978,13 @@ function Remove-FolderContents {
                 } else { 
                     "$([math]::Round($actualSpaceFreed / 1MB, 1)) MB" 
                 }
-                Write-LogEntry "💾 Total disk space recovered: $savedText" 'SUCCESS'
+                Write-LogEntry "[SAVE] Total disk space recovered: $savedText" 'SUCCESS'
             }
         }
 
     } catch {
         Write-LogEntry "Critical error during disk cleanup: $_" 'ERROR'
-        $global:LastStatus = "❌ Disk cleanup failed: $_"
+        $global:LastStatus = "[ERROR] Disk cleanup failed: $_"
         throw
     } finally {
         $stopwatch.Stop()
@@ -7962,7 +7994,7 @@ function Remove-FolderContents {
         $cleanedCount = if ($null -ne $script:cleanedPaths) { $script:cleanedPaths.Count } else { 0 }
         $failedCount = if ($null -ne $script:failedPaths) { $script:failedPaths.Count } else { 0 }
         
-        Write-LogEntry "`n📊 Disk Cleanup Summary:" 'INFO'
+        Write-LogEntry "`n[SUMMARY] Disk Cleanup Summary:" 'INFO'
         Write-LogEntry "Duration: $([math]::Round($duration, 2)) seconds" 'INFO'
         Write-LogEntry "Locations cleaned: $cleanedCount" 'SUCCESS'
         Write-LogEntry "Failed operations: $failedCount" 'ERROR'
@@ -7978,9 +8010,9 @@ function Remove-FolderContents {
         
         # Show failed operations if any
         if ($failedCount -gt 0 -and $null -ne $script:failedPaths) {
-            Write-LogEntry "`n❌ Failed Operations:" 'ERROR'
+            Write-LogEntry "`n[ERROR] Failed Operations:" 'ERROR'
             foreach ($failed in $script:failedPaths) {
-                Write-LogEntry "  • $($failed.Description): $($failed.Error)" 'ERROR'
+                Write-LogEntry "  - $($failed.Description): $($failed.Error)" 'ERROR'
             }
         }
         
@@ -7988,15 +8020,15 @@ function Remove-FolderContents {
         try {
             if ($null -ne $script:logEntries) {
                 $script:logEntries.ToArray() | Out-File -FilePath $LogPath -Encoding UTF8 -Force
-                Write-LogEntry "📝 Detailed log saved to: $LogPath" 'INFO'
+                Write-LogEntry "[NOTE] Detailed log saved to: $LogPath" 'INFO'
             }
         } catch {
-            Write-LogEntry "⚠ Failed to save log file: $_" 'WARNING'
+            Write-LogEntry "[WARN] Failed to save log file: $_" 'WARNING'
         }
         
         # Set global status
         if ($cleanedCount -gt 0) {
-            $statusMsg = "✅ Disk cleanup completed - $cleanedCount locations processed"
+            $statusMsg = "[OK] Disk cleanup completed - $cleanedCount locations processed"
             if ($failedCount -gt 0) {
                 $statusMsg += " ($failedCount failed)"
             }
@@ -8010,7 +8042,7 @@ function Remove-FolderContents {
             }
             $global:LastStatus = $statusMsg
         } else {
-            $global:LastStatus = "⚠ Disk cleanup completed but no locations were processed"
+            $global:LastStatus = "[WARN] Disk cleanup completed but no locations were processed"
         }
         
         Write-LogEntry "=== Disk Cleanup Operations Completed ===" 'INFO'
@@ -8018,9 +8050,9 @@ function Remove-FolderContents {
 }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Option 13 - System Repair
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 function Invoke-SystemMaintenance {
     [CmdletBinding()]
     param (
@@ -8048,7 +8080,7 @@ function Invoke-SystemMaintenance {
         if (-not (Test-Path $LogArchivePath)) {
             try {
                 New-Item -Path $LogArchivePath -ItemType Directory -Force | Out-Null
-                Write-Host "✓ Created log archive: $LogArchivePath" -ForegroundColor Green
+                Write-Host "[OK] Created log archive: $LogArchivePath" -ForegroundColor Green
             } catch {
                 throw "Cannot create log archive directory: $_"
             }
@@ -8073,7 +8105,7 @@ function Invoke-SystemMaintenance {
         )
     }
 
-    Write-Host "🔧 Starting optimized system maintenance..." -ForegroundColor Cyan
+    Write-Host "[TOOLS] Starting optimized system maintenance..." -ForegroundColor Cyan
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
     try {
@@ -8085,35 +8117,35 @@ function Invoke-SystemMaintenance {
                     Repair-Volume -DriveLetter $drive -Scan -ErrorAction SilentlyContinue
                     Repair-Volume -DriveLetter $drive -OfflineScanAndFix -ErrorAction SilentlyContinue
                 }
-                return "✓ Filesystem repair completed"
+                return "[OK] Filesystem repair completed"
             } catch {
-                return "⚠ Filesystem repair failed: $_"
+                return "[WARN] Filesystem repair failed: $_"
             }
         } -ArgumentList $sysDriveLetter
 
-        Write-Host "▶ Component store maintenance..." -ForegroundColor Yellow
+        Write-Host "[RUN] Component store maintenance..." -ForegroundColor Yellow
         # Speed: Run critical DISM operations only, suppress output and input
         $dismJobs = @()
         $dismJobs += Start-Job -ScriptBlock { 
             $null = DISM.exe /Online /Cleanup-Image /RestoreHealth /Quiet /NoRestart 2>&1
-            return "✓ Component store restore completed"
+            return "[OK] Component store restore completed"
         }
         $dismJobs += Start-Job -ScriptBlock { 
             $null = DISM.exe /Online /Cleanup-Image /StartComponentCleanup /ResetBase /Quiet /NoRestart 2>&1
-            return "✓ Component cleanup completed"
+            return "[OK] Component cleanup completed"
         }
 
-        Write-Host "▶ Network stack reset..." -ForegroundColor Yellow
+        Write-Host "[RUN] Network stack reset..." -ForegroundColor Yellow
         # Speed: Combine network operations
         $networkJob = Start-Job -ScriptBlock {
             netsh winsock reset | Out-Null
             netsh int ip reset | Out-Null  
             ipconfig /flushdns | Out-Null
             Clear-DnsClientCache
-            return "✓ Network stack reset"
+            return "[OK] Network stack reset"
         }
 
-        Write-Host "▶ Cleaning temporary files..." -ForegroundColor Yellow
+        Write-Host "[RUN] Cleaning temporary files..." -ForegroundColor Yellow
         # Speed: Parallel cleanup using runspaces
         $cleanupJobs = @()
         
@@ -8125,9 +8157,9 @@ function Invoke-SystemMaintenance {
                 if (Test-Path $path) {
                     try {
                         Remove-Item -Path $path -Recurse -Force -ErrorAction Stop
-                        $results += "✓ Deleted: $path"
+                        $results += "[OK] Deleted: $path"
                     } catch {
-                        $results += "⚠ Failed: $path"
+                        $results += "[WARN] Failed: $path"
                     }
                 }
             }
@@ -8143,9 +8175,9 @@ function Invoke-SystemMaintenance {
             if (Test-Path $winTemp) {
                 try {
                     Get-ChildItem -Path $winTemp -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-                    $results += "✓ Cleared Windows Temp"
+                    $results += "[OK] Cleared Windows Temp"
                 } catch {
-                    $results += "⚠ Windows Temp cleanup failed"
+                    $results += "[WARN] Windows Temp cleanup failed"
                 }
             }
             
@@ -8155,16 +8187,16 @@ function Invoke-SystemMaintenance {
                     try {
                         Get-ChildItem -Path $folder -Force -ErrorAction SilentlyContinue | 
                             Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-                        $results += "✓ Cleaned: $folder"
+                        $results += "[OK] Cleaned: $folder"
                     } catch {
-                        $results += "⚠ Failed: $folder"
+                        $results += "[WARN] Failed: $folder"
                     }
                 }
             }
             return $results
         } -ArgumentList $tempPaths.WindowsTemp, $tempPaths.Additional
 
-        Write-Host "▶ Security hardening..." -ForegroundColor Yellow
+        Write-Host "[RUN] Security hardening..." -ForegroundColor Yellow
         # Security: Enhanced security operations
         $securityJob = Start-Job -ScriptBlock {
             $results = @()
@@ -8172,9 +8204,9 @@ function Invoke-SystemMaintenance {
             # Reset firewall to secure defaults
             try {
                 netsh advfirewall reset | Out-Null
-                $results += "✓ Firewall reset to secure defaults"
+                $results += "[OK] Firewall reset to secure defaults"
             } catch {
-                $results += "⚠ Firewall reset failed"
+                $results += "[WARN] Firewall reset failed"
             }
             
             # Enable Windows Defender
@@ -8182,15 +8214,15 @@ function Invoke-SystemMaintenance {
                 Set-MpPreference -DisableRealtimeMonitoring $false -ErrorAction Stop
                 Set-MpPreference -DisableScriptScanning $false -ErrorAction SilentlyContinue
                 Set-MpPreference -DisableBehaviorMonitoring $false -ErrorAction SilentlyContinue
-                $results += "✓ Windows Defender enhanced"
+                $results += "[OK] Windows Defender enhanced"
             } catch {
-                $results += "⚠ Defender configuration failed"
+                $results += "[WARN] Defender configuration failed"
             }
             
             return $results
         }
 
-        Write-Host "▶ System optimization..." -ForegroundColor Yellow
+        Write-Host "[RUN] System optimization..." -ForegroundColor Yellow
         # Speed: SSD optimization
         $optimizationJob = Start-Job -ScriptBlock {
             param($drive)
@@ -8199,9 +8231,9 @@ function Invoke-SystemMaintenance {
             # SSD Trim
             try {
                 Optimize-Volume -DriveLetter $drive -ReTrim -ErrorAction Stop
-                $results += "✓ SSD Trim completed"
+                $results += "[OK] SSD Trim completed"
             } catch {
-                $results += "⚠ SSD Trim failed"
+                $results += "[WARN] SSD Trim failed"
             }
             
             # Icon cache rebuild
@@ -8211,16 +8243,16 @@ function Invoke-SystemMaintenance {
                 Remove-Item "$env:LOCALAPPDATA\IconCache.db" -Force -ErrorAction SilentlyContinue
                 Remove-Item "$env:LOCALAPPDATA\Microsoft\Windows\Explorer\iconcache*" -Recurse -Force -Confirm:$false -ErrorAction SilentlyContinue
                 Start-Process explorer
-                $results += "✓ Icon cache rebuilt"
+                $results += "[OK] Icon cache rebuilt"
             } catch {
-                $results += "⚠ Icon cache rebuild failed"
+                $results += "[WARN] Icon cache rebuild failed"
             }
             
             return $results
         } -ArgumentList $sysDriveLetter
 
         # Security: Safe bloatware removal with whitelist approach
-        Write-Host "▶ Removing unnecessary apps..." -ForegroundColor Yellow
+        Write-Host "[RUN] Removing unnecessary apps..." -ForegroundColor Yellow
         $appRemovalJob = Start-Job -ScriptBlock {
             $results = @()
             # Security: Only remove specific known bloatware
@@ -8236,20 +8268,20 @@ function Invoke-SystemMaintenance {
                     ForEach-Object {
                         try {
                             Remove-AppxProvisionedPackage -Online -PackageName $_.PackageName -ErrorAction Stop
-                            $results += "✓ Removed: $($_.DisplayName)"
+                            $results += "[OK] Removed: $($_.DisplayName)"
                         } catch {
-                            $results += "⚠ Failed to remove: $($_.DisplayName)"
+                            $results += "[WARN] Failed to remove: $($_.DisplayName)"
                         }
                     }
                 }
             } catch {
-                $results += "⚠ App removal enumeration failed"
+                $results += "[WARN] App removal enumeration failed"
             }
             return $results
         }
 
         # Wait for all jobs with timeout and real-time progress reporting
-        Write-Host "⏳ Monitoring operations in real-time..." -ForegroundColor Yellow
+        Write-Host "[PENDING] Monitoring operations in real-time..." -ForegroundColor Yellow
         $allJobs = @($fsRepairJob, $networkJob, $securityJob, $optimizationJob, $appRemovalJob) + $dismJobs + $cleanupJobs
         
         # Create job tracking with descriptive names
@@ -8284,9 +8316,9 @@ function Invoke-SystemMaintenance {
         $completedJobs = @()
         $lastUpdate = Get-Date
         
-        Write-Host "`n  📋 Active Operations:" -ForegroundColor Cyan
+        Write-Host "`n  [REPORT] Active Operations:" -ForegroundColor Cyan
         $jobTracker.Values | ForEach-Object { 
-            Write-Host "    • $($_.Name) - Started" -ForegroundColor Gray 
+            Write-Host "    - $($_.Name) - Started" -ForegroundColor Gray 
         }
         Write-Host ""
         
@@ -8303,28 +8335,28 @@ function Invoke-SystemMaintenance {
                     
                     switch ($newState) {
                         'Completed' {
-                            Write-Host "    ✅ $($tracker.Name) completed ($($elapsed.ToString('F1'))s)" -ForegroundColor Green
+                            Write-Host "    [OK] $($tracker.Name) completed ($($elapsed.ToString('F1'))s)" -ForegroundColor Green
                             
                             # Show job results immediately
                             try {
                                 $result = Receive-Job $job
                                 if ($result) {
                                     $result | ForEach-Object { 
-                                        Write-Host "       └─ $_" -ForegroundColor DarkGray 
+                                        Write-Host "       `-- $_" -ForegroundColor DarkGray 
                                     }
                                 }
                             } catch {
-                                Write-Host "       └─ ⚠ Could not retrieve results" -ForegroundColor Yellow
+                                Write-Host "       `-- [WARN] Could not retrieve results" -ForegroundColor Yellow
                             }
                         }
                         'Failed' {
-                            Write-Host "    ❌ $($tracker.Name) failed ($($elapsed.ToString('F1'))s)" -ForegroundColor Red
+                            Write-Host "    [ERROR] $($tracker.Name) failed ($($elapsed.ToString('F1'))s)" -ForegroundColor Red
                         }
                         'Stopped' {
-                            Write-Host "    ⏹️ $($tracker.Name) stopped ($($elapsed.ToString('F1'))s)" -ForegroundColor Yellow
+                            Write-Host "    [STOP] $($tracker.Name) stopped ($($elapsed.ToString('F1'))s)" -ForegroundColor Yellow
                         }
                         'Blocked' {
-                            Write-Host "    ⏸️ $($tracker.Name) blocked - attempting to resume..." -ForegroundColor Yellow
+                            Write-Host "    [PAUSE] $($tracker.Name) blocked - attempting to resume..." -ForegroundColor Yellow
                             try {
                                 $null = Receive-Job $job -Keep
                             } catch {
@@ -8342,13 +8374,13 @@ function Invoke-SystemMaintenance {
                 $runningCount = ($allJobs | Where-Object { $_.State -eq 'Running' }).Count
                 if ($runningCount -gt 0) {
                     $elapsed = ($currentTime - $startTime).TotalMinutes
-                    Write-Host "    ⏳ $runningCount operations still running... ($($elapsed.ToString('F1')) min elapsed)" -ForegroundColor Cyan
+                    Write-Host "    [PENDING] $runningCount operations still running... ($($elapsed.ToString('F1')) min elapsed)" -ForegroundColor Cyan
                     
                     # Show which jobs are still running
                     $allJobs | Where-Object { $_.State -eq 'Running' } | ForEach-Object {
                         $tracker = $jobTracker[$_.Id]
                         $jobElapsed = ($currentTime - $tracker.StartTime).TotalSeconds
-                        Write-Host "       • $($tracker.Name) ($($jobElapsed.ToString('F0'))s)" -ForegroundColor DarkCyan
+                        Write-Host "       - $($tracker.Name) ($($jobElapsed.ToString('F0'))s)" -ForegroundColor DarkCyan
                     }
                 }
                 $lastUpdate = $currentTime
@@ -8360,7 +8392,7 @@ function Invoke-SystemMaintenance {
             # Check timeout
             $elapsed = ($currentTime - $startTime).TotalSeconds
             if ($elapsed -gt $timeoutSeconds) {
-                Write-Host "`n    ⚠ Timeout reached after $($timeoutSeconds/60) minutes, stopping remaining jobs..." -ForegroundColor Yellow
+                Write-Host "`n    [WARN] Timeout reached after $($timeoutSeconds/60) minutes, stopping remaining jobs..." -ForegroundColor Yellow
                 $runningJobs | Stop-Job
                 break
             }
@@ -8370,7 +8402,7 @@ function Invoke-SystemMaintenance {
             
         } while ($runningJobs.Count -gt 0)
         
-        Write-Host "`n📊 Final Results Summary:" -ForegroundColor Cyan
+        Write-Host "`n[SUMMARY] Final Results Summary:" -ForegroundColor Cyan
         
         # Clean up jobs and show final summary
         $successCount = 0
@@ -8383,25 +8415,25 @@ function Invoke-SystemMaintenance {
             switch ($job.State) {
                 'Completed' { 
                     $successCount++
-                    Write-Host "  ✅ $($tracker.Name) - Success ($($finalElapsed.ToString('F1'))s)" -ForegroundColor Green
+                    Write-Host "  [OK] $($tracker.Name) - Success ($($finalElapsed.ToString('F1'))s)" -ForegroundColor Green
                 }
                 'Failed' { 
                     $failedCount++
-                    Write-Host "  ❌ $($tracker.Name) - Failed ($($finalElapsed.ToString('F1'))s)" -ForegroundColor Red
+                    Write-Host "  [ERROR] $($tracker.Name) - Failed ($($finalElapsed.ToString('F1'))s)" -ForegroundColor Red
                 }
                 default { 
                     $failedCount++
-                    Write-Host "  ⚠️ $($tracker.Name) - $($job.State) ($($finalElapsed.ToString('F1'))s)" -ForegroundColor Yellow
+                    Write-Host "  [WARN] $($tracker.Name) - $($job.State) ($($finalElapsed.ToString('F1'))s)" -ForegroundColor Yellow
                 }
             }
             
             Remove-Job $job -Force
         }
         
-        Write-Host "`n📈 Operation Summary: $successCount successful, $failedCount failed/incomplete" -ForegroundColor $(if ($failedCount -eq 0) { 'Green' } else { 'Yellow' })
+        Write-Host "`n[STATS] Operation Summary: $successCount successful, $failedCount failed/incomplete" -ForegroundColor $(if ($failedCount -eq 0) { 'Green' } else { 'Yellow' })
 
         # Security: Audit system state
-        Write-Host "`n🔍 Security audit..." -ForegroundColor Yellow
+        Write-Host "`n[SCAN] Security audit..." -ForegroundColor Yellow
         $auditResults = @()
         
         # Check for suspicious scheduled tasks
@@ -8410,20 +8442,20 @@ function Invoke-SystemMaintenance {
                 $_.State -eq 'Unknown' -or 
                 ($_.TaskPath -notlike '\Microsoft\*' -and $_.Author -eq '') 
             } | ForEach-Object {
-                $auditResults += "⚠ Suspicious task: $($_.TaskName)"
+                $auditResults += "[WARN] Suspicious task: $($_.TaskName)"
             }
         } catch {
-            $auditResults += "⚠ Task audit failed"
+            $auditResults += "[WARN] Task audit failed"
         }
         
         if ($auditResults.Count -eq 0) {
-            Write-Host "  ✓ No security issues detected" -ForegroundColor Green
+            Write-Host "  [OK] No security issues detected" -ForegroundColor Green
         } else {
             $auditResults | ForEach-Object { Write-Host "  $_" -ForegroundColor Yellow }
         }
 
         # Speed: Smart event log clearing (keep critical logs)
-        Write-Host "`n🗂️ Clearing non-critical event logs..." -ForegroundColor Yellow
+        Write-Host "`n[FILES] Clearing non-critical event logs..." -ForegroundColor Yellow
         $criticalLogs = @('System', 'Application', 'Security')
         $clearedCount = 0
         
@@ -8437,10 +8469,10 @@ function Invoke-SystemMaintenance {
                 # Silently continue for logs that can't be cleared
             }
         }
-        Write-Host "  ✓ Cleared $clearedCount non-critical event logs" -ForegroundColor Green
+        Write-Host "  [OK] Cleared $clearedCount non-critical event logs" -ForegroundColor Green
 
         # Final system health check
-        Write-Host "`n🏥 System health verification..." -ForegroundColor Yellow
+        Write-Host "`n[HP] System health verification..." -ForegroundColor Yellow
         $healthCheck = Start-Job -ScriptBlock {
             # Verify critical services
             $criticalServices = @('Winmgmt', 'EventLog', 'RpcSs', 'DcomLaunch')
@@ -8449,12 +8481,12 @@ function Invoke-SystemMaintenance {
             foreach ($service in $criticalServices) {
                 $svc = Get-Service -Name $service -ErrorAction SilentlyContinue
                 if ($svc.Status -ne 'Running') {
-                    $serviceStatus += "⚠ Service $service is $($svc.Status)"
+                    $serviceStatus += "[WARN] Service $service is $($svc.Status)"
                 }
             }
             
             if ($serviceStatus.Count -eq 0) {
-                return "✓ All critical services running"
+                return "[OK] All critical services running"
             } else {
                 return $serviceStatus
             }
@@ -8469,10 +8501,10 @@ function Invoke-SystemMaintenance {
         throw
     } finally {
         $stopwatch.Stop()
-        Write-Host "`n⚡ Maintenance completed in $($stopwatch.Elapsed.TotalMinutes.ToString('F1')) minutes" -ForegroundColor Green
+        Write-Host "`n[FAST] Maintenance completed in $($stopwatch.Elapsed.TotalMinutes.ToString('F1')) minutes" -ForegroundColor Green
         
         if (-not $SkipReboot) {
-            Write-Host "`n🔄 System restart recommended for optimal performance." -ForegroundColor Yellow
+            Write-Host "`n[RESTART] System restart recommended for optimal performance." -ForegroundColor Yellow
             $restart = Read-Host "Restart now? (y/N)"
             if ($restart -eq 'y' -or $restart -eq 'Y') {
                 Restart-Computer -Force
@@ -8481,9 +8513,9 @@ function Invoke-SystemMaintenance {
     }
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Option 14 - Remove User Profiles
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 function Remove-UserProfilesClassroom {
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -8539,27 +8571,27 @@ function Remove-UserProfilesClassroom {
             Write-Host "CRITICAL WARNING - USER PROFILE DELETION" -ForegroundColor Red -BackgroundColor Black
             Write-Host "="*60 -ForegroundColor Red
             Write-Host "This operation will PERMANENTLY DELETE all user profiles except:" -ForegroundColor Yellow
-            $ExcludedProfiles | ForEach-Object { Write-Host "  ✓ $_" -ForegroundColor Green }
+            $ExcludedProfiles | ForEach-Object { Write-Host "  [OK] $_" -ForegroundColor Green }
             Write-Host "`nDeleted profiles CANNOT be recovered!" -ForegroundColor Red
             Write-Host "="*60 -ForegroundColor Red
 
             # Security: Double confirmation
-            $confirmation1 = Read-Host "`n❓ Type 'DELETE' to confirm profile deletion (case-sensitive)"
+            $confirmation1 = Read-Host "`n[?] Type 'DELETE' to confirm profile deletion (case-sensitive)"
             if ($confirmation1 -ne 'DELETE') {
                 Write-LogEntry "Operation cancelled - incorrect confirmation" 'WARNING'
-                $global:LastStatus = "⚠ User cancelled profile cleanup."
+                $global:LastStatus = "[WARN] User cancelled profile cleanup."
                 return
             }
 
-            $confirmation2 = Read-Host "❓ Final confirmation - Type 'YES' to proceed"
+            $confirmation2 = Read-Host "[?] Final confirmation - Type 'YES' to proceed"
             if ($confirmation2 -ne 'YES') {
                 Write-LogEntry "Operation cancelled by user" 'WARNING'
-                $global:LastStatus = "⚠ User cancelled profile cleanup."
+                $global:LastStatus = "[WARN] User cancelled profile cleanup."
                 return
             }
         }
 
-        Write-LogEntry "🔍 Scanning for user profiles..." 'INFO'
+        Write-LogEntry "[SCAN] Scanning for user profiles..." 'INFO'
 
         # Speed: Use faster WMI query with specific filters
         $cimSessionOptions = New-CimSessionOption -Protocol WSMan
@@ -8578,7 +8610,7 @@ AND NOT LocalPath LIKE 'C:\\Users\\All Users%'
         
         if (-not $AllUserProfiles) {
             Write-LogEntry "No user profiles found for deletion" 'INFO'
-            $global:LastStatus = "ℹ No user profiles found for deletion."
+            $global:LastStatus = "[INFO] No user profiles found for deletion."
             return
         }
 
@@ -8648,16 +8680,16 @@ AND NOT LocalPath LIKE 'C:\\Users\\All Users%'
             if ($activeUsers.Count -gt 0) {
                 Write-LogEntry "Active users found: $($activeUsers -join ', ')" 'WARNING'
             }
-            $global:LastStatus = "ℹ No profiles available for deletion."
+            $global:LastStatus = "[INFO] No profiles available for deletion."
             return
         }
 
         # Display deletion plan
-        Write-LogEntry "`n📋 Deletion Plan:" 'INFO'
+        Write-LogEntry "`n[REPORT] Deletion Plan:" 'INFO'
         $totalSize = 0
         foreach ($profileInfo in $validatedProfiles) {
             $sizeStr = if ($profileInfo.Size -gt 0) { " (~$([math]::Round($profileInfo.Size, 2)) MB)" } else { "" }
-            Write-LogEntry "  • $($profileInfo.Name)$sizeStr" 'INFO'
+            Write-LogEntry "  - $($profileInfo.Name)$sizeStr" 'INFO'
             $totalSize += $profileInfo.Size
         }
         Write-LogEntry "Total profiles to delete: $($validatedProfiles.Count)" 'INFO'
@@ -8665,12 +8697,12 @@ AND NOT LocalPath LIKE 'C:\\Users\\All Users%'
 
         if ($WhatIf) {
             Write-LogEntry "WhatIf mode - no profiles will be deleted" 'INFO'
-            $global:LastStatus = "ℹ WhatIf completed - $($validatedProfiles.Count) profiles would be deleted."
+            $global:LastStatus = "[INFO] WhatIf completed - $($validatedProfiles.Count) profiles would be deleted."
             return
         }
 
         # Speed: Parallel deletion using runspaces for large numbers of profiles
-        Write-LogEntry "`n🧹 Starting profile deletion..." 'INFO'
+        Write-LogEntry "`n[CLEAN] Starting profile deletion..." 'INFO'
         $deletedCount = 0
         $failedCount = 0
         $deletionResults = @()
@@ -8736,14 +8768,14 @@ AND NOT LocalPath LIKE 'C:\\Users\\All Users%'
                     $deletionResults += $result
                     
                     if ($result.Success) {
-                        Write-LogEntry "✔ Deleted profile: $($result.Name) ($($result.Duration)ms)" 'SUCCESS'
+                        Write-LogEntry "[OK] Deleted profile: $($result.Name) ($($result.Duration)ms)" 'SUCCESS'
                         $deletedCount++
                     } else {
-                        Write-LogEntry "✘ Failed to delete profile: $($result.Name) - $($result.Error)" 'ERROR'
+                        Write-LogEntry "[X] Failed to delete profile: $($result.Name) - $($result.Error)" 'ERROR'
                         $failedCount++
                     }
                 } catch {
-                    Write-LogEntry "✘ Job error for profile: $($job.ProfileName) - $_" 'ERROR'
+                    Write-LogEntry "[X] Job error for profile: $($job.ProfileName) - $_" 'ERROR'
                     $failedCount++
                 } finally {
                     $job.PowerShell.Dispose()
@@ -8776,7 +8808,7 @@ AND NOT LocalPath LIKE 'C:\\Users\\All Users%'
                     if (Wait-Job $deleteJob -Timeout $TimeoutSeconds) {
                         Receive-Job $deleteJob -ErrorAction Stop
                         Remove-Job $deleteJob
-                        Write-LogEntry "✔ Successfully deleted profile: $profileName" 'SUCCESS'
+                        Write-LogEntry "[OK] Successfully deleted profile: $profileName" 'SUCCESS'
                         $deletedCount++
                     } else {
                         Remove-Job $deleteJob -Force
@@ -8784,14 +8816,14 @@ AND NOT LocalPath LIKE 'C:\\Users\\All Users%'
                     }
                     
                 } catch {
-                    Write-LogEntry "✘ Failed to delete profile: $profileName - $_" 'ERROR'
+                    Write-LogEntry "[X] Failed to delete profile: $profileName - $_" 'ERROR'
                     $failedCount++
                 }
             }
         }
 
         # Cleanup verification
-        Write-LogEntry "`n🔍 Verifying deletion results..." 'INFO'
+        Write-LogEntry "`n[SCAN] Verifying deletion results..." 'INFO'
         Start-Sleep -Seconds 2  # Allow system to update
         
         $remainingProfiles = Get-CimInstance -CimSession $cimSession -Query $profileQuery -ErrorAction SilentlyContinue
@@ -8801,10 +8833,10 @@ AND NOT LocalPath LIKE 'C:\\Users\\All Users%'
         }
         
         if ($actualRemaining) {
-            Write-LogEntry "⚠ Warning: $($actualRemaining.Count) profiles still exist after deletion" 'WARNING'
+            Write-LogEntry "[WARN] Warning: $($actualRemaining.Count) profiles still exist after deletion" 'WARNING'
             $actualRemaining | ForEach-Object {
                 $name = Split-Path $_.LocalPath -Leaf
-                Write-LogEntry "  • Remaining: $name" 'WARNING'
+                Write-LogEntry "  - Remaining: $name" 'WARNING'
             }
         }
 
@@ -8839,12 +8871,12 @@ AND NOT LocalPath LIKE 'C:\\Users\\All Users%'
         
         # Set global status
         if ($deletedCount -gt 0) {
-            $global:LastStatus = "✅ Deleted $deletedCount user profiles in $([math]::Round($duration, 1))s"
+            $global:LastStatus = "[OK] Deleted $deletedCount user profiles in $([math]::Round($duration, 1))s"
             if ($failedCount -gt 0) {
                 $global:LastStatus += " ($failedCount failed)"
             }
         } else {
-            $global:LastStatus = "ℹ No profiles were deleted"
+            $global:LastStatus = "[INFO] No profiles were deleted"
         }
     }
 }
@@ -8852,9 +8884,9 @@ AND NOT LocalPath LIKE 'C:\\Users\\All Users%'
 # Enhanced alias for compatibility
 Set-Alias -Name Remove-UserProfiles -Value Remove-UserProfilesClassroom -Force
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Option 15 - Disable the display of the last user logged on
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 function Apply-LoginScreenRegistryFixes {
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -8969,7 +9001,7 @@ function Apply-LoginScreenRegistryFixes {
                 $verifyValue = Get-ItemProperty -Path $Path -Name $Name -ErrorAction Stop
                 if ($verifyValue.$Name -eq $Value) {
                     $level = if ($SecurityCritical) { 'SECURITY' } else { 'SUCCESS' }
-                    Write-LogEntry "✔ $Description" $level
+                    Write-LogEntry "[OK] $Description" $level
                     $appliedSettings += [pscustomobject]@{
                         Path            = $Path
                         Name            = $Name
@@ -8983,7 +9015,7 @@ function Apply-LoginScreenRegistryFixes {
                 }
             }
         } catch {
-            Write-LogEntry "✘ Failed to apply $Description : $_" 'ERROR'
+            Write-LogEntry "[X] Failed to apply $Description : $_" 'ERROR'
             $failedSettings += [pscustomobject]@{
                 Path        = $Path
                 Name        = $Name
@@ -9002,7 +9034,7 @@ function Apply-LoginScreenRegistryFixes {
         }
 
         # Core login screen security settings
-        Write-LogEntry "`n🛡️ Applying core login screen security settings..." 'INFO'
+        Write-LogEntry "`n[SHIELD] Applying core login screen security settings..." 'INFO'
         
         # Speed: Batch registry operations using array
         $coreSettings = @(
@@ -9026,7 +9058,7 @@ function Apply-LoginScreenRegistryFixes {
 
         # Enhanced security settings (applied when -EnhancedSecurity is used)
         if ($EnhancedSecurity) {
-            Write-LogEntry "`n🔒 Applying enhanced security settings..." 'SECURITY'
+            Write-LogEntry "`n[SECURE] Applying enhanced security settings..." 'SECURITY'
             
             $enhancedSettings = @(
                 @{
@@ -9119,7 +9151,7 @@ function Apply-LoginScreenRegistryFixes {
 
         # Security: Additional hardening for classroom environments
         if ($EnhancedSecurity) {
-            Write-LogEntry "`n🏫 Applying classroom-specific security hardening..." 'SECURITY'
+            Write-LogEntry "`n[SCHOOL] Applying classroom-specific security hardening..." 'SECURITY'
             
             # Disable guest account
             try {
@@ -9127,11 +9159,11 @@ function Apply-LoginScreenRegistryFixes {
                 if ($guestAccount -and $guestAccount.Enabled) {
                     if ($PSCmdlet.ShouldProcess("LocalUser 'Guest'", "Disable")) {
                         Disable-LocalUser -Name "Guest" -ErrorAction Stop
-                        Write-LogEntry "✔ Disabled Guest account" 'SECURITY'
+                        Write-LogEntry "[OK] Disabled Guest account" 'SECURITY'
                     }
                 }
             } catch {
-                Write-LogEntry "✘ Failed to disable Guest account: $_" 'ERROR'
+                Write-LogEntry "[X] Failed to disable Guest account: $_" 'ERROR'
             }
             
             # Set strong password policy via registry
@@ -9158,26 +9190,26 @@ function Apply-LoginScreenRegistryFixes {
         }
 
         # Security: Registry integrity verification
-        Write-LogEntry "`n🔍 Verifying registry integrity..." 'INFO'
+        Write-LogEntry "`n[SCAN] Verifying registry integrity..." 'INFO'
         $verificationErrors = 0
         
         foreach ($setting in $appliedSettings) {
             try {
                 $currentValue = Get-ItemProperty -Path $setting.Path -Name $setting.Name -ErrorAction Stop
                 if ($currentValue.($setting.Name) -ne $setting.Value) {
-                    Write-LogEntry "⚠ Verification failed for $($setting.Description)" 'WARNING'
+                    Write-LogEntry "[WARN] Verification failed for $($setting.Description)" 'WARNING'
                     $verificationErrors++
                 }
             } catch {
-                Write-LogEntry "⚠ Could not verify $($setting.Description)" 'WARNING'
+                Write-LogEntry "[WARN] Could not verify $($setting.Description)" 'WARNING'
                 $verificationErrors++
             }
         }
         
         if ($verificationErrors -eq 0) {
-            Write-LogEntry "✔ All registry settings verified successfully" 'SUCCESS'
+            Write-LogEntry "[OK] All registry settings verified successfully" 'SUCCESS'
         } else {
-            Write-LogEntry "⚠ $verificationErrors settings failed verification" 'WARNING'
+            Write-LogEntry "[WARN] $verificationErrors settings failed verification" 'WARNING'
         }
 
         # Create registry backup file
@@ -9185,9 +9217,9 @@ function Apply-LoginScreenRegistryFixes {
             try {
                 $backupFile = "$env:TEMP\LoginRegistryBackup_$(Get-Date -Format 'yyyyMMdd_HHmmss').json"
                 $backupData | ConvertTo-Json -Depth 5 | Out-File -FilePath $backupFile -Encoding UTF8
-                Write-LogEntry "✔ Registry backup saved to: $backupFile" 'INFO'
+                Write-LogEntry "[OK] Registry backup saved to: $backupFile" 'INFO'
             } catch {
-                Write-LogEntry "⚠ Failed to save registry backup: $_" 'WARNING'
+                Write-LogEntry "[WARN] Failed to save registry backup: $_" 'WARNING'
             }
         }
 
@@ -9199,7 +9231,7 @@ function Apply-LoginScreenRegistryFixes {
         $duration = $stopwatch.Elapsed.TotalSeconds
         
         # Generate summary
-        Write-LogEntry "`n📊 Configuration Summary:" 'INFO'
+        Write-LogEntry "`n[SUMMARY] Configuration Summary:" 'INFO'
         Write-LogEntry "Duration: $([math]::Round($duration, 2)) seconds" 'INFO'
         Write-LogEntry "Settings applied: $($appliedSettings.Count)" 'SUCCESS'
         Write-LogEntry "Settings failed: $($failedSettings.Count)" 'ERROR'
@@ -9210,23 +9242,23 @@ function Apply-LoginScreenRegistryFixes {
         }
         
         if ($failedSettings.Count -gt 0) {
-            Write-LogEntry "`n❌ Failed Settings:" 'ERROR'
+            Write-LogEntry "`n[ERROR] Failed Settings:" 'ERROR'
             foreach ($failed in $failedSettings) {
-                Write-LogEntry "  • $($failed.Description): $($failed.Error)" 'ERROR'
+                Write-LogEntry "  - $($failed.Description): $($failed.Error)" 'ERROR'
             }
         }
         
         # Write detailed log file
         try {
             $logEntries | Out-File -FilePath $LogPath -Encoding UTF8 -Force
-            Write-LogEntry "📝 Detailed log saved to: $LogPath" 'INFO'
+            Write-LogEntry "[NOTE] Detailed log saved to: $LogPath" 'INFO'
         } catch {
-            Write-LogEntry "⚠ Failed to save log file: $_" 'WARNING'
+            Write-LogEntry "[WARN] Failed to save log file: $_" 'WARNING'
         }
         
         # Set global status
         if ($appliedSettings.Count -gt 0) {
-            $statusMsg = "✅ Applied $($appliedSettings.Count) login screen security settings"
+            $statusMsg = "[OK] Applied $($appliedSettings.Count) login screen security settings"
             if ($failedSettings.Count -gt 0) {
                 $statusMsg += " ($($failedSettings.Count) failed)"
             }
@@ -9235,7 +9267,7 @@ function Apply-LoginScreenRegistryFixes {
             }
             $global:LastStatus = $statusMsg
         } else {
-            $global:LastStatus = "⚠ No login screen settings were applied"
+            $global:LastStatus = "[WARN] No login screen settings were applied"
         }
         
         Write-LogEntry "=== Login Screen Registry Configuration Completed ===" 'INFO'
@@ -9265,22 +9297,22 @@ function Restore-LoginScreenRegistrySettings {
             
             try {
                 Set-ItemProperty -Path $path -Name $name -Value $entry.Value.Value -ErrorAction Stop
-                Write-Host "✔ Restored: $($entry.Name)" -ForegroundColor Green
+                Write-Host "[OK] Restored: $($entry.Name)" -ForegroundColor Green
                 $restored++
             } catch {
-                Write-Warning "⚠ Failed to restore: $($entry.Name) - $_"
+                Write-Warning "[WARN] Failed to restore: $($entry.Name) - $_"
             }
         }
         
-        Write-Host "✅ Restored $restored registry settings from backup" -ForegroundColor Cyan
+        Write-Host "[OK] Restored $restored registry settings from backup" -ForegroundColor Cyan
     } catch {
         throw "Failed to restore from backup: $_"
     }
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Option 16 - Enable Automatic Login with CC-Student
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 function Set-DomainAutoLogin {
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -9337,7 +9369,7 @@ function Set-DomainAutoLogin {
         )
         
         if (-not $SecurePassword) {
-            Write-LogEntry "⚠ SECURITY WARNING: Auto-login requires storing credentials" 'WARNING'
+            Write-LogEntry "[WARN] SECURITY WARNING: Auto-login requires storing credentials" 'WARNING'
             Write-LogEntry "Consider using alternative authentication methods for production" 'WARNING'
             
             if (-not $Force) {
@@ -9385,10 +9417,10 @@ function Set-DomainAutoLogin {
             try {
                 $backupFile = "$env:TEMP\AutoLoginBackup_$(Get-Date -Format 'yyyyMMdd_HHmmss').json"
                 $backupData | ConvertTo-Json | Out-File -FilePath $backupFile -Encoding UTF8
-                Write-LogEntry "✔ Registry backup saved to: $backupFile" 'INFO'
+                Write-LogEntry "[OK] Registry backup saved to: $backupFile" 'INFO'
                 return $backupFile
             } catch {
-                Write-LogEntry "⚠ Failed to save registry backup: $_" 'WARNING'
+                Write-LogEntry "[WARN] Failed to save registry backup: $_" 'WARNING'
             }
         }
         
@@ -9429,7 +9461,7 @@ function Set-DomainAutoLogin {
         param([string]$DomainName)
         
         try {
-            Write-LogEntry "🔍 Validating domain connectivity..." 'INFO'
+            Write-LogEntry "[SCAN] Validating domain connectivity..." 'INFO'
             
             # Test domain controller connectivity
             $domainController = Resolve-DnsName -Name $DomainName -Type A -ErrorAction Stop
@@ -9440,15 +9472,15 @@ function Set-DomainAutoLogin {
             # Test LDAP connectivity
             $ldapTest = Test-NetConnection -ComputerName $DomainName -Port 389 -WarningAction SilentlyContinue
             if (-not $ldapTest.TcpTestSucceeded) {
-                Write-LogEntry "⚠ LDAP connectivity test failed" 'WARNING'
+                Write-LogEntry "[WARN] LDAP connectivity test failed" 'WARNING'
                 return $false
             }
             
-            Write-LogEntry "✔ Domain connectivity validated" 'SUCCESS'
+            Write-LogEntry "[OK] Domain connectivity validated" 'SUCCESS'
             return $true
             
         } catch {
-            Write-LogEntry "⚠ Domain validation failed: $_" 'WARNING'
+            Write-LogEntry "[WARN] Domain validation failed: $_" 'WARNING'
             return $false
         }
     }
@@ -9495,11 +9527,11 @@ function Set-DomainAutoLogin {
             try {
                 if ($PSCmdlet.ShouldProcess("$regPath\$($setting.Name)", "Set registry value")) {
                     Set-ItemProperty -Path $regPath -Name $setting.Name -Value $setting.Value -Type $setting.Type -ErrorAction Stop
-                    Write-LogEntry "✔ Set $($setting.Name)" 'SUCCESS'
+                    Write-LogEntry "[OK] Set $($setting.Name)" 'SUCCESS'
                     $settingsApplied++
                 }
             } catch {
-                Write-LogEntry "✘ Failed to set $($setting.Name): $_" 'ERROR'
+                Write-LogEntry "[X] Failed to set $($setting.Name): $_" 'ERROR'
                 throw
             }
         }
@@ -9516,7 +9548,7 @@ function Set-DomainAutoLogin {
 
         # Handle disable auto-login request
         if ($DisableAutoLogin) {
-            Write-LogEntry "🚫 Disabling auto-login..." 'INFO'
+            Write-LogEntry "[BLOCK] Disabling auto-login..." 'INFO'
             
             $regPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
             
@@ -9534,8 +9566,8 @@ function Set-DomainAutoLogin {
                         }
                     }
                     
-                    Write-LogEntry "✔ Auto-login disabled and credentials cleared" 'SUCCESS'
-                    $global:LastStatus = "✅ Auto-login disabled successfully."
+                    Write-LogEntry "[OK] Auto-login disabled and credentials cleared" 'SUCCESS'
+                    $global:LastStatus = "[OK] Auto-login disabled successfully."
                     return
                     
                 } catch {
@@ -9551,26 +9583,26 @@ function Set-DomainAutoLogin {
             Write-Host "CRITICAL SECURITY WARNING - AUTO-LOGIN CONFIGURATION" -ForegroundColor Red -BackgroundColor Black
             Write-Host "="*70 -ForegroundColor Red
             Write-Host "This configuration will:" -ForegroundColor Yellow
-            Write-Host "  • Store domain credentials on local system" -ForegroundColor Yellow
-            Write-Host "  • Allow automatic login without authentication" -ForegroundColor Yellow
-            Write-Host "  • Potentially expose credentials to local attacks" -ForegroundColor Yellow
+            Write-Host "  - Store domain credentials on local system" -ForegroundColor Yellow
+            Write-Host "  - Allow automatic login without authentication" -ForegroundColor Yellow
+            Write-Host "  - Potentially expose credentials to local attacks" -ForegroundColor Yellow
             Write-Host "`nRECOMMENDATIONS:" -ForegroundColor Cyan
-            Write-Host "  • Use only in secure, controlled environments" -ForegroundColor Cyan
-            Write-Host "  • Consider using domain Group Policy instead" -ForegroundColor Cyan
-            Write-Host "  • Limit auto-login count to minimize exposure" -ForegroundColor Cyan
-            Write-Host "  • Regularly rotate the password" -ForegroundColor Cyan
+            Write-Host "  - Use only in secure, controlled environments" -ForegroundColor Cyan
+            Write-Host "  - Consider using domain Group Policy instead" -ForegroundColor Cyan
+            Write-Host "  - Limit auto-login count to minimize exposure" -ForegroundColor Cyan
+            Write-Host "  - Regularly rotate the password" -ForegroundColor Cyan
             Write-Host "="*70 -ForegroundColor Red
             
-            $confirmation = Read-Host "`n❓ Type 'UNDERSTAND' to acknowledge security risks and continue"
+            $confirmation = Read-Host "`n[?] Type 'UNDERSTAND' to acknowledge security risks and continue"
             if ($confirmation -ne 'UNDERSTAND') {
                 Write-LogEntry "Operation cancelled - security risks not acknowledged" 'WARNING'
-                $global:LastStatus = "⚠ User cancelled auto-login configuration."
+                $global:LastStatus = "[WARN] User cancelled auto-login configuration."
                 return
             }
         }
 
         # Validate inputs
-        Write-LogEntry "🔍 Validating configuration parameters..." 'INFO'
+        Write-LogEntry "[SCAN] Validating configuration parameters..." 'INFO'
         
         if ([string]::IsNullOrWhiteSpace($UserName)) {
             throw "Username cannot be empty"
@@ -9587,18 +9619,18 @@ function Set-DomainAutoLogin {
         }
 
         # Security: Get secure credentials
-        Write-LogEntry "🔐 Processing credentials securely..." 'SECURITY'
+        Write-LogEntry "[LOCK] Processing credentials securely..." 'SECURITY'
         $credential = Get-SecureCredential -Username $UserName -Domain $DomainName -SecurePassword $Password
         
         # Security: Test credential validity (optional)
         if ($domainConnectivity) {
             try {
-                Write-LogEntry "🔍 Validating credentials..." 'INFO'
+                Write-LogEntry "[SCAN] Validating credentials..." 'INFO'
                 # Note: In production, you might want to test credentials against domain
                 # This is omitted here to avoid additional authentication attempts
-                Write-LogEntry "✔ Credential format validated" 'SUCCESS'
+                Write-LogEntry "[OK] Credential format validated" 'SUCCESS'
             } catch {
-                Write-LogEntry "⚠ Credential validation failed: $_" 'WARNING'
+                Write-LogEntry "[WARN] Credential validation failed: $_" 'WARNING'
                 if (-not $Force) {
                     throw "Invalid credentials provided"
                 }
@@ -9606,26 +9638,26 @@ function Set-DomainAutoLogin {
         }
 
         # Security: Backup current settings
-        Write-LogEntry "💾 Backing up current auto-login settings..." 'INFO'
+        Write-LogEntry "[SAVE] Backing up current auto-login settings..." 'INFO'
         $backupFile = Backup-AutoLoginSettings
         
         if ($WhatIf) {
             Write-LogEntry "WhatIf: Would configure auto-login for $DomainName\$UserName" 'INFO'
             Write-LogEntry "WhatIf: Would set AutoLogonCount to $AutoLoginCount" 'INFO'
-            $global:LastStatus = "ℹ WhatIf completed - auto-login would be configured."
+            $global:LastStatus = "[INFO] WhatIf completed - auto-login would be configured."
             return
         }
 
         # Security: Encrypt password
-        Write-LogEntry "🔒 Encrypting credentials..." 'SECURITY'
+        Write-LogEntry "[SECURE] Encrypting credentials..." 'SECURITY'
         $encryptedPassword = Protect-AutoLoginPassword -SecurePassword $credential.Password
         
         # Apply registry settings
-        Write-LogEntry "📝 Applying auto-login registry settings..." 'INFO'
+        Write-LogEntry "[NOTE] Applying auto-login registry settings..." 'INFO'
         $settingsCount = Set-AutoLoginRegistry -Username $UserName -Domain $DomainName -EncryptedPassword $encryptedPassword -LoginCount $AutoLoginCount
         
         # Security: Verify settings were applied
-        Write-LogEntry "🔍 Verifying configuration..." 'INFO'
+        Write-LogEntry "[SCAN] Verifying configuration..." 'INFO'
         $regPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
         
         try {
@@ -9637,7 +9669,7 @@ function Set-DomainAutoLogin {
                 $userNameValue.DefaultUserName -eq $UserName -and 
                 $domainValue.DefaultDomainName -eq $DomainName) {
                 
-                Write-LogEntry "✔ Auto-login configuration verified successfully" 'SUCCESS'
+                Write-LogEntry "[OK] Auto-login configuration verified successfully" 'SUCCESS'
             } else {
                 throw "Configuration verification failed"
             }
@@ -9647,7 +9679,7 @@ function Set-DomainAutoLogin {
 
         # Security: Set appropriate permissions on registry key
         try {
-            Write-LogEntry "🔒 Securing registry permissions..." 'SECURITY'
+            Write-LogEntry "[SECURE] Securing registry permissions..." 'SECURITY'
             
             $acl = Get-Acl -Path $regPath
             # Remove inherited permissions to protect stored credentials
@@ -9659,21 +9691,21 @@ function Set-DomainAutoLogin {
             }
             
             Set-Acl -Path $regPath -AclObject $acl
-            Write-LogEntry "✔ Registry permissions secured" 'SUCCESS'
+            Write-LogEntry "[OK] Registry permissions secured" 'SUCCESS'
             
         } catch {
-            Write-LogEntry "⚠ Failed to secure registry permissions: $_" 'WARNING'
+            Write-LogEntry "[WARN] Failed to secure registry permissions: $_" 'WARNING'
         }
 
     } catch {
         Write-LogEntry "Critical error during auto-login configuration: $_" 'ERROR'
-        $global:LastStatus = "❌ Auto-login configuration failed: $_"
+        $global:LastStatus = "[ERROR] Auto-login configuration failed: $_"
         throw
     } finally {
         $stopwatch.Stop()
         $duration = $stopwatch.Elapsed.TotalSeconds
         
-        Write-LogEntry "`n📊 Configuration Summary:" 'INFO'
+        Write-LogEntry "`n[SUMMARY] Configuration Summary:" 'INFO'
         Write-LogEntry "Duration: $([math]::Round($duration, 2)) seconds" 'INFO'
         
         if (-not $DisableAutoLogin -and -not $WhatIf) {
@@ -9685,17 +9717,17 @@ function Set-DomainAutoLogin {
         # Write log file
         try {
             $logEntries | Out-File -FilePath $LogPath -Encoding UTF8 -Force
-            Write-LogEntry "📝 Detailed log saved to: $LogPath" 'INFO'
+            Write-LogEntry "[NOTE] Detailed log saved to: $LogPath" 'INFO'
         } catch {
-            Write-LogEntry "⚠ Failed to save log file: $_" 'WARNING'
+            Write-LogEntry "[WARN] Failed to save log file: $_" 'WARNING'
         }
         
         # Set final status
         if (-not $global:LastStatus -or $global:LastStatus -notlike "*auto-login*") {
             if ($DisableAutoLogin) {
-                $global:LastStatus = "✅ Auto-login disabled successfully."
+                $global:LastStatus = "[OK] Auto-login disabled successfully."
             } else {
-                $global:LastStatus = "✅ Auto-login configured for $DomainName\$UserName."
+                $global:LastStatus = "[OK] Auto-login configured for $DomainName\$UserName."
             }
         }
         
@@ -9732,9 +9764,9 @@ function Get-AutoLoginStatus {
     }
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Option 7 - Set Desktop Power Settings - Only run on Desktop computers, no laptops!
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 function Set-DesktopPowerSettings {
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -9917,11 +9949,11 @@ function Set-DesktopPowerSettings {
             
             $backupFile = "$env:TEMP\PowerSettingsBackup_$(Get-Date -Format 'yyyyMMdd_HHmmss').json"
             $backupData | ConvertTo-Json -Depth 3 | Out-File -FilePath $backupFile -Encoding UTF8
-            Write-LogEntry "✔ Power settings backup saved to: $backupFile" 'INFO'
+            Write-LogEntry "[OK] Power settings backup saved to: $backupFile" 'INFO'
             return $backupFile
             
         } catch {
-            Write-LogEntry "⚠ Failed to backup power settings: $_" 'WARNING'
+            Write-LogEntry "[WARN] Failed to backup power settings: $_" 'WARNING'
             return $null
         }
     }
@@ -9949,7 +9981,7 @@ function Set-DesktopPowerSettings {
                         Value = $SchemeName
                         Success = $true
                     }
-                    Write-LogEntry "✔ Power scheme set to: $SchemeName" 'SUCCESS'
+                    Write-LogEntry "[OK] Power scheme set to: $SchemeName" 'SUCCESS'
                 } else {
                     throw "Failed to set power scheme: $result"
                 }
@@ -9961,7 +9993,7 @@ function Set-DesktopPowerSettings {
                 Success = $false
                 Error = $_.Exception.Message
             }
-            Write-LogEntry "✘ Failed to set power scheme: $_" 'ERROR'
+            Write-LogEntry "[X] Failed to set power scheme: $_" 'ERROR'
         }
         
         # Configure monitor timeout
@@ -9979,7 +10011,7 @@ function Set-DesktopPowerSettings {
                         Value = "$MonitorTimeout minutes"
                         Success = $true
                     }
-                    Write-LogEntry "✔ Monitor timeout set to: $MonitorTimeout minutes" 'SUCCESS'
+                    Write-LogEntry "[OK] Monitor timeout set to: $MonitorTimeout minutes" 'SUCCESS'
                 } else {
                     throw "Failed to set monitor timeout: AC=$resultAC, DC=$resultDC"
                 }
@@ -9991,7 +10023,7 @@ function Set-DesktopPowerSettings {
                 Success = $false
                 Error = $_.Exception.Message
             }
-            Write-LogEntry "✘ Failed to set monitor timeout: $_" 'ERROR'
+            Write-LogEntry "[X] Failed to set monitor timeout: $_" 'ERROR'
         }
         
         # Configure disk timeout
@@ -10009,7 +10041,7 @@ function Set-DesktopPowerSettings {
                             Value = "Disabled"
                             Success = $true
                         }
-                        Write-LogEntry "✔ Disk timeout disabled" 'SUCCESS'
+                        Write-LogEntry "[OK] Disk timeout disabled" 'SUCCESS'
                     } else {
                         throw "Failed to disable disk timeout: AC=$resultAC, DC=$resultDC"
                     }
@@ -10021,7 +10053,7 @@ function Set-DesktopPowerSettings {
                     Success = $false
                     Error = $_.Exception.Message
                 }
-                Write-LogEntry "✘ Failed to disable disk timeout: $_" 'ERROR'
+                Write-LogEntry "[X] Failed to disable disk timeout: $_" 'ERROR'
             }
         } else {
             try {
@@ -10037,7 +10069,7 @@ function Set-DesktopPowerSettings {
                             Value = "$DiskTimeout minutes"
                             Success = $true
                         }
-                        Write-LogEntry "✔ Disk timeout set to: $DiskTimeout minutes" 'SUCCESS'
+                        Write-LogEntry "[OK] Disk timeout set to: $DiskTimeout minutes" 'SUCCESS'
                     } else {
                         throw "Failed to set disk timeout: AC=$resultAC, DC=$resultDC"
                     }
@@ -10049,7 +10081,7 @@ function Set-DesktopPowerSettings {
                     Success = $false
                     Error = $_.Exception.Message
                 }
-                Write-LogEntry "✘ Failed to set disk timeout: $_" 'ERROR'
+                Write-LogEntry "[X] Failed to set disk timeout: $_" 'ERROR'
             }
         }
         
@@ -10065,7 +10097,7 @@ function Set-DesktopPowerSettings {
                         Value = "Disabled"
                         Success = $true
                     }
-                    Write-LogEntry "✔ Hibernation disabled" 'SUCCESS'
+                    Write-LogEntry "[OK] Hibernation disabled" 'SUCCESS'
                 } else {
                     throw "Failed to disable hibernation: $result"
                 }
@@ -10077,7 +10109,7 @@ function Set-DesktopPowerSettings {
                 Success = $false
                 Error = $_.Exception.Message
             }
-            Write-LogEntry "✘ Failed to disable hibernation: $_" 'ERROR'
+            Write-LogEntry "[X] Failed to disable hibernation: $_" 'ERROR'
         }
         
         return $configResults
@@ -10095,15 +10127,15 @@ function Set-DesktopPowerSettings {
 
         # Hardware detection and validation
         if (-not $SkipHardwareDetection) {
-            Write-LogEntry "`n🔍 Detecting system hardware type..." 'HARDWARE'
+            Write-LogEntry "`n[SCAN] Detecting system hardware type..." 'HARDWARE'
             $hardwareInfo = Get-SystemHardwareType
             
             Write-LogEntry "Hardware Analysis:" 'HARDWARE'
-            Write-LogEntry "  • System Type: $(if($hardwareInfo.IsLaptop){'Laptop'}elseif($hardwareInfo.IsDesktop){'Desktop'}elseif($hardwareInfo.IsServer){'Server'}else{'Workstation'})" 'HARDWARE'
-            Write-LogEntry "  • Has Battery: $($hardwareInfo.HasBattery)" 'HARDWARE'
-            Write-LogEntry "  • Manufacturer: $($hardwareInfo.Manufacturer)" 'HARDWARE'
-            Write-LogEntry "  • Model: $($hardwareInfo.Model)" 'HARDWARE'
-            Write-LogEntry "  • Memory: $($hardwareInfo.TotalPhysicalMemory) GB" 'HARDWARE'
+            Write-LogEntry "  - System Type: $(if($hardwareInfo.IsLaptop){'Laptop'}elseif($hardwareInfo.IsDesktop){'Desktop'}elseif($hardwareInfo.IsServer){'Server'}else{'Workstation'})" 'HARDWARE'
+            Write-LogEntry "  - Has Battery: $($hardwareInfo.HasBattery)" 'HARDWARE'
+            Write-LogEntry "  - Manufacturer: $($hardwareInfo.Manufacturer)" 'HARDWARE'
+            Write-LogEntry "  - Model: $($hardwareInfo.Model)" 'HARDWARE'
+            Write-LogEntry "  - Memory: $($hardwareInfo.TotalPhysicalMemory) GB" 'HARDWARE'
             
             # Security: Prevent accidental laptop configuration
             if ($hardwareInfo.IsLaptop -and -not $AllowLaptops -and -not $Force) {
@@ -10113,17 +10145,17 @@ function Set-DesktopPowerSettings {
                 Write-Host "This system appears to be a LAPTOP with battery power." -ForegroundColor Yellow
                 Write-Host "Desktop power settings may negatively impact battery life!" -ForegroundColor Yellow
                 Write-Host "`nTo proceed anyway, use one of these options:" -ForegroundColor Cyan
-                Write-Host "  • Use -AllowLaptops parameter" -ForegroundColor Cyan
-                Write-Host "  • Use -Force parameter" -ForegroundColor Cyan
-                Write-Host "  • Use -SkipHardwareDetection parameter" -ForegroundColor Cyan
+                Write-Host "  - Use -AllowLaptops parameter" -ForegroundColor Cyan
+                Write-Host "  - Use -Force parameter" -ForegroundColor Cyan
+                Write-Host "  - Use -SkipHardwareDetection parameter" -ForegroundColor Cyan
                 Write-Host "="*60 -ForegroundColor Red
                 
-                $global:LastStatus = "⚠ Operation blocked - laptop detected."
+                $global:LastStatus = "[WARN] Operation blocked - laptop detected."
                 return
             }
             
             if ($hardwareInfo.IsLaptop -and ($AllowLaptops -or $Force)) {
-                Write-LogEntry "⚠ Proceeding with laptop configuration (overridden)" 'WARNING'
+                Write-LogEntry "[WARN] Proceeding with laptop configuration (overridden)" 'WARNING'
             }
         }
 
@@ -10133,23 +10165,23 @@ function Set-DesktopPowerSettings {
             Write-Host "POWER SETTINGS CONFIGURATION" -ForegroundColor Yellow -BackgroundColor Black
             Write-Host "="*60 -ForegroundColor Yellow
             Write-Host "This will configure the following settings:" -ForegroundColor White
-            Write-Host "  • Power Plan: $PowerPlan" -ForegroundColor Cyan
-            Write-Host "  • Monitor Timeout: $MonitorTimeoutMinutes minutes" -ForegroundColor Cyan
-            Write-Host "  • Disk Timeout: $(if($DiskTimeoutMinutes -eq 0){'Disabled'}else{"$DiskTimeoutMinutes minutes"})" -ForegroundColor Cyan
-            Write-Host "  • Hibernation: Disabled" -ForegroundColor Cyan
+            Write-Host "  - Power Plan: $PowerPlan" -ForegroundColor Cyan
+            Write-Host "  - Monitor Timeout: $MonitorTimeoutMinutes minutes" -ForegroundColor Cyan
+            Write-Host "  - Disk Timeout: $(if($DiskTimeoutMinutes -eq 0){'Disabled'}else{"$DiskTimeoutMinutes minutes"})" -ForegroundColor Cyan
+            Write-Host "  - Hibernation: Disabled" -ForegroundColor Cyan
             Write-Host "`nNote: These settings optimize for desktop performance" -ForegroundColor Yellow
             Write-Host "="*60 -ForegroundColor Yellow
             
-            $confirmation = Read-Host "`n❓ Continue with power configuration? (Y/N)"
+            $confirmation = Read-Host "`n[?] Continue with power configuration? (Y/N)"
             if ($confirmation -notin @('Y', 'y', 'Yes', 'yes')) {
                 Write-LogEntry "Operation cancelled by user" 'WARNING'
-                $global:LastStatus = "⚠ User cancelled power settings configuration."
+                $global:LastStatus = "[WARN] User cancelled power settings configuration."
                 return
             }
         }
 
         # Get available power schemes
-        Write-LogEntry "`n🔍 Scanning available power schemes..." 'INFO'
+        Write-LogEntry "`n[SCAN] Scanning available power schemes..." 'INFO'
         $powerSchemes = Get-PowerSchemes
         
         if ($powerSchemes.Count -eq 0) {
@@ -10159,12 +10191,12 @@ function Set-DesktopPowerSettings {
         Write-LogEntry "Available power schemes:" 'INFO'
         foreach ($scheme in $powerSchemes.GetEnumerator()) {
             $activeIndicator = if ($scheme.Value.IsActive) { " (ACTIVE)" } else { "" }
-            Write-LogEntry "  • $($scheme.Key)$activeIndicator" 'INFO'
+            Write-LogEntry "  - $($scheme.Key)$activeIndicator" 'INFO'
         }
         
         # Validate requested power plan
         if (-not $powerSchemes.ContainsKey($PowerPlan)) {
-            Write-LogEntry "⚠ Requested power plan '$PowerPlan' not found" 'WARNING'
+            Write-LogEntry "[WARN] Requested power plan '$PowerPlan' not found" 'WARNING'
             Write-LogEntry "Falling back to 'High Performance' scheme" 'WARNING'
             $PowerPlan = 'High Performance'
             
@@ -10178,22 +10210,22 @@ function Set-DesktopPowerSettings {
 
         # Backup current settings
         if (-not $WhatIfPreference) {
-            Write-LogEntry "`n💾 Backing up current power settings..." 'INFO'
+            Write-LogEntry "`n[SAVE] Backing up current power settings..." 'INFO'
             $backupFile = Backup-PowerSettings
         }
 
         if ($WhatIfPreference) {
             Write-LogEntry "`nWhatIf Summary:" 'INFO'
-            Write-LogEntry "  • Would set power scheme to: $PowerPlan" 'INFO'
-            Write-LogEntry "  • Would set monitor timeout to: $MonitorTimeoutMinutes minutes" 'INFO'
-            Write-LogEntry "  • Would set disk timeout to: $(if($DiskTimeoutMinutes -eq 0){'Disabled'}else{"$DiskTimeoutMinutes minutes"})" 'INFO'
-            Write-LogEntry "  • Would disable hibernation" 'INFO'
-            $global:LastStatus = "ℹ WhatIf completed - power settings would be configured."
+            Write-LogEntry "  - Would set power scheme to: $PowerPlan" 'INFO'
+            Write-LogEntry "  - Would set monitor timeout to: $MonitorTimeoutMinutes minutes" 'INFO'
+            Write-LogEntry "  - Would set disk timeout to: $(if($DiskTimeoutMinutes -eq 0){'Disabled'}else{"$DiskTimeoutMinutes minutes"})" 'INFO'
+            Write-LogEntry "  - Would disable hibernation" 'INFO'
+            $global:LastStatus = "[INFO] WhatIf completed - power settings would be configured."
             return
         }
 
         # Apply power configuration
-        Write-LogEntry "`n⚡ Applying power configuration..." 'INFO'
+        Write-LogEntry "`n[FAST] Applying power configuration..." 'INFO'
         $configResults = Set-PowerConfiguration -SchemeName $PowerPlan -SchemeGUID $selectedScheme.GUID -MonitorTimeout $MonitorTimeoutMinutes -DiskTimeout $DiskTimeoutMinutes
         
         # Process results
@@ -10204,62 +10236,62 @@ function Set-DesktopPowerSettings {
         $script:failedSettings = $configResults | Where-Object { -not $_.Success }
 
         # Verify configuration
-        Write-LogEntry "`n🔍 Verifying power configuration..." 'INFO'
+        Write-LogEntry "`n[SCAN] Verifying power configuration..." 'INFO'
         try {
             $currentScheme = powercfg.exe /getactivescheme 2>$null
             if ($currentScheme -and $currentScheme -match $selectedScheme.GUID) {
-                Write-LogEntry "✔ Power scheme verification passed" 'SUCCESS'
+                Write-LogEntry "[OK] Power scheme verification passed" 'SUCCESS'
             } else {
-                Write-LogEntry "⚠ Power scheme verification failed" 'WARNING'
+                Write-LogEntry "[WARN] Power scheme verification failed" 'WARNING'
             }
         } catch {
-            Write-LogEntry "⚠ Could not verify power scheme: $_" 'WARNING'
+            Write-LogEntry "[WARN] Could not verify power scheme: $_" 'WARNING'
         }
 
     } catch {
         Write-LogEntry "Critical error during power settings configuration: $_" 'ERROR'
-        $global:LastStatus = "❌ Power settings configuration failed: $_"
+        $global:LastStatus = "[ERROR] Power settings configuration failed: $_"
         throw
     } finally {
         $stopwatch.Stop()
         $duration = $stopwatch.Elapsed.TotalSeconds
         
-        Write-LogEntry "`n📊 Configuration Summary:" 'INFO'
+        Write-LogEntry "`n[SUMMARY] Configuration Summary:" 'INFO'
         Write-LogEntry "Duration: $([math]::Round($duration, 2)) seconds" 'INFO'
         Write-LogEntry "Settings applied: $($appliedSettings.Count)" 'SUCCESS'
         Write-LogEntry "Settings failed: $($failedSettings.Count)" 'ERROR'
         
         if ($appliedSettings.Count -gt 0) {
-            Write-LogEntry "`n✅ Successfully Applied:" 'SUCCESS'
+            Write-LogEntry "`n[OK] Successfully Applied:" 'SUCCESS'
             foreach ($setting in $appliedSettings) {
-                Write-LogEntry "  • $($setting.Setting): $($setting.Value)" 'SUCCESS'
+                Write-LogEntry "  - $($setting.Setting): $($setting.Value)" 'SUCCESS'
             }
         }
         
         if ($failedSettings.Count -gt 0) {
-            Write-LogEntry "`n❌ Failed Settings:" 'ERROR'
+            Write-LogEntry "`n[ERROR] Failed Settings:" 'ERROR'
             foreach ($setting in $failedSettings) {
-                Write-LogEntry "  • $($setting.Setting): $($setting.Error)" 'ERROR'
+                Write-LogEntry "  - $($setting.Setting): $($setting.Error)" 'ERROR'
             }
         }
         
         # Write log file
         try {
             $logEntries | Out-File -FilePath $LogPath -Encoding UTF8 -Force
-            Write-LogEntry "📝 Detailed log saved to: $LogPath" 'INFO'
+            Write-LogEntry "[NOTE] Detailed log saved to: $LogPath" 'INFO'
         } catch {
-            Write-LogEntry "⚠ Failed to save log file: $_" 'WARNING'
+            Write-LogEntry "[WARN] Failed to save log file: $_" 'WARNING'
         }
         
         # Set final status
         if ($appliedSettings.Count -gt 0) {
             if ($failedSettings.Count -eq 0) {
-                $global:LastStatus = "✅ All power settings applied successfully."
+                $global:LastStatus = "[OK] All power settings applied successfully."
             } else {
-                $global:LastStatus = "⚠ Power settings partially applied ($($appliedSettings.Count) success, $($failedSettings.Count) failed)."
+                $global:LastStatus = "[WARN] Power settings partially applied ($($appliedSettings.Count) success, $($failedSettings.Count) failed)."
             }
         } else {
-            $global:LastStatus = "❌ No power settings were applied."
+            $global:LastStatus = "[ERROR] No power settings were applied."
         }
         
         Write-LogEntry "=== Power Settings Configuration Completed ===" 'INFO'
@@ -10299,9 +10331,9 @@ function Get-PowerConfiguration {
     }
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Option 17 - Install Computer Lab Scheduled Tasks
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 function Register-LabScheduledTasks {
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -10549,9 +10581,9 @@ if %ERRORLEVEL% EQU 0 (
 }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Option 18 - Set OneDrive to Automatically Login at Boot
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 function Set-OneDriveAutoLoginPolicy {
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -10624,12 +10656,12 @@ function Set-OneDriveAutoLoginPolicy {
         try {
             if (-not (Test-RegistryPath $Path)) {
                 New-Item -Path $Path -Force -ErrorAction Stop | Out-Null
-                Write-LogEntry "✔ Created registry path: $Path" 'SUCCESS'
+                Write-LogEntry "[OK] Created registry path: $Path" 'SUCCESS'
                 return $true
             }
             return $true
         } catch {
-            Write-LogEntry "✘ Failed to create registry path: $Path - $_" 'ERROR'
+            Write-LogEntry "[X] Failed to create registry path: $Path - $_" 'ERROR'
             return $false
         }
     }
@@ -10681,9 +10713,9 @@ function Set-OneDriveAutoLoginPolicy {
             # Check if the policy already has the correct value
             if (Test-PolicyValue -Path $Path -Name $Name -DesiredValue $Value) {
                 $level = if ($Critical) { 'SKIP' } else { 'SKIP' }
-                Write-LogEntry "⏭ $Description (already configured)" $level
+                Write-LogEntry "[SKIP] $Description (already configured)" $level
                 
-                # ✅ FIX: Ensure skippedPolicies exists and use ArrayList.Add()
+                # [OK] FIX: Ensure skippedPolicies exists and use ArrayList.Add()
                 if ($null -eq $script:skippedPolicies) {
                     $script:skippedPolicies = New-Object System.Collections.ArrayList
                 }
@@ -10711,9 +10743,9 @@ function Set-OneDriveAutoLoginPolicy {
                 $verifyValue = Get-ItemProperty -Path $Path -Name $Name -ErrorAction Stop
                 if ($verifyValue.$Name -eq $Value) {
                     $level = if ($Critical) { 'POLICY' } else { 'SUCCESS' }
-                    Write-LogEntry "✔ $Description" $level
+                    Write-LogEntry "[OK] $Description" $level
                     
-                    # ✅ FIX: Ensure appliedPolicies exists and use ArrayList.Add()
+                    # [OK] FIX: Ensure appliedPolicies exists and use ArrayList.Add()
                     if ($null -eq $script:appliedPolicies) {
                         $script:appliedPolicies = New-Object System.Collections.ArrayList
                     }
@@ -10731,9 +10763,9 @@ function Set-OneDriveAutoLoginPolicy {
                 }
             }
         } catch {
-            Write-LogEntry "✘ Failed to apply $Description : $_" 'ERROR'
+            Write-LogEntry "[X] Failed to apply $Description : $_" 'ERROR'
             
-            # ✅ FIX: Ensure failedPolicies exists and use ArrayList.Add()
+            # [OK] FIX: Ensure failedPolicies exists and use ArrayList.Add()
             if ($null -eq $script:failedPolicies) {
                 $script:failedPolicies = New-Object System.Collections.ArrayList
             }
@@ -10816,12 +10848,12 @@ function Set-OneDriveAutoLoginPolicy {
             if ($backupData.Count -gt 0) {
                 $backupFile = "$env:TEMP\OneDrivePolicyBackup_$(Get-Date -Format 'yyyyMMdd_HHmmss').json"
                 $backupData | ConvertTo-Json -Depth 4 | Out-File -FilePath $backupFile -Encoding UTF8
-                Write-LogEntry "✔ Policy backup saved to: $backupFile" 'INFO'
+                Write-LogEntry "[OK] Policy backup saved to: $backupFile" 'INFO'
                 return $backupFile
             }
             
         } catch {
-            Write-LogEntry "⚠ Failed to backup OneDrive policies: $_" 'WARNING'
+            Write-LogEntry "[WARN] Failed to backup OneDrive policies: $_" 'WARNING'
         }
         
         return $null
@@ -10861,16 +10893,16 @@ function Set-OneDriveAutoLoginPolicy {
         }
 
         # Validate OneDrive installation
-        Write-LogEntry "`n🔍 Validating OneDrive installation..." 'INFO'
+        Write-LogEntry "`n[SCAN] Validating OneDrive installation..." 'INFO'
         $oneDriveInfo = Test-OneDriveInstallation
         
         if (-not $oneDriveInfo.IsInstalled) {
-            Write-LogEntry "⚠ OneDrive not detected on this system" 'WARNING'
+            Write-LogEntry "[WARN] OneDrive not detected on this system" 'WARNING'
             Write-LogEntry "Policies will be applied but may not take effect until OneDrive is installed" 'WARNING'
         } else {
-            Write-LogEntry "✔ OneDrive installation detected:" 'SUCCESS'
+            Write-LogEntry "[OK] OneDrive installation detected:" 'SUCCESS'
             foreach ($installation in $oneDriveInfo.Installations) {
-                Write-LogEntry "  • $($installation.Type): $($installation.Path) (v$($installation.Version))" 'INFO'
+                Write-LogEntry "  - $($installation.Type): $($installation.Path) (v$($installation.Version))" 'INFO'
             }
         }
 
@@ -10884,26 +10916,26 @@ function Set-OneDriveAutoLoginPolicy {
 
         # Backup existing policies if requested
         if ($BackupSettings) {
-            Write-LogEntry "`n💾 Backing up current OneDrive policies..." 'INFO'
+            Write-LogEntry "`n[SAVE] Backing up current OneDrive policies..." 'INFO'
             $backupFile = Backup-OneDrivePolicies -RegistryPaths $registryPaths.Values
         }
 
         if ($WhatIfPreference) {
             Write-LogEntry "`nWhatIf Summary - Policies that would be applied:" 'INFO'
-            if ($EnableSilentConfig) { Write-LogEntry "  • Silent account configuration: Enabled" 'INFO' }
-            if ($DisableFirstRunWizard) { Write-LogEntry "  • First run wizard: Disabled" 'INFO' }
-            if ($EnableAutoStartup) { Write-LogEntry "  • Auto startup: Enabled" 'INFO' }
-            if ($EnableFilesOnDemand) { Write-LogEntry "  • Files On-Demand: Enabled" 'INFO' }
-            if ($DisablePersonalSync) { Write-LogEntry "  • Personal account sync: Disabled" 'INFO' }
-            if ($EnableKnownFolderMove) { Write-LogEntry "  • Known Folder Move: Enabled" 'INFO' }
-            if ($TenantId) { Write-LogEntry "  • Tenant restriction: $TenantId" 'INFO' }
-            if ($SyncThrottleKbps -gt 0) { Write-LogEntry "  • Sync throttle: $SyncThrottleKbps KB/s" 'INFO' }
-            $global:LastStatus = "ℹ WhatIf completed - OneDrive policies would be configured."
+            if ($EnableSilentConfig) { Write-LogEntry "  - Silent account configuration: Enabled" 'INFO' }
+            if ($DisableFirstRunWizard) { Write-LogEntry "  - First run wizard: Disabled" 'INFO' }
+            if ($EnableAutoStartup) { Write-LogEntry "  - Auto startup: Enabled" 'INFO' }
+            if ($EnableFilesOnDemand) { Write-LogEntry "  - Files On-Demand: Enabled" 'INFO' }
+            if ($DisablePersonalSync) { Write-LogEntry "  - Personal account sync: Disabled" 'INFO' }
+            if ($EnableKnownFolderMove) { Write-LogEntry "  - Known Folder Move: Enabled" 'INFO' }
+            if ($TenantId) { Write-LogEntry "  - Tenant restriction: $TenantId" 'INFO' }
+            if ($SyncThrottleKbps -gt 0) { Write-LogEntry "  - Sync throttle: $SyncThrottleKbps KB/s" 'INFO' }
+            $global:LastStatus = "[INFO] WhatIf completed - OneDrive policies would be configured."
             return
         }
 
         # Apply core OneDrive policies
-        Write-LogEntry "`n🛠️ Applying OneDrive policies..." 'POLICY'
+        Write-LogEntry "`n[REPAIR] Applying OneDrive policies..." 'POLICY'
         
         # Silent account configuration
         if ($EnableSilentConfig) {
@@ -10957,7 +10989,7 @@ function Set-OneDriveAutoLoginPolicy {
         }
 
         # Additional security and performance policies
-        Write-LogEntry "`n🔒 Applying security and performance policies..." 'POLICY'
+        Write-LogEntry "`n[SECURE] Applying security and performance policies..." 'POLICY'
         
         # Prevent OneDrive from generating network traffic until user signs in
         Set-OneDrivePolicy -Path $registryPaths.MainPolicy -Name "PreventNetworkTrafficPreUserSignIn" -Value 1 -Description "Prevented network traffic before user sign-in" | Out-Null
@@ -10971,7 +11003,7 @@ function Set-OneDriveAutoLoginPolicy {
         }
 
         # Verification of applied policies
-        Write-LogEntry "`n🔍 Verifying policy application..." 'INFO'
+        Write-LogEntry "`n[SCAN] Verifying policy application..." 'INFO'
         $verificationErrors = 0
         
         # Ensure appliedPolicies exists before iterating
@@ -10980,11 +11012,11 @@ function Set-OneDriveAutoLoginPolicy {
                 try {
                     $currentValue = Get-ItemProperty -Path $policy.Path -Name $policy.Name -ErrorAction Stop
                     if ($currentValue.($policy.Name) -ne $policy.Value) {
-                        Write-LogEntry "⚠ Verification failed for $($policy.Description)" 'WARNING'
+                        Write-LogEntry "[WARN] Verification failed for $($policy.Description)" 'WARNING'
                         $verificationErrors++
                     }
                 } catch {
-                    Write-LogEntry "⚠ Could not verify $($policy.Description)" 'WARNING'
+                    Write-LogEntry "[WARN] Could not verify $($policy.Description)" 'WARNING'
                     $verificationErrors++
                 }
             }
@@ -10994,16 +11026,16 @@ function Set-OneDriveAutoLoginPolicy {
         $skippedCount = if ($null -ne $script:skippedPolicies) { $script:skippedPolicies.Count } else { 0 }
         
         if ($verificationErrors -eq 0 -and $appliedCount -gt 0) {
-            Write-LogEntry "✔ All OneDrive policies verified successfully" 'SUCCESS'
+            Write-LogEntry "[OK] All OneDrive policies verified successfully" 'SUCCESS'
         } elseif ($appliedCount -eq 0 -and $skippedCount -gt 0) {
-            Write-LogEntry "✔ All OneDrive policies already correctly configured" 'SUCCESS'
+            Write-LogEntry "[OK] All OneDrive policies already correctly configured" 'SUCCESS'
         } elseif ($verificationErrors -gt 0) {
-            Write-LogEntry "⚠ $verificationErrors policies failed verification" 'WARNING'
+            Write-LogEntry "[WARN] $verificationErrors policies failed verification" 'WARNING'
         }
 
     } catch {
         Write-LogEntry "Critical error during OneDrive policy configuration: $_" 'ERROR'
-        $global:LastStatus = "❌ OneDrive policy configuration failed: $_"
+        $global:LastStatus = "[ERROR] OneDrive policy configuration failed: $_"
         throw
     } finally {
         $stopwatch.Stop()
@@ -11014,7 +11046,7 @@ function Set-OneDriveAutoLoginPolicy {
         $skippedCount = if ($null -ne $script:skippedPolicies) { $script:skippedPolicies.Count } else { 0 }
         $failedCount = if ($null -ne $script:failedPolicies) { $script:failedPolicies.Count } else { 0 }
         
-        Write-LogEntry "`n📊 Policy Configuration Summary:" 'INFO'
+        Write-LogEntry "`n[SUMMARY] Policy Configuration Summary:" 'INFO'
         Write-LogEntry "Duration: $([math]::Round($duration, 2)) seconds" 'INFO'
         Write-LogEntry "Policies applied: $appliedCount" 'SUCCESS'
         Write-LogEntry "Policies already correct: $skippedCount" 'SKIP'
@@ -11039,9 +11071,9 @@ function Set-OneDriveAutoLoginPolicy {
         }
         
         if ($failedCount -gt 0 -and $null -ne $script:failedPolicies) {
-            Write-LogEntry "`n❌ Failed Policies:" 'ERROR'
+            Write-LogEntry "`n[ERROR] Failed Policies:" 'ERROR'
             foreach ($failed in $script:failedPolicies) {
-                Write-LogEntry "  • $($failed.Description): $($failed.Error)" 'ERROR'
+                Write-LogEntry "  - $($failed.Description): $($failed.Error)" 'ERROR'
             }
         }
         
@@ -11049,22 +11081,22 @@ function Set-OneDriveAutoLoginPolicy {
         try {
             if ($null -ne $script:logEntries) {
                 $script:logEntries.ToArray() | Out-File -FilePath $LogPath -Encoding UTF8 -Force
-                Write-LogEntry "📝 Detailed log saved to: $LogPath" 'INFO'
+                Write-LogEntry "[NOTE] Detailed log saved to: $LogPath" 'INFO'
             }
         } catch {
-            Write-LogEntry "⚠ Failed to save log file: $_" 'WARNING'
+            Write-LogEntry "[WARN] Failed to save log file: $_" 'WARNING'
         }
         
         # Set global status with safe counting
         $totalPolicies = $appliedCount + $skippedCount
         if ($totalPolicies -gt 0) {
             if ($appliedCount -gt 0) {
-                $statusMsg = "✅ Applied $appliedCount OneDrive policies"
+                $statusMsg = "[OK] Applied $appliedCount OneDrive policies"
                 if ($skippedCount -gt 0) {
                     $statusMsg += " ($skippedCount already correct)"
                 }
             } else {
-                $statusMsg = "✅ All $skippedCount OneDrive policies already correctly configured"
+                $statusMsg = "[OK] All $skippedCount OneDrive policies already correctly configured"
             }
             
             if ($failedCount -gt 0) {
@@ -11075,7 +11107,7 @@ function Set-OneDriveAutoLoginPolicy {
             }
             $global:LastStatus = $statusMsg
         } else {
-            $global:LastStatus = "⚠ No OneDrive policies were processed"
+            $global:LastStatus = "[WARN] No OneDrive policies were processed"
         }
         
         Write-LogEntry "=== OneDrive Policy Configuration Completed ===" 'INFO'
@@ -11149,23 +11181,23 @@ function Remove-OneDrivePolicies {
                 if ($PSCmdlet.ShouldProcess($path, "Remove OneDrive policy registry key")) {
                     if (-not $ConfirmEach -or (Read-Host "Remove $path? (y/n)") -eq 'y') {
                         Remove-Item -Path $path -Recurse -Force -ErrorAction Stop
-                        Write-Host "✔ Removed OneDrive policies from: $path" -ForegroundColor Green
+                        Write-Host "[OK] Removed OneDrive policies from: $path" -ForegroundColor Green
                         $removedCount++
                     }
                 }
             } catch {
-                Write-Warning "⚠ Failed to remove $path : $_"
+                Write-Warning "[WARN] Failed to remove $path : $_"
             }
         }
     }
     
-    Write-Host "✅ Removed OneDrive policies from $removedCount registry locations" -ForegroundColor Cyan
+    Write-Host "[OK] Removed OneDrive policies from $removedCount registry locations" -ForegroundColor Cyan
 }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Option 19 - Full System Update
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 function Run-CorePostDeploymentTasks {
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -11363,7 +11395,7 @@ Function '$FunctionName' failed with error:
         if ($Include.Count -gt 0) {
             foreach ($taskId in $Include) {
                 if ($Tasks.ContainsKey($taskId)) { $filteredTasks[$taskId] = $Tasks[$taskId] }
-                else { Write-LogEntry "⚠ Unknown task specified in include list: $taskId" 'WARNING' }
+                else { Write-LogEntry "[WARN] Unknown task specified in include list: $taskId" 'WARNING' }
             }
         } else {
             $filteredTasks = $Tasks.Clone()
@@ -11415,7 +11447,7 @@ Function '$FunctionName' failed with error:
         }
         
         try {
-            Write-LogEntry "🚀 Starting task: $($TaskInfo.Name)" 'TASK'
+            Write-LogEntry "[START] Starting task: $($TaskInfo.Name)" 'TASK'
             
             if ($WhatIfMode) {
                 Write-LogEntry "WhatIf: Would execute $($TaskInfo.Function)" 'INFO'
@@ -11424,7 +11456,7 @@ Function '$FunctionName' failed with error:
                 $result.Output += "WhatIf execution completed"
             } else {
                 # Run function directly in-process
-                Write-LogEntry "ℹ Running '$($TaskInfo.Function)' in-process..." 'INFO'
+                Write-LogEntry "[INFO] Running '$($TaskInfo.Function)' in-process..." 'INFO'
                 Invoke-FunctionInProcess -FunctionName $TaskInfo.Function
                 $result.Success = $true
                 $result.Output += "In-process execution completed"
@@ -11435,9 +11467,9 @@ Function '$FunctionName' failed with error:
             $result.EndTime  = Get-Date
 
             if ($result.Success) {
-                Write-LogEntry "✔ Completed: $($TaskInfo.Name) ($([math]::Round($result.Duration.TotalSeconds, 1))s)" 'SUCCESS'
+                Write-LogEntry "[OK] Completed: $($TaskInfo.Name) ($([math]::Round($result.Duration.TotalSeconds, 1))s)" 'SUCCESS'
             } else {
-                Write-LogEntry "✘ Failed: $($TaskInfo.Name) - $($result.Error)" 'ERROR'
+                Write-LogEntry "[X] Failed: $($TaskInfo.Name) - $($result.Error)" 'ERROR'
             }
 
         } catch {
@@ -11446,7 +11478,7 @@ Function '$FunctionName' failed with error:
             $result.EndTime  = Get-Date
             $result.Error    = $_.Exception.Message
             $result.Success  = $false
-            Write-LogEntry "✘ Task failed: $($TaskInfo.Name) - $_" 'ERROR'
+            Write-LogEntry "[X] Task failed: $($TaskInfo.Name) - $_" 'ERROR'
         }
         return $result
     }
@@ -11493,69 +11525,69 @@ Function '$FunctionName' failed with error:
         if ($WhatIfPreference) { Write-LogEntry "WhatIf mode - no actual changes will be made" 'INFO' }
 
         # Filter and validate tasks
-        Write-LogEntry "`n🔍 Analyzing task configuration..." 'INFO'
+        Write-LogEntry "`n[SCAN] Analyzing task configuration..." 'INFO'
         $tasksToRun = Get-FilteredTasks -Tasks $availableTasks -Include $IncludeTasks -Exclude $ExcludeTasks
         if ($tasksToRun.Count -eq 0) { throw "No tasks selected for execution" }
 
         $dependencyErrors = Test-TaskDependencies -Tasks $tasksToRun
         if ($dependencyErrors.Count -gt 0) {
-            Write-LogEntry "❌ Dependency validation failed:" 'ERROR'
-            foreach ($error in $dependencyErrors) { Write-LogEntry "  • $error" 'ERROR' }
+            Write-LogEntry "[ERROR] Dependency validation failed:" 'ERROR'
+            foreach ($error in $dependencyErrors) { Write-LogEntry "  - $error" 'ERROR' }
             throw "Task dependency validation failed"
         }
 
         # Sort tasks by priority
         $sortedTasks = $tasksToRun.GetEnumerator() | Sort-Object { $_.Value.Priority }
-        Write-LogEntry "✔ Task validation completed" 'SUCCESS'
+        Write-LogEntry "[OK] Task validation completed" 'SUCCESS'
         Write-LogEntry "Tasks to execute: $($tasksToRun.Count)" 'INFO'
 
         # Display execution plan
-        Write-LogEntry "`n📋 Execution Plan:" 'INFO'
+        Write-LogEntry "`n[REPORT] Execution Plan:" 'INFO'
         $totalEstimatedTime = 0
         foreach ($task in $sortedTasks) {
             $estimate = $task.Value.EstimatedDuration
             $totalEstimatedTime += $estimate
-            Write-LogEntry "  • $($task.Value.Name) ($($task.Value.Category)) - ~$([math]::Round($estimate/60, 1))min" 'INFO'
+            Write-LogEntry "  - $($task.Value.Name) ($($task.Value.Category)) - ~$([math]::Round($estimate/60, 1))min" 'INFO'
         }
         Write-LogEntry "Total estimated time: $([math]::Round($totalEstimatedTime/60, 1)) minutes" 'INFO'
 
         if ($WhatIfPreference) {
             Write-LogEntry "`nWhatIf Summary - Tasks that would be executed:" 'INFO'
-            foreach ($task in $sortedTasks) { Write-LogEntry "  • $($task.Value.Name): $($task.Value.Function)" 'INFO' }
-            $global:LastStatus = "ℹ WhatIf completed - $($tasksToRun.Count) tasks would be executed."
+            foreach ($task in $sortedTasks) { Write-LogEntry "  - $($task.Value.Name): $($task.Value.Function)" 'INFO' }
+            $global:LastStatus = "[INFO] WhatIf completed - $($tasksToRun.Count) tasks would be executed."
             return
         }
 
         # Execute tasks sequentially
-        Write-LogEntry "`n🚀 Beginning task execution..." 'SYSTEM'
+        Write-LogEntry "`n[START] Beginning task execution..." 'SYSTEM'
         foreach ($task in $sortedTasks) {
             $result = Invoke-DeploymentTask -TaskId $task.Key -TaskInfo $task.Value -TimeoutMinutes $TaskTimeoutMinutes -WhatIfMode:$WhatIfPreference
             $taskResults += $result
             if (-not $result.Success -and -not $ContinueOnError) {
-                Write-LogEntry "❌ Stopping execution due to task failure: $($result.Name)" 'ERROR'
+                Write-LogEntry "[ERROR] Stopping execution due to task failure: $($result.Name)" 'ERROR'
                 break
             }
         }
 
         # Generate final report
         if ($GenerateReport) {
-            Write-LogEntry "`n📊 Generating deployment report..." 'INFO'
+            Write-LogEntry "`n[SUMMARY] Generating deployment report..." 'INFO'
             $deploymentReport = New-DeploymentReport -TaskResults $taskResults
             $reportFile = "$env:TEMP\DeploymentReport_$(Get-Date -Format 'yyyyMMdd_HHmmss').json"
             $deploymentReport | ConvertTo-Json -Depth 5 | Out-File -FilePath $reportFile -Encoding UTF8
-            Write-LogEntry "✔ Deployment report saved to: $reportFile" 'SUCCESS'
+            Write-LogEntry "[OK] Deployment report saved to: $reportFile" 'SUCCESS'
         }
 
     } catch {
         Write-LogEntry "Critical error during post-deployment execution: $_" 'ERROR'
-        $global:LastStatus = "❌ Core post-deployment tasks failed: $_"
+        $global:LastStatus = "[ERROR] Core post-deployment tasks failed: $_"
         throw
     } finally {
         $globalStopwatch.Stop()
         $totalDuration = $globalStopwatch.Elapsed
         
         # Final summary
-        Write-LogEntry "`n📊 Post-Deployment Summary:" 'SYSTEM'
+        Write-LogEntry "`n[SUMMARY] Post-Deployment Summary:" 'SYSTEM'
         Write-LogEntry "Total Duration: $([math]::Round($totalDuration.TotalMinutes, 2)) minutes" 'INFO'
         
         if ($taskResults) {
@@ -11567,19 +11599,19 @@ Function '$FunctionName' failed with error:
             Write-LogEntry "Failed: $failureCount" 'ERROR'
             
             if ($failureCount -gt 0) {
-                Write-LogEntry "`n❌ Failed Tasks:" 'ERROR'
+                Write-LogEntry "`n[ERROR] Failed Tasks:" 'ERROR'
                 foreach ($failedTask in ($taskResults | Where-Object { -not $_.Success })) {
-                    Write-LogEntry "  • $($failedTask.Name): $($failedTask.Error)" 'ERROR'
+                    Write-LogEntry "  - $($failedTask.Name): $($failedTask.Error)" 'ERROR'
                 }
             }
             
             if ($failureCount -eq 0) {
-                $global:LastStatus = "✅ All $successCount post-deployment tasks completed successfully."
+                $global:LastStatus = "[OK] All $successCount post-deployment tasks completed successfully."
             } else {
-                $global:LastStatus = "⚠ Post-deployment completed with issues: $successCount successful, $failureCount failed."
+                $global:LastStatus = "[WARN] Post-deployment completed with issues: $successCount successful, $failureCount failed."
             }
         } else {
-            $global:LastStatus = "ℹ No tasks were executed."
+            $global:LastStatus = "[INFO] No tasks were executed."
         }
         
         # Write comprehensive log file
@@ -11587,9 +11619,9 @@ Function '$FunctionName' failed with error:
             $dir = Split-Path -Path $LogPath -Parent
             if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
             $logEntries | Out-File -FilePath $LogPath -Encoding UTF8 -Force
-            Write-LogEntry "📝 Detailed log saved to: $LogPath" 'INFO'
+            Write-LogEntry "[NOTE] Detailed log saved to: $LogPath" 'INFO'
         } catch {
-            Write-LogEntry "⚠ Failed to save log file: $_" 'WARNING'
+            Write-LogEntry "[WARN] Failed to save log file: $_" 'WARNING'
         }
         
         Write-LogEntry "=== Core Post-Deployment Tasks Completed ===" 'SYSTEM'
@@ -11611,16 +11643,16 @@ function Get-AvailableDeploymentTasks {
         'WindowsUpdate'     = 'Run Windows Update'
     }
     
-    Write-Host "`n📋 Available Deployment Tasks:" -ForegroundColor Cyan
+    Write-Host "`n[REPORT] Available Deployment Tasks:" -ForegroundColor Cyan
     foreach ($task in $tasks.GetEnumerator()) {
-        Write-Host "  • $($task.Key): $($task.Value)" -ForegroundColor White
+        Write-Host "  - $($task.Key): $($task.Value)" -ForegroundColor White
     }
 }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Option 20 - Network Repair
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 function Run-NetworkDiagnostics {
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -11741,7 +11773,7 @@ function Run-NetworkDiagnostics {
                     default { "Status: $($adapter.NetConnectionStatus)" }
                 }
                 
-                Write-LogEntry "         • $($adapter.Name): $statusText" 'INFO'
+                Write-LogEntry "         - $($adapter.Name): $statusText" 'INFO'
                 
                 $script:diagnosticResults.AdapterHealth[$adapter.Name] = @{
                     Status = $statusText
@@ -12244,7 +12276,7 @@ function Run-NetworkDiagnostics {
             if ($script:diagnosticResults.CriticalIssues.Count -gt 0) {
                 $report += "CRITICAL ISSUES:"
                 foreach ($issue in $script:diagnosticResults.CriticalIssues) {
-                    $report += "• $issue"
+                    $report += "- $issue"
                 }
                 $report += ""
             }
@@ -12268,14 +12300,14 @@ function Run-NetworkDiagnostics {
             if ($script:repairActions.Count -gt 0) {
                 $report += "REPAIR ACTIONS PERFORMED:"
                 foreach ($action in $script:repairActions) {
-                    $report += "• $action"
+                    $report += "- $action"
                 }
                 $report += ""
             }
             
             $report += "RECOMMENDATIONS:"
             foreach ($rec in $script:diagnosticResults.Recommendations) {
-                $report += "• $rec"
+                $report += "- $rec"
             }
             
             $report | Out-File -FilePath $reportPath -Encoding UTF8 -Force
@@ -12386,7 +12418,7 @@ function Run-NetworkDiagnostics {
             Write-LogEntry "" 'INFO'
             Write-LogEntry "[ERROR] Critical Issues Found:" 'ERROR'
             foreach ($issue in $script:diagnosticResults.CriticalIssues) {
-                Write-LogEntry "  • $issue" 'ERROR'
+                Write-LogEntry "  - $issue" 'ERROR'
             }
         }
         
@@ -12394,7 +12426,7 @@ function Run-NetworkDiagnostics {
             Write-LogEntry "" 'INFO'
             Write-LogEntry "[INFO] Recommendations:" 'INFO'
             foreach ($rec in $script:diagnosticResults.Recommendations) {
-                Write-LogEntry "  • $rec" 'INFO'
+                Write-LogEntry "  - $rec" 'INFO'
             }
         }
         
@@ -12634,7 +12666,7 @@ function Invoke-AdvancedNetworkRepair {
             Write-Host "" -ForegroundColor Cyan
             Write-Host "[INFO] Advanced repair summary:" -ForegroundColor Cyan
             foreach ($action in $repairActions) {
-                Write-Host "   • $action" -ForegroundColor Cyan
+                Write-Host "   - $action" -ForegroundColor Cyan
             }
             
             if ($ResetNetworkStack -or $ResetWinsock) {
@@ -12700,9 +12732,9 @@ function Get-NetworkStatus {
     return $status
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Option 8 - Network Optimization
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Network Optimization Module - Clean Version
 # To use: dot-source this file in your main script with: . ".\NetworkOptimization.ps1"
 # Then call: Start-NetworkOptimization
@@ -13072,11 +13104,11 @@ function Show-OptimizationSummary {
     
     Write-LogMessage -Message "=== NETWORK OPTIMIZATION SUMMARY ===" -Level "INFO"
     Write-LogMessage -Message "Optimizations completed successfully:" -Level "SUCCESS"
-    Write-LogMessage -Message "  ✓ IPv6 protocol disabled" -Level "SUCCESS"
-    Write-LogMessage -Message "  ✓ TCP/IP settings optimized" -Level "SUCCESS"
-    Write-LogMessage -Message "  ✓ Network adapter settings optimized" -Level "SUCCESS"
-    Write-LogMessage -Message "  ✓ DNS settings optimized" -Level "SUCCESS"
-    Write-LogMessage -Message "  ✓ Windows network stack optimized" -Level "SUCCESS"
+    Write-LogMessage -Message "  [OK] IPv6 protocol disabled" -Level "SUCCESS"
+    Write-LogMessage -Message "  [OK] TCP/IP settings optimized" -Level "SUCCESS"
+    Write-LogMessage -Message "  [OK] Network adapter settings optimized" -Level "SUCCESS"
+    Write-LogMessage -Message "  [OK] DNS settings optimized" -Level "SUCCESS"
+    Write-LogMessage -Message "  [OK] Windows network stack optimized" -Level "SUCCESS"
     Write-LogMessage -Message " " -Level "INFO"
     Write-LogMessage -Message "Configuration backup saved to: $BackupPath" -Level "INFO"
     Write-LogMessage -Message "Log file saved to: $Script:LogPath" -Level "INFO"
@@ -13156,14 +13188,14 @@ function Start-NetworkOptimization {
     }
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Menu Display
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 function Show-Menu {
     Clear-Host
-    Write-Host "╔══════════════════════════════════════════════════════════╗" -ForegroundColor Magenta
-    Write-Host "║              Compton College Tech Utils                  ║" -ForegroundColor Magenta
-    Write-Host "╚══════════════════════════════════════════════════════════╝" -ForegroundColor Magenta
+    Write-Host "[==========================================================]" -ForegroundColor Magenta
+    Write-Host "|              Compton College Tech Utils                  |" -ForegroundColor Magenta
+    Write-Host "[==========================================================]" -ForegroundColor Magenta
     Write-Host ""
 
     Write-Host "1.  Create MISAdmin account" -ForegroundColor White
@@ -13193,9 +13225,9 @@ function Show-Menu {
     Write-Host ""
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Main Loop
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 function Main {
     do {
         Clear-Host  # <== Clear screen BEFORE showing the menu
@@ -13310,15 +13342,15 @@ function Main {
 				exit
 			}
             default {
-                $global:LastStatus = "❌ Invalid selection. Please try again."
+                $global:LastStatus = "[ERROR] Invalid selection. Please try again."
                 Start-Sleep -Seconds 1
             }
         }
     } while ($true)
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Entry Point
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 Invoke-StartupSelfUpdate
 Main
