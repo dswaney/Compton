@@ -1,5 +1,5 @@
-﻿# ScriptVersion: 1.0
-# LastUpdated: 2026-03-23
+# ScriptVersion: 1.3
+# LastUpdated: 2026-04-13 09:50
 
 [CmdletBinding()]
 param(
@@ -7,12 +7,14 @@ param(
     [switch]$IncludePinned = $false,
     [switch]$AttemptMSStore = $false,
     [switch]$UpdateOffice = $true,
+    [switch]$EnableClassicContextMenu = $true,
     [int]$OfficeWaitMinutes = 30,
     [string]$LogPath = "$env:SystemDrive\Temp\Weekend-Apps-Update.log"
 )
 
 $ErrorActionPreference = 'Stop'
 
+# Writes color-coded status output to the console and appends the same message to the log file.
 function Write-Log {
     param(
         [string]$Message,
@@ -41,6 +43,7 @@ function Write-Log {
     }
 }
 
+# Confirms the script is running elevated because package updates and system changes require admin rights.
 function Test-IsAdministrator {
     try {
         $identity  = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -52,6 +55,7 @@ function Test-IsAdministrator {
     }
 }
 
+# Finds winget.exe from the PATH first, then falls back to the common App Installer locations.
 function Get-WingetPath {
     $cmd = Get-Command winget.exe -ErrorAction SilentlyContinue
     if ($cmd) {
@@ -75,6 +79,7 @@ function Get-WingetPath {
     return $null
 }
 
+# Filters out progress bars, separators, and other noisy winget output that does not help with logging or parsing.
 function Test-IsNoiseLine {
     param([string]$Line)
 
@@ -90,6 +95,7 @@ function Test-IsNoiseLine {
     return $false
 }
 
+# Normalizes raw winget output into cleaner line-based text so it can be logged and parsed consistently.
 function Get-CleanWingetOutput {
     param([object[]]$RawOutput)
 
@@ -110,6 +116,7 @@ function Get-CleanWingetOutput {
     return @($clean)
 }
 
+# Runs winget with the supplied arguments, captures output, logs it, and returns a structured result object.
 function Invoke-Winget {
     param(
         [Parameter(Mandatory)]
@@ -144,6 +151,7 @@ function Invoke-Winget {
     }
 }
 
+# Enables modern TLS defaults and raises the connection limit to reduce network-related package source issues.
 function Initialize-NetworkDefaults {
     try {
         [Net.ServicePointManager]::SecurityProtocol =
@@ -162,12 +170,120 @@ function Initialize-NetworkDefaults {
     catch {}
 }
 
+# Applies the registry setting that restores the classic Windows 10 style right-click context menu in Windows 11.
+function Set-ClassicContextMenuForHive {
+    param(
+        [Parameter(Mandatory)]
+        [string]$RootKey
+    )
+
+    try {
+        $basePath = Join-Path $RootKey 'Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}'
+        $inprocPath = Join-Path $basePath 'InprocServer32'
+
+        if (-not (Test-Path $basePath)) {
+            New-Item -Path $basePath -Force | Out-Null
+        }
+
+        if (-not (Test-Path $inprocPath)) {
+            New-Item -Path $inprocPath -Force | Out-Null
+        }
+
+        New-ItemProperty -Path $inprocPath -Name '(default)' -Value '' -PropertyType String -Force -ErrorAction SilentlyContinue | Out-Null
+        Set-ItemProperty -Path $inprocPath -Name '(default)' -Value '' -ErrorAction SilentlyContinue
+
+        Write-Log "Enabled classic context menu for hive: $RootKey" 'OK'
+    }
+    catch {
+        Write-Log "Failed to update hive $RootKey : $($_.Exception.Message)" 'ERROR'
+    }
+}
+
+function Enable-ClassicContextMenuAllUsers {
+    Write-Log 'Applying classic Windows 10-style context menu for all users...' 'INFO'
+
+    # Apply to the current user profile.
+    Set-ClassicContextMenuForHive -RootKey 'Registry::HKEY_CURRENT_USER'
+
+    # Apply to all currently loaded user profiles.
+    $userSids = Get-ChildItem Registry::HKEY_USERS |
+        Where-Object {
+            $_.PSChildName -match '^S-1-5-21-' -and
+            $_.PSChildName -notmatch '_Classes$'
+        } |
+        Select-Object -ExpandProperty PSChildName
+
+    foreach ($sid in $userSids) {
+        Set-ClassicContextMenuForHive -RootKey "Registry::HKEY_USERS\$sid"
+    }
+
+    # Apply to the Default User profile so future users inherit the classic context menu.
+    $defaultHiveName = 'HKU\DefaultTemp'
+    $defaultHivePsPath = 'Registry::HKEY_USERS\DefaultTemp'
+    $defaultUserNtUserDat = 'C:\Users\Default\NTUSER.DAT'
+
+    if (Test-Path $defaultUserNtUserDat) {
+        $hiveLoaded = $false
+
+        try {
+            $loadResult = & reg.exe load $defaultHiveName $defaultUserNtUserDat 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                throw "Failed to load Default User hive: $($loadResult -join ' ')"
+            }
+
+            $hiveLoaded = $true
+            Start-Sleep -Milliseconds 750
+
+            Set-ClassicContextMenuForHive -RootKey $defaultHivePsPath
+
+            # Release handles before unloading the hive.
+            Start-Sleep -Milliseconds 750
+            [System.GC]::Collect()
+            [System.GC]::WaitForPendingFinalizers()
+            Start-Sleep -Milliseconds 750
+        }
+        catch {
+            Write-Log "Failed to update Default User profile: $($_.Exception.Message)" 'ERROR'
+        }
+        finally {
+            if ($hiveLoaded) {
+                $unloaded = $false
+                $unloadResult = $null
+
+                foreach ($attempt in 1..5) {
+                    $unloadResult = & reg.exe unload $defaultHiveName 2>&1
+                    if ($LASTEXITCODE -eq 0) {
+                        $unloaded = $true
+                        Write-Log 'Applied classic context menu to Default User profile.' 'OK'
+                        break
+                    }
+
+                    Start-Sleep -Seconds 1
+                    [System.GC]::Collect()
+                    [System.GC]::WaitForPendingFinalizers()
+                }
+
+                if (-not $unloaded) {
+                    Write-Log "Classic context menu was written to Default User profile, but unloading the hive failed after multiple attempts. Last response: $($unloadResult -join ' ')" 'WARN'
+                }
+            }
+        }
+    }
+    else {
+        Write-Log 'Default User NTUSER.DAT not found; future new users were not updated.' 'WARN'
+    }
+
+    Write-Log 'Classic context menu registry changes applied. Users may need to sign out and back in.' 'INFO'
+}
+
+# Refreshes winget package sources before inventory collection and upgrades are attempted.
 function Update-WingetSources {
     Write-Log "Refreshing WinGet sources..." 'INFO'
     $null = Invoke-Winget -Arguments @('source', 'update') -IgnoreExitCode
     Write-Log "WinGet source refresh completed." 'OK'
 }
 
+# Retrieves the current list of upgradeable packages from a specific winget source.
 function Get-UpgradeInventory {
     param([string]$Source = 'winget')
 
@@ -178,6 +294,7 @@ function Get-UpgradeInventory {
     return (Invoke-Winget -Arguments $args -IgnoreExitCode)
 }
 
+# Parses winget inventory text into normal upgrades and packages that require explicit targeting.
 function Parse-WingetInventory {
     param([string[]]$Lines)
 
@@ -252,6 +369,7 @@ function Parse-WingetInventory {
     }
 }
 
+# Performs a bulk upgrade pass against the requested winget source using non-interactive switches.
 function Invoke-WingetUpgradeAll {
     param([string]$Source = 'winget')
 
@@ -270,6 +388,7 @@ function Invoke-WingetUpgradeAll {
     return (Invoke-Winget -Arguments $args -IgnoreExitCode)
 }
 
+# Upgrades one package by ID first, then optionally retries by package name if the ID-based attempt fails.
 function Invoke-TargetedUpgrade {
     param(
         [Parameter(Mandatory)]$Package,
@@ -333,6 +452,7 @@ function Invoke-TargetedUpgrade {
     return $result
 }
 
+# Loops through a package collection and performs targeted upgrade attempts while tracking failures.
 function Invoke-PackageSet {
     param(
         [object[]]$Packages,
@@ -363,6 +483,7 @@ function Invoke-PackageSet {
     return $failures
 }
 
+# Starts a Microsoft Office Click-to-Run update and waits up to the configured timeout for completion.
 function Update-OfficeClickToRun {
     param([int]$WaitMinutes = 30)
 
@@ -389,6 +510,7 @@ function Update-OfficeClickToRun {
     Write-Log "Office Click-to-Run exited with code $($proc.ExitCode)." 'INFO'
 }
 
+# Checks whether Windows Update reports that a reboot is pending after software maintenance.
 function Test-RebootRequired {
     try {
         $sysInfo = New-Object -ComObject Microsoft.Update.SystemInfo
@@ -399,6 +521,7 @@ function Test-RebootRequired {
     }
 }
 
+# Removes a defined set of package IDs from a package list so they are not retried unnecessarily.
 function Remove-PackagesById {
     param(
         [object[]]$Packages,
@@ -423,6 +546,7 @@ function Remove-PackagesById {
     return @($filtered)
 }
 
+# Main execution starts here: validate elevation, prepare networking, apply optional desktop tweak, then process app updates.
 if (-not (Test-IsAdministrator)) {
     Write-Error "This script must be run as Administrator."
     exit 1
@@ -430,8 +554,18 @@ if (-not (Test-IsAdministrator)) {
 
 Initialize-NetworkDefaults
 Write-Log "Initializing application update script..." 'INFO'
+Write-Log "Script version: 1.3 | Last updated: 2026-04-13 09:50" 'INFO'
 
 try {
+    if ($EnableClassicContextMenu) {
+        Write-Log "Applying Option 1: Enable classic Windows 10 style right-click context menu..." 'INFO'
+        Enable-ClassicContextMenuAllUsers
+        Write-Log "Classic context menu change will fully apply after Explorer restarts or the user signs out and back in." 'INFO'
+    }
+    else {
+        Write-Log "Option 1 skipped because EnableClassicContextMenu was set to false." 'INFO'
+    }
+
     Update-WingetSources
 
     Write-Log "Collecting pre-upgrade inventory..." 'INFO'
@@ -518,5 +652,5 @@ try {
 }
 catch {
     Write-Log "Script failed: $($_.Exception.Message)" 'ERROR'
-    exit 3
+    exit 1
 }
