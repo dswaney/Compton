@@ -1,7 +1,7 @@
 # =====================================================================
 # ScriptName: 06_Weekend_Windows_Updates.ps1
 # ScriptVersion: 1.4
-# LastUpdated: 2026-03-26
+# LastUpdated: 2026-04-15
 # Purpose: Installs Windows Updates using PSWindowsUpdate, writes a
 #          YAML audit log in C:\Logs, and explicitly reboots if Windows
 #          reports that a reboot is required.
@@ -321,14 +321,164 @@ function Ensure-PSWindowsUpdate {
 }
 
 function Reset-WUComponentsSafe {
-    Write-Log "Resetting Windows Update components..." 'INFO'
+    Write-Log "Resetting Windows Update components using built-in manual routine..." 'INFO'
 
-    if (-not (Get-Command -Name Reset-WUComponents -ErrorAction SilentlyContinue)) {
-        throw "Reset-WUComponents command was not found after importing PSWindowsUpdate."
+    $services = @('wuauserv', 'bits', 'cryptsvc', 'msiserver')
+
+    foreach ($serviceName in $services) {
+        try {
+            $service = Get-Service -Name $serviceName -ErrorAction Stop
+            if ($service.Status -ne 'Stopped') {
+                Write-Log "Stopping service: $serviceName" 'INFO'
+                Stop-Service -Name $serviceName -Force -ErrorAction Stop
+            }
+            else {
+                Write-Log "Service already stopped: $serviceName" 'INFO'
+            }
+        }
+        catch {
+            Write-Log "Failed to stop service ${serviceName}: $($_.Exception.Message)" 'WARN'
+        }
     }
 
-    Reset-WUComponents -Verbose *>&1 | ForEach-Object {
-        Write-Log "$_" 'INFO'
+    Start-Sleep -Seconds 3
+
+    $shouldDeleteUpdatePolicy = $false
+    $shouldDeletePolicyManagerUpdate = $false
+    $wuTriggerDetails = @()
+    $pmTriggerDetails = @()
+
+    try {
+        $wuPolicyPath = 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UpdatePolicy'
+        $wuSettingsPath = 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UpdatePolicy\Settings'
+
+        if (Test-Path -LiteralPath $wuPolicyPath) {
+            $shouldDeleteUpdatePolicy = $true
+            $wuTriggerDetails += "Detected registry hive: $wuPolicyPath"
+            Write-Log "Detected Windows Update policy hive: $wuPolicyPath" 'INFO'
+        }
+
+        if (Test-Path -LiteralPath $wuSettingsPath) {
+            $wuSettings = Get-ItemProperty -Path $wuSettingsPath -ErrorAction SilentlyContinue
+            if ($wuSettings) {
+                $pauseProps = $wuSettings.PSObject.Properties | Where-Object {
+                    $_.Name -like '*Pause*' -and $null -ne $_.Value -and "$($_.Value)".Trim() -ne ''
+                }
+
+                if ($pauseProps) {
+                    $shouldDeleteUpdatePolicy = $true
+                    foreach ($prop in $pauseProps) {
+                        $detail = "{0} = {1}" -f $prop.Name, $prop.Value
+                        $wuTriggerDetails += $detail
+                    }
+
+                    $pauseNames = ($pauseProps | Select-Object -ExpandProperty Name) -join ', '
+                    Write-Log "Detected pause-related Windows Update state: $pauseNames" 'INFO'
+                }
+            }
+        }
+    }
+    catch {
+        Write-Log "Failed while checking Windows Update policy state: $($_.Exception.Message)" 'WARN'
+    }
+
+    try {
+        $pmUpdatePath = 'HKLM:\SOFTWARE\Microsoft\PolicyManager\current\device\Update'
+
+        if (Test-Path -LiteralPath $pmUpdatePath) {
+            $pmUpdate = Get-ItemProperty -Path $pmUpdatePath -ErrorAction SilentlyContinue
+            if ($pmUpdate) {
+                $interestingProps = $pmUpdate.PSObject.Properties | Where-Object {
+                    $_.Name -match 'Pause|Paused|ProviderSet|WinningProvider|Enrolled'
+                }
+
+                if ($interestingProps) {
+                    $shouldDeletePolicyManagerUpdate = $true
+                    foreach ($prop in $interestingProps) {
+                        $detail = "{0} = {1}" -f $prop.Name, $prop.Value
+                        $pmTriggerDetails += $detail
+                    }
+
+                    $propNames = ($interestingProps | Select-Object -ExpandProperty Name) -join ', '
+                    Write-Log "Detected PolicyManager Update state: $propNames" 'INFO'
+                }
+            }
+        }
+    }
+    catch {
+        Write-Log "Failed while checking PolicyManager Update state: $($_.Exception.Message)" 'WARN'
+    }
+
+    if ($wuTriggerDetails.Count -gt 0) {
+        foreach ($detail in $wuTriggerDetails) {
+            Write-Log "Windows Update cleanup trigger: $detail" 'INFO'
+        }
+    }
+
+    if ($pmTriggerDetails.Count -gt 0) {
+        foreach ($detail in $pmTriggerDetails) {
+            Write-Log "PolicyManager cleanup trigger: $detail" 'INFO'
+        }
+    }
+
+    if ($shouldDeleteUpdatePolicy) {
+        try {
+            Write-Log "Deleting Windows Update policy registry hive..." 'INFO'
+            & reg.exe delete "HKLM\SOFTWARE\Microsoft\WindowsUpdate\UpdatePolicy" /f | Out-Null
+            Write-Log "Deleted HKLM\SOFTWARE\Microsoft\WindowsUpdate\UpdatePolicy" 'OK'
+        }
+        catch {
+            Write-Log "Failed to delete HKLM\SOFTWARE\Microsoft\WindowsUpdate\UpdatePolicy: $($_.Exception.Message)" 'WARN'
+        }
+    }
+    else {
+        Write-Log "No pause-related Windows Update policy state detected; skipping UpdatePolicy registry delete." 'INFO'
+    }
+
+    if ($shouldDeletePolicyManagerUpdate) {
+        try {
+            Write-Log "Deleting PolicyManager Update registry hive..." 'INFO'
+            & reg.exe delete "HKLM\SOFTWARE\Microsoft\PolicyManager\current\device\Update" /f | Out-Null
+            Write-Log "Deleted HKLM\SOFTWARE\Microsoft\PolicyManager\current\device\Update" 'OK'
+        }
+        catch {
+            Write-Log "Failed to delete HKLM\SOFTWARE\Microsoft\PolicyManager\current\device\Update: $($_.Exception.Message)" 'WARN'
+        }
+    }
+    else {
+        Write-Log "No relevant PolicyManager Update state detected; skipping PolicyManager registry delete." 'INFO'
+    }
+
+    $foldersToClear = @(
+        "$env:SystemRoot\SoftwareDistribution",
+        "$env:SystemRoot\System32\catroot2"
+    )
+
+    foreach ($folder in $foldersToClear) {
+        try {
+            if (Test-Path -LiteralPath $folder) {
+                Write-Log "Clearing folder: $folder" 'INFO'
+                Remove-Item -LiteralPath $folder -Recurse -Force -ErrorAction Stop
+                Write-Log "Cleared folder: $folder" 'OK'
+            }
+            else {
+                Write-Log "Folder not present, skipping: $folder" 'INFO'
+            }
+        }
+        catch {
+            Write-Log "Failed to clear folder ${folder}: $($_.Exception.Message)" 'WARN'
+        }
+    }
+
+    foreach ($serviceName in $services) {
+        try {
+            Write-Log "Starting service: $serviceName" 'INFO'
+            Start-Service -Name $serviceName -ErrorAction Stop
+            Write-Log "Started service: $serviceName" 'OK'
+        }
+        catch {
+            Write-Log "Failed to start service ${serviceName}: $($_.Exception.Message)" 'WARN'
+        }
     }
 
     Write-Log "Windows Update components reset complete." 'OK'
