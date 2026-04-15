@@ -1,11 +1,8 @@
 # =====================================================================
 # ScriptName: Compton_Tech_Utils.ps1
-# ScriptVersion: 1.8.9
-# LastUpdated: 2026-04-08
+# ScriptVersion: 1.9.0
+# LastUpdated: 2026-04-15
 # =====================================================================
-
-
-
 
 # -----------------------------------------------------------------------------
 # Startup Self-Update Check
@@ -6603,80 +6600,46 @@ function Reset-WindowsUpdateComponents {
     <#
     .SYNOPSIS
     Resets Windows Update components with timeout and retry logic
-    
+
     .PARAMETER MaxTimeout
     Maximum timeout in minutes for the operation
-    
+
     .OUTPUTS
     Returns hashtable with component reset results
     #>
-    
+
     [CmdletBinding()]
     param(
         [Parameter()]
         [int]$MaxTimeout = 60
     )
-    
+
     $result = @{
         Success = $false
         ComponentsReset = $false
         Errors = @()
         Duration = $null
     }
-    
+
     $resetStart = Get-Date
-    
+
     try {
         if ($WhatIfPreference) {
             Write-Host "   Would reset Windows Update components" -ForegroundColor Yellow
             $result.Success = $true
             return $result
         }
-        
-        Write-StatusLog "Resetting Windows Update components..." -Level "Info"
-        
-        # Check if Reset-WUComponents is available
-        $resetCommand = Get-Command "Reset-WUComponents" -ErrorAction SilentlyContinue
-        
-        if (-not $resetCommand) {
-            # Use manual component reset
-            $result = Reset-WUComponentsManually
-        } else {
-            # Use PSWindowsUpdate module command with timeout
-            $timeoutMs = $MaxTimeout * 60 * 1000
-            
-            $job = Start-Job -ScriptBlock {
-                Import-Module PSWindowsUpdate -Force
-                Reset-WUComponents -Verbose
-            }
-            
-            try {
-                $completed = Wait-Job $job -Timeout ($MaxTimeout * 60)
-                
-                if ($completed) {
-                    $output = Receive-Job $job
-                    $result.ComponentsReset = $true
-                    $result.Success = $true
-                    Write-StatusLog "[OK] Windows Update components reset successfully" -Level "Success"
-                } else {
-                    Stop-Job $job -Force
-                    $result.Errors += "Windows Update component reset timed out after $MaxTimeout minutes"
-                    Write-StatusLog "[ERROR] Component reset timed out after $MaxTimeout minutes" -Level "Error"
-                }
-            } catch {
-                $result.Errors += "Failed to reset Windows Update components: $($_.Exception.Message)"
-                Write-StatusLog "[ERROR] Failed to reset components: $($_.Exception.Message)" -Level "Error"
-            } finally {
-                Remove-Job $job -Force -ErrorAction SilentlyContinue
-            }
-        }
-        
+
+        Write-StatusLog "Resetting Windows Update components using built-in manual routine..." -Level "Info"
+        $result = Reset-WUComponentsManually
+
     } catch {
         $result.Errors += "Component reset process failed: $($_.Exception.Message)"
+        Write-StatusLog "[ERROR] Component reset process failed: $($_.Exception.Message)" -Level "Error"
     } finally {
         $result.Duration = (Get-Date) - $resetStart
     }
-    
+
     return $result
 }
 
@@ -6999,7 +6962,7 @@ function Show-WindowsUpdatePlan {
         Write-Host "`nSECURITY UPDATES ($($securityUpdates.Count)):" -ForegroundColor Red
         $securityUpdates | ForEach-Object {
             $sizeText = if ($_.Size) { " - $([math]::Round($_.Size / 1MB, 1)) MB" } else { "" }
-            Write-Host "  [RED] $($_.Title) ($(if ($_.KB -and $_.KB -ne 'N/A') { $_.KB } else { 'N/A' }))$sizeText" -ForegroundColor Red
+            Write-Host "  [RED] $($_.Title) (KB$($_.KB))$sizeText" -ForegroundColor Red
         }
     }
     
@@ -7007,7 +6970,7 @@ function Show-WindowsUpdatePlan {
         Write-Host "`nCRITICAL UPDATES ($($criticalUpdates.Count)):" -ForegroundColor Yellow
         $criticalUpdates | ForEach-Object {
             $sizeText = if ($_.Size) { " - $([math]::Round($_.Size / 1MB, 1)) MB" } else { "" }
-            Write-Host "  [YELLOW] $($_.Title) ($(if ($_.KB -and $_.KB -ne 'N/A') { $_.KB } else { 'N/A' }))$sizeText" -ForegroundColor Yellow
+            Write-Host "  [YELLOW] $($_.Title) (KB$($_.KB))$sizeText" -ForegroundColor Yellow
         }
     }
     
@@ -7015,7 +6978,7 @@ function Show-WindowsUpdatePlan {
         Write-Host "`nSTANDARD UPDATES ($($normalUpdates.Count)):" -ForegroundColor Green
         $normalUpdates | ForEach-Object {
             $sizeText = if ($_.Size) { " - $([math]::Round($_.Size / 1MB, 1)) MB" } else { "" }
-            Write-Host "  [GREEN] $($_.Title) ($(if ($_.KB -and $_.KB -ne 'N/A') { $_.KB } else { 'N/A' }))$sizeText" -ForegroundColor Green
+            Write-Host "  [GREEN] $($_.Title) (KB$($_.KB))$sizeText" -ForegroundColor Green
         }
     }
     
@@ -7029,256 +6992,6 @@ function Show-WindowsUpdatePlan {
     
     Write-Host "="*100 -ForegroundColor Cyan
 }
-
-
-function Get-NormalizedWindowsUpdateKb {
-    <#
-    .SYNOPSIS
-    Normalizes KB numbers from Windows Update result objects
-    #>
-    param(
-        [AllowNull()]
-        [object]$KBValue,
-
-        [AllowNull()]
-        [string]$Title
-    )
-
-    $kbText = $null
-
-    if ($null -ne $KBValue) {
-        try {
-            if ($KBValue -is [System.Collections.IEnumerable] -and -not ($KBValue -is [string])) {
-                $kbItems = @($KBValue | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
-                if ($kbItems.Count -gt 0) {
-                    $kbText = [string]$kbItems[0]
-                }
-            } else {
-                $kbText = [string]$KBValue
-            }
-        } catch {
-            $kbText = $null
-        }
-    }
-
-    if ([string]::IsNullOrWhiteSpace($kbText) -or $kbText -eq 'KB' -or $kbText -like '*N/A*') {
-        $kbText = $null
-    }
-
-    if ($kbText -and $kbText -match '^KBKB(\d+)$') {
-        $kbText = "KB$($Matches[1])"
-    } elseif ($kbText -and $kbText -match '^(?:KB)?(\d{6,8})$') {
-        $kbText = "KB$($Matches[1])"
-    }
-
-    if (-not $kbText -and -not [string]::IsNullOrWhiteSpace($Title)) {
-        $kbMatch = [regex]::Match($Title, 'KB\d{6,8}', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-        if ($kbMatch.Success) {
-            $kbText = $kbMatch.Value.ToUpper()
-        }
-    }
-
-    if (-not $kbText) {
-        $kbText = 'N/A'
-    }
-
-    return $kbText
-}
-
-function Get-WindowsUpdateResultState {
-    <#
-    .SYNOPSIS
-    Classifies Windows Update installation results into terminal and non-terminal states
-    #>
-    param(
-        [AllowNull()]
-        [string]$Status
-    )
-
-    if ([string]::IsNullOrWhiteSpace($Status)) {
-        return 'Unknown'
-    }
-
-    switch -Regex ($Status.Trim()) {
-        '^(Installed|Succeeded|Success)$' { return 'Installed' }
-        '^(Downloaded)$' { return 'Downloaded' }
-        '^(Accepted)$' { return 'Accepted' }
-        '^(NotApplicable|NoUpdates|AlreadyInstalled)$' { return 'Ignored' }
-        '^(Failed|Error|Aborted)$' { return 'Failed' }
-        default { return 'Unknown' }
-    }
-}
-
-function Merge-WindowsUpdateInstallationResults {
-    <#
-    .SYNOPSIS
-    De-duplicates Windows Update installation results and keeps the final terminal state
-    #>
-    param(
-        [Parameter(Mandatory)]
-        [array]$InstallationResults
-    )
-
-    $resultMap = @{}
-
-    foreach ($updateResult in $InstallationResults) {
-        if (-not $updateResult) { continue }
-
-        $title = "Unknown Update"
-        $kb = "N/A"
-        $size = 0
-        $categories = @()
-        $rebootRequired = $false
-        $status = "Unknown"
-        $isSecurity = $false
-        $failureReason = $null
-
-        try {
-            if ($updateResult.PSObject.Properties['Title'] -and $updateResult.Title) { $title = [string]$updateResult.Title }
-        } catch {}
-
-        try {
-            if ($updateResult.PSObject.Properties['KB']) { $kb = Get-NormalizedWindowsUpdateKb -KBValue $updateResult.KB -Title $title }
-            else { $kb = Get-NormalizedWindowsUpdateKb -KBValue $null -Title $title }
-        } catch {
-            $kb = Get-NormalizedWindowsUpdateKb -KBValue $null -Title $title
-        }
-
-        try {
-            if ($updateResult.PSObject.Properties['Size'] -and $null -ne $updateResult.Size) { $size = [long]$updateResult.Size }
-        } catch {}
-
-        try {
-            if ($updateResult.PSObject.Properties['Categories'] -and $updateResult.Categories) { $categories = @($updateResult.Categories) }
-        } catch {}
-
-        try {
-            if ($updateResult.PSObject.Properties['RebootRequired']) { $rebootRequired = [bool]$updateResult.RebootRequired }
-        } catch {}
-
-        try {
-            if ($updateResult.PSObject.Properties['Result'] -and $updateResult.Result) { $status = [string]$updateResult.Result }
-            elseif ($updateResult.PSObject.Properties['Status'] -and $updateResult.Status) { $status = [string]$updateResult.Status }
-        } catch {}
-
-        try {
-            if ($categories -and (($categories -join ' ') -match 'Security')) {
-                $isSecurity = $true
-            } elseif ($title -match 'Security|Defender|Cumulative Update') {
-                $isSecurity = $true
-            }
-        } catch {}
-
-        try {
-            if ($updateResult.PSObject.Properties['HResult'] -and $updateResult.HResult) {
-                $failureReason = ('0x{0:X8}' -f ([uint32]$updateResult.HResult))
-            }
-        } catch {}
-
-        if (-not $failureReason) {
-            $failureReason = $status
-        }
-
-        $identityKey = "{0}|{1}" -f $title, $kb
-
-        if (-not $resultMap.ContainsKey($identityKey)) {
-            $resultMap[$identityKey] = [ordered]@{
-                Title = $title
-                KB = $kb
-                Size = $size
-                IsSecurity = $isSecurity
-                RebootRequired = $rebootRequired
-                SeenAccepted = $false
-                SeenDownloaded = $false
-                Installed = $false
-                Failed = $false
-                FailureReason = $null
-            }
-        }
-
-        $entry = $resultMap[$identityKey]
-        if ($size -gt 0) { $entry.Size = $size }
-        if ($isSecurity) { $entry.IsSecurity = $true }
-        if ($rebootRequired) { $entry.RebootRequired = $true }
-
-        switch (Get-WindowsUpdateResultState -Status $status) {
-            'Accepted' {
-                $entry.SeenAccepted = $true
-            }
-            'Downloaded' {
-                $entry.SeenDownloaded = $true
-            }
-            'Installed' {
-                $entry.Installed = $true
-                $entry.Failed = $false
-                $entry.FailureReason = $null
-            }
-            'Failed' {
-                if (-not $entry.Installed) {
-                    $entry.Failed = $true
-                    $entry.FailureReason = $failureReason
-                }
-            }
-            default {
-                # Ignore informational or unknown states unless no terminal state is ever seen
-            }
-        }
-    }
-
-    $final = @{
-        Installed = @()
-        Failed = @()
-    }
-
-    foreach ($entry in $resultMap.Values) {
-        $processedResult = @{
-            Title = $entry.Title
-            KB = $entry.KB
-            Size = $entry.Size
-            IsSecurity = $entry.IsSecurity
-            RebootRequired = $entry.RebootRequired
-            Status = if ($entry.Installed) { 'Installed' } elseif ($entry.Failed) { 'Failed' } elseif ($entry.SeenDownloaded) { 'Downloaded' } elseif ($entry.SeenAccepted) { 'Accepted' } else { 'Unknown' }
-            FailureReason = $entry.FailureReason
-        }
-
-        if ($entry.Installed) {
-            $final.Installed += $processedResult
-        } elseif ($entry.Failed) {
-            $final.Failed += $processedResult
-        }
-    }
-
-    return $final
-}
-
-function Test-BenignPostUpdateEvent {
-    <#
-    .SYNOPSIS
-    Filters out known benign events from post-update validation noise
-    #>
-    param(
-        [Parameter(Mandatory)]
-        [System.Diagnostics.Eventing.Reader.EventRecord]$EventRecord
-    )
-
-    try {
-        $message = ''
-        try { $message = [string]$EventRecord.Message } catch {}
-
-        if ($EventRecord.Id -eq 3095 -and $message -match 'member of a workgroup' -and $message -match 'Netlogon service does not need to run') {
-            return $true
-        }
-
-        if ($EventRecord.Id -eq 30 -and $message -match 'Microsoft-Windows-Kernel-ShimEngine/Operational' -and $message -match 'does not affect') {
-            return $true
-        }
-    } catch {
-        return $false
-    }
-
-    return $false
-}
-
 
 function Install-WindowsUpdatesSecurely {
     <#
@@ -7575,39 +7288,66 @@ function Install-WindowsUpdatesSecurely {
         # Clean up the job
         Remove-Job $installJob -Force -ErrorAction SilentlyContinue
         
-        # Process results with de-duplication and terminal-state handling
+        # Process results with safe property access
         if ($installationResults) {
             Write-Host "[SUMMARY] Processing $($installationResults.Count) installation results..." -ForegroundColor Cyan
-
-            try {
-                $mergedResults = Merge-WindowsUpdateInstallationResults -InstallationResults @($installationResults)
-
-                foreach ($installedUpdate in @($mergedResults.Installed)) {
-                    $result.Installed += $installedUpdate
-
-                    if ($installedUpdate.IsSecurity) {
-                        $result.SecurityUpdates += $installedUpdate
+            
+            $processedCount = 0
+            foreach ($updateResult in $installationResults) {
+                $processedCount++
+                Write-Progress -Activity "Processing Results" -Status "Update $processedCount of $($installationResults.Count)" -PercentComplete (($processedCount / $installationResults.Count) * 100)
+                
+                try {
+                    # Safe property access with null checks
+                    $title = if ($updateResult.PSObject.Properties['Title']) { $updateResult.Title } else { "Unknown Update" }
+                    $kb = if ($updateResult.PSObject.Properties['KB']) { $updateResult.KB } else { "N/A" }
+                    $size = if ($updateResult.PSObject.Properties['Size']) { $updateResult.Size } else { 0 }
+                    $status = if ($updateResult.PSObject.Properties['Result']) { $updateResult.Result } else { "Unknown" }
+                    $categories = if ($updateResult.PSObject.Properties['Categories']) { $updateResult.Categories } else { @() }
+                    $rebootRequired = if ($updateResult.PSObject.Properties['RebootRequired']) { $updateResult.RebootRequired } else { $false }
+                    
+                    # Clean up KB number if it's duplicated
+                    if ($kb -match "^KBKB(\d+)$") {
+                        $kb = "KB$($Matches[1])"
+                    } elseif ($kb -eq "KB" -or [string]::IsNullOrEmpty($kb)) {
+                        $kb = "N/A"
                     }
-
-                    if ($installedUpdate.RebootRequired) {
-                        $result.RebootRequired = $true
+                    
+                    $processedResult = @{
+                        Title = $title
+                        KB = $kb
+                        Size = $size
+                        Status = $status
+                        IsSecurity = $categories -match 'Security'
+                        RebootRequired = $rebootRequired
                     }
-
-                    Write-StatusLog "[OK] Installed: $($installedUpdate.Title)" -Level "Success"
+                    
+                    # Categorize based on status
+                    if ($status -eq 'Installed' -or $status -eq 'Downloaded' -or $status -eq 'Succeeded') {
+                        $result.Installed += $processedResult
+                        
+                        if ($processedResult.IsSecurity) {
+                            $result.SecurityUpdates += $processedResult
+                        }
+                        
+                        if ($processedResult.RebootRequired) {
+                            $result.RebootRequired = $true
+                        }
+                        
+                        Write-StatusLog "[OK] Installed: $title" -Level "Success"
+                    } else {
+                        $result.Failed += $processedResult
+                        Write-StatusLog "[ERROR] Failed: $title - $status" -Level "Error"
+                    }
                 }
-
-                foreach ($failedUpdate in @($mergedResults.Failed)) {
-                    $result.Failed += $failedUpdate
-                    Write-StatusLog "[ERROR] Failed: $($failedUpdate.Title) - $($failedUpdate.FailureReason)" -Level "Error"
+                catch {
+                    $result.Errors += "Error processing update result: $($_.Exception.Message)"
+                    Write-StatusLog "[WARN] Error processing update result: $($_.Exception.Message)" -Level "Warning"
                 }
             }
-            catch {
-                $result.Errors += "Error processing update result: $($_.Exception.Message)"
-                Write-StatusLog "[WARN] Error processing update result: $($_.Exception.Message)" -Level "Warning"
-            }
-
+            
             Write-Progress -Activity "Processing Results" -Completed
-
+            
         } else {
             Write-StatusLog "[WARN] No installation results returned" -Level "Warning"
             $result.Errors += "No installation results returned from Install-WindowsUpdate"
@@ -7673,24 +7413,17 @@ function Test-PostUpdateSystemHealth {
         $systemDrive = Get-WmiObject -Class Win32_LogicalDisk | Where-Object { $_.DeviceID -eq $env:SystemDrive }
         $result.DiskSpaceAfter = [math]::Round($systemDrive.FreeSpace / 1GB, 2)
         
-        # Check recent event log errors (last 30 minutes) and filter known benign noise
+        # Check recent event log errors (last 30 minutes)
         $cutoffTime = (Get-Date).AddMinutes(-30)
         try {
-            $recentErrors = Get-WinEvent -FilterHashtable @{LogName='System'; Level=2; StartTime=$cutoffTime} -MaxEvents 25 -ErrorAction SilentlyContinue
+            $recentErrors = Get-WinEvent -FilterHashtable @{LogName='System'; Level=2; StartTime=$cutoffTime} -MaxEvents 10 -ErrorAction SilentlyContinue
             if ($recentErrors) {
-                $filteredErrors = @($recentErrors | Where-Object { -not (Test-BenignPostUpdateEvent -EventRecord $_) })
-                if ($filteredErrors.Count -gt 0) {
-                    $result.EventLogErrors = $filteredErrors | Select-Object -First 10 | ForEach-Object {
-                        $eventMessage = ''
-                        try { $eventMessage = [string]$_.Message } catch {}
-                        if ([string]::IsNullOrWhiteSpace($eventMessage)) { $eventMessage = 'No event message available.' }
-
-                        @{
-                            TimeCreated = $_.TimeCreated
-                            Id = $_.Id
-                            LevelDisplayName = $_.LevelDisplayName
-                            Message = $eventMessage.Substring(0, [Math]::Min(200, $eventMessage.Length))
-                        }
+                $result.EventLogErrors = $recentErrors | ForEach-Object { 
+                    @{
+                        TimeCreated = $_.TimeCreated
+                        Id = $_.Id
+                        LevelDisplayName = $_.LevelDisplayName
+                        Message = $_.Message.Substring(0, [Math]::Min(200, $_.Message.Length))
                     }
                 }
             }
