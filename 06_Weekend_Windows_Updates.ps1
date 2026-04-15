@@ -1,6 +1,6 @@
 # =====================================================================
 # ScriptName: 06_Weekend_Windows_Updates.ps1
-# ScriptVersion: 1.4
+# ScriptVersion: 1.5
 # LastUpdated: 2026-04-15
 # Purpose: Installs Windows Updates using PSWindowsUpdate, writes a
 #          YAML audit log in C:\Logs, and explicitly reboots if Windows
