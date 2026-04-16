@@ -1,5 +1,5 @@
-# ScriptVersion: 1.5
-# LastUpdated: 2026-04-03
+# ScriptVersion: 2.0
+# LastUpdated: 2026-04-16
 
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Low')]
 param(
@@ -230,7 +230,7 @@ if (-not (Test-IsAdministrator)) {
 }
 
 $taskDefinitions = @(
-    [pscustomobject]@{ Name = '01. Check for Updated Scripts';          Script = (Join-Path $ScriptsRoot '00_Update-Scripts-FromGitHub.ps1');       Time = '01:15'; Args = '' },
+    [pscustomobject]@{ Name = '01. Check for Updated Scripts';          Script = (Join-Path $ScriptsRoot '00_Update-Scripts-FromShare.ps1');       Time = '01:15'; Args = '' },
     [pscustomobject]@{ Name = '02. Enable Windows Update Services';     Script = (Join-Path $ScriptsRoot '01_Enable_Windows_Update_Services.ps1');  Time = '01:20'; Args = '' },
     [pscustomobject]@{ Name = '03. Remove User Profiles Weekly';        Script = (Join-Path $ScriptsRoot '02_Remove_User_Profiles.ps1');            Time = '01:30'; Args = '' },
     [pscustomobject]@{ Name = '04. Weekend Apps Update';                Script = (Join-Path $ScriptsRoot '03_Weekend_Apps_Update.ps1');             Time = '02:00'; Args = '' },
