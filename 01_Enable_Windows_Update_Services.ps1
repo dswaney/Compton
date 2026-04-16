@@ -1,6 +1,6 @@
 # =====================================================================
 # ScriptName: 01_Enable_Windows_Update_Services.ps1
-# ScriptVersion: 1.4
+# ScriptVersion: 1.5
 # LastUpdated: 2026-04-16
 # Purpose: Restore Windows Update services, tasks, and policy settings
 #          on Windows 11, verify required services are running, retry
@@ -282,6 +282,94 @@ function Set-RegistryDwordSafe {
     }
 }
 
+function Ensure-ShareScriptUpdater {
+    param(
+        [string]$SourcePath = '\\filesvr\Labscripts\00_Update-Scripts-FromShare.ps1',
+        [string]$DestinationFolder = 'C:\Scripts',
+        [string]$DestinationFileName = '00_Update-Scripts-FromShare.ps1'
+    )
+
+    try {
+        if (-not (Test-Path -LiteralPath $SourcePath)) {
+            throw "Source updater script not found: $SourcePath"
+        }
+
+        if (-not (Test-Path -LiteralPath $DestinationFolder)) {
+            New-Item -Path $DestinationFolder -ItemType Directory -Force | Out-Null
+            Write-Status "Created destination folder: $DestinationFolder" 'OK'
+        }
+
+        $destinationPath = Join-Path $DestinationFolder $DestinationFileName
+        Copy-Item -LiteralPath $SourcePath -Destination $destinationPath -Force
+        Write-Status "Copied updater script to: $destinationPath" 'OK'
+
+        try {
+            Unblock-File -LiteralPath $destinationPath -ErrorAction SilentlyContinue
+        }
+        catch {
+        }
+
+        return $destinationPath
+    }
+    catch {
+        Write-Status "Failed to stage share updater script: $($_.Exception.Message)" 'ERROR'
+        return $null
+    }
+}
+
+function Update-CheckForUpdatedScriptsTask {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ScriptPath,
+
+        [string]$TaskName = '01. Check for Updated Scripts'
+    )
+
+    try {
+        $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+    }
+    catch {
+        Write-Status "Scheduled task not found: $TaskName" 'WARN'
+        return $false
+    }
+
+    try {
+        $existingAction = $task.Actions | Select-Object -First 1
+        if ($null -eq $existingAction) {
+            throw 'Scheduled task has no executable action to modify.'
+        }
+
+        $newArguments = "-NoProfile -ExecutionPolicy Bypass -File `"$ScriptPath`""
+        $updatedAction = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $newArguments
+
+        $registerParams = @{
+            TaskName = $task.TaskName
+            Action   = $updatedAction
+            Settings = $task.Settings
+        }
+
+        if ($null -ne $task.Description) {
+            $registerParams['Description'] = $task.Description
+        }
+
+        if ($null -ne $task.Triggers -and $task.Triggers.Count -gt 0) {
+            $registerParams['Trigger'] = $task.Triggers
+        }
+
+        if ($null -ne $task.Principal) {
+            $registerParams['Principal'] = $task.Principal
+        }
+
+        Register-ScheduledTask @registerParams -Force | Out-Null
+        Write-Status "Updated scheduled task '$TaskName' to run: $ScriptPath" 'OK'
+        return $true
+    }
+    catch {
+        Write-Status "Failed to update scheduled task '$TaskName' : $($_.Exception.Message)" 'ERROR'
+        return $false
+    }
+}
+
 if (-not (Test-IsAdmin)) {
     Write-Host ""
     Write-Host "This script must be run as Administrator." -ForegroundColor Red
@@ -289,6 +377,11 @@ if (-not (Test-IsAdmin)) {
 }
 
 Write-Status "Initializing script..." 'INFO'
+$shareUpdaterPath = Ensure-ShareScriptUpdater
+if ($shareUpdaterPath) {
+    [void](Update-CheckForUpdatedScriptsTask -ScriptPath $shareUpdaterPath)
+}
+
 # Restore registry startup values first
 # Common defaults used for Windows Update-related services:
 # wuauserv = Manual (3)
