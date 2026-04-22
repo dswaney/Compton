@@ -1,6 +1,6 @@
 # =====================================================================
 # ScriptName: Compton_Tech_Utils.ps1
-# ScriptVersion: 1.9.1
+# ScriptVersion: 1.9.2
 # LastUpdated: 2026-04-22
 # =====================================================================
 
@@ -10052,6 +10052,27 @@ function Set-DesktopPowerSettings {
         $configResults = @()
         $monitorSeconds = $MonitorTimeout * 60
 
+        function Invoke-HardPowerEnforcement {
+            param(
+                [string]$ActiveSchemeGUID,
+                [int]$DisplayMinutes,
+                [int]$SleepMinutes
+            )
+
+            $displaySeconds = $DisplayMinutes * 60
+            Invoke-PowerCfg -Arguments @('/setactive', $ActiveSchemeGUID) -Description 'Ensure target power scheme is active before hard enforcement' | Out-Null
+            Invoke-PowerCfg -Arguments @('/change', 'monitor-timeout-ac', $DisplayMinutes) -Description 'Hard enforce AC monitor timeout' | Out-Null
+            Invoke-PowerCfg -Arguments @('/change', 'monitor-timeout-dc', $DisplayMinutes) -Description 'Hard enforce DC monitor timeout' | Out-Null
+            Invoke-PowerCfg -Arguments @('/change', 'standby-timeout-ac', $SleepMinutes) -Description 'Hard enforce AC sleep timeout' | Out-Null
+            Invoke-PowerCfg -Arguments @('/change', 'standby-timeout-dc', $SleepMinutes) -Description 'Hard enforce DC sleep timeout' | Out-Null
+            Invoke-PowerCfg -Arguments @('/setacvalueindex', $ActiveSchemeGUID, 'SUB_VIDEO', 'VIDEOIDLE', $displaySeconds) -Description 'Hard enforce AC display idle timeout index' | Out-Null
+            Invoke-PowerCfg -Arguments @('/setdcvalueindex', $ActiveSchemeGUID, 'SUB_VIDEO', 'VIDEOIDLE', $displaySeconds) -Description 'Hard enforce DC display idle timeout index' | Out-Null
+            Invoke-PowerCfg -Arguments @('/setacvalueindex', $ActiveSchemeGUID, 'SUB_SLEEP', 'STANDBYIDLE', $SleepMinutes) -Description 'Hard enforce AC sleep idle timeout index' | Out-Null
+            Invoke-PowerCfg -Arguments @('/setdcvalueindex', $ActiveSchemeGUID, 'SUB_SLEEP', 'STANDBYIDLE', $SleepMinutes) -Description 'Hard enforce DC sleep idle timeout index' | Out-Null
+            Invoke-PowerCfg -Arguments @('/hibernate', 'off') -Description 'Hard enforce hibernation off' | Out-Null
+            Invoke-PowerCfg -Arguments @('/S', $ActiveSchemeGUID) -Description 'Commit hard-enforced power settings' | Out-Null
+        }
+
         try {
             Write-LogEntry "Setting power scheme to: $SchemeName" 'INFO'
             if ($PSCmdlet.ShouldProcess($SchemeName, "Set active power scheme")) {
@@ -10134,6 +10155,18 @@ function Set-DesktopPowerSettings {
         } catch {
             $configResults += Add-Result -Setting 'Hibernation' -Value 'Disabled' -Success $false -Error $_.Exception.Message
             Write-LogEntry "[X] Failed to disable hibernation: $_" 'ERROR'
+        }
+
+        try {
+            Write-LogEntry 'Applying final hard enforcement pass to prevent old timeout values from being restored' 'INFO'
+            if ($PSCmdlet.ShouldProcess($SchemeName, 'Hard enforce desktop power values')) {
+                Invoke-HardPowerEnforcement -ActiveSchemeGUID $SchemeGUID -DisplayMinutes $MonitorTimeout -SleepMinutes $SleepTimeout
+                $configResults += Add-Result -Setting 'Hard Enforcement Pass' -Value 'Completed'
+                Write-LogEntry '[OK] Final hard enforcement pass completed' 'SUCCESS'
+            }
+        } catch {
+            $configResults += Add-Result -Setting 'Hard Enforcement Pass' -Value 'Completed' -Success $false -Error $_.Exception.Message
+            Write-LogEntry "[X] Failed final hard enforcement pass: $_" 'ERROR'
         }
 
         try {
