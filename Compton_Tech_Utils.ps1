@@ -1,7 +1,7 @@
 # =====================================================================
 # ScriptName: Compton_Tech_Utils.ps1
-# ScriptVersion: 1.9.0
-# LastUpdated: 2026-04-15
+# ScriptVersion: 1.9.1
+# LastUpdated: 2026-04-22
 # =====================================================================
 
 # -----------------------------------------------------------------------------
@@ -9827,11 +9827,13 @@ function Set-DesktopPowerSettings {
         [ValidateRange(1, 600)]
         [int]$MonitorTimeoutMinutes = 60,
         
-        [ValidateRange(1, 600)]
+        [ValidateRange(0, 600)]
         [int]$DiskTimeoutMinutes = 0,  # 0 = Never
+
+        [ValidateRange(0, 600)]
+        [int]$SleepTimeoutMinutes = 0, # 0 = Never
         
         [switch]$Force,
-        # Removed [switch]$WhatIf - this is automatically provided by SupportsShouldProcess
         [switch]$AllowLaptops,
         [string]$LogPath = "$env:TEMP\PowerSettings_$(Get-Date -Format 'yyyyMMdd_HHmmss').log",
         [switch]$SkipHardwareDetection
@@ -9843,7 +9845,7 @@ function Set-DesktopPowerSettings {
     }
 
     $ErrorActionPreference = 'Continue'
-    $ProgressPreference = 'SilentlyContinue'  # Speed: Disable progress bars
+    $ProgressPreference = 'SilentlyContinue'
     
     # Initialize tracking
     $logEntries = @()
@@ -9866,10 +9868,46 @@ function Set-DesktopPowerSettings {
         }
     }
 
+    function Invoke-PowerCfg {
+        param(
+            [Parameter(Mandatory)][string[]]$Arguments,
+            [Parameter(Mandatory)][string]$Description
+        )
+
+        $result = & powercfg.exe @Arguments 2>&1
+        $exitCode = $LASTEXITCODE
+        if ($exitCode -ne 0) {
+            $resultText = if ($result) { ($result | Out-String).Trim() } else { 'No output returned.' }
+            throw "$Description failed (ExitCode=$exitCode): $resultText"
+        }
+
+        return $result
+    }
+
+    function Add-Result {
+        param(
+            [Parameter(Mandatory)][string]$Setting,
+            [Parameter(Mandatory)][string]$Value,
+            [bool]$Success = $true,
+            [string]$Error = $null
+        )
+
+        $entry = [ordered]@{
+            Setting = $Setting
+            Value   = $Value
+            Success = $Success
+        }
+
+        if (-not $Success -and $Error) {
+            $entry.Error = $Error
+        }
+
+        return [pscustomobject]$entry
+    }
+
     # Speed: Hardware detection with caching
     function Get-SystemHardwareType {
         try {
-            # Use CIM for faster queries
             $computerSystem = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
             $battery = Get-CimInstance -ClassName Win32_Battery -ErrorAction SilentlyContinue
             $systemEnclosure = Get-CimInstance -ClassName Win32_SystemEnclosure -ErrorAction SilentlyContinue
@@ -9887,14 +9925,12 @@ function Set-DesktopPowerSettings {
                 Model = $computerSystem.Model
             }
             
-            # Determine system type based on multiple factors
             if ($systemEnclosure) {
                 $hardwareInfo.ChassisTypes = $systemEnclosure.ChassisTypes
                 
-                # Chassis type detection (more reliable than PCSystemType)
-                $laptopChassisTypes = @(8, 9, 10, 11, 12, 14, 18, 21, 30, 31, 32)  # Laptop variants
-                $desktopChassisTypes = @(3, 4, 5, 6, 7, 15, 16)  # Desktop variants
-                $serverChassisTypes = @(17, 23)  # Server variants
+                $laptopChassisTypes = @(8, 9, 10, 11, 12, 14, 18, 21, 30, 31, 32)
+                $desktopChassisTypes = @(3, 4, 5, 6, 7, 15, 16)
+                $serverChassisTypes = @(17, 23)
                 
                 if ($systemEnclosure.ChassisTypes | Where-Object { $_ -in $laptopChassisTypes }) {
                     $hardwareInfo.IsLaptop = $true
@@ -9907,18 +9943,16 @@ function Set-DesktopPowerSettings {
                 }
             }
             
-            # Fallback to PCSystemType if chassis detection inconclusive
             if (-not ($hardwareInfo.IsLaptop -or $hardwareInfo.IsDesktop -or $hardwareInfo.IsServer)) {
                 switch ($computerSystem.PCSystemType) {
                     1 { $hardwareInfo.IsDesktop = $true }
                     2 { $hardwareInfo.IsLaptop = $true }
                     3 { $hardwareInfo.IsWorkstation = $true }
                     4 { $hardwareInfo.IsServer = $true }
-                    default { $hardwareInfo.IsDesktop = $true }  # Default assumption
+                    default { $hardwareInfo.IsDesktop = $true }
                 }
             }
             
-            # Battery presence overrides chassis detection for laptops
             if ($hardwareInfo.HasBattery -and -not $hardwareInfo.IsServer) {
                 $hardwareInfo.IsLaptop = $true
                 $hardwareInfo.IsDesktop = $false
@@ -9930,18 +9964,15 @@ function Set-DesktopPowerSettings {
             Write-LogEntry "Hardware detection failed: $_" 'WARNING'
             return @{
                 IsLaptop = $false
-                IsDesktop = $true  # Safe default
+                IsDesktop = $true
                 Error = $_.Exception.Message
             }
         }
     }
 
-    # Speed: Get available power schemes efficiently
     function Get-PowerSchemes {
         try {
             $schemes = @{}
-            
-            # Parse powercfg output for available schemes
             $output = powercfg.exe /list 2>$null
             if ($LASTEXITCODE -eq 0 -and $output) {
                 foreach ($line in $output) {
@@ -9959,7 +9990,6 @@ function Set-DesktopPowerSettings {
                 }
             }
             
-            # Add common scheme mappings if not found
             $commonSchemes = @{
                 'High Performance' = 'SCHEME_MIN'
                 'Balanced' = 'SCHEME_BALANCED'
@@ -9985,7 +10015,6 @@ function Set-DesktopPowerSettings {
         }
     }
 
-    # Security: Backup current power settings
     function Backup-PowerSettings {
         try {
             $backupData = @{
@@ -9993,6 +10022,8 @@ function Set-DesktopPowerSettings {
                 HibernationStatus = (powercfg.exe /query SCHEME_CURRENT SUB_SLEEP HIBERNATEIDLE 2>$null)
                 MonitorTimeoutAC = (powercfg.exe /query SCHEME_CURRENT SUB_VIDEO VIDEOIDLE /AC 2>$null)
                 MonitorTimeoutDC = (powercfg.exe /query SCHEME_CURRENT SUB_VIDEO VIDEOIDLE /DC 2>$null)
+                SleepTimeoutAC = (powercfg.exe /query SCHEME_CURRENT SUB_SLEEP STANDBYIDLE /AC 2>$null)
+                SleepTimeoutDC = (powercfg.exe /query SCHEME_CURRENT SUB_SLEEP STANDBYIDLE /DC 2>$null)
                 DiskTimeoutAC = (powercfg.exe /query SCHEME_CURRENT SUB_DISK DISKIDLE /AC 2>$null)
                 DiskTimeoutDC = (powercfg.exe /query SCHEME_CURRENT SUB_DISK DISKIDLE /DC 2>$null)
                 Timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
@@ -10009,257 +10040,207 @@ function Set-DesktopPowerSettings {
         }
     }
 
-    # Speed: Execute power configuration commands
     function Set-PowerConfiguration {
         param(
             [string]$SchemeName,
             [string]$SchemeGUID,
             [int]$MonitorTimeout,
-            [int]$DiskTimeout
+            [int]$DiskTimeout,
+            [int]$SleepTimeout
         )
         
         $configResults = @()
-        
-        # Set power scheme
+        $monitorSeconds = $MonitorTimeout * 60
+
         try {
             Write-LogEntry "Setting power scheme to: $SchemeName" 'INFO'
-            
             if ($PSCmdlet.ShouldProcess($SchemeName, "Set active power scheme")) {
-                $result = powercfg.exe /setactive $SchemeGUID 2>&1
-                if ($LASTEXITCODE -eq 0) {
-                    $configResults += @{
-                        Setting = "Power Scheme"
-                        Value = $SchemeName
-                        Success = $true
-                    }
-                    Write-LogEntry "[OK] Power scheme set to: $SchemeName" 'SUCCESS'
-                } else {
-                    throw "Failed to set power scheme: $result"
-                }
+                Invoke-PowerCfg -Arguments @('/setactive', $SchemeGUID) -Description "Set power scheme to $SchemeName" | Out-Null
+                $configResults += Add-Result -Setting 'Power Scheme' -Value $SchemeName
+                Write-LogEntry "[OK] Power scheme set to: $SchemeName" 'SUCCESS'
             }
         } catch {
-            $configResults += @{
-                Setting = "Power Scheme"
-                Value = $SchemeName
-                Success = $false
-                Error = $_.Exception.Message
-            }
+            $configResults += Add-Result -Setting 'Power Scheme' -Value $SchemeName -Success $false -Error $_.Exception.Message
             Write-LogEntry "[X] Failed to set power scheme: $_" 'ERROR'
         }
-        
-        # Configure monitor timeout
+
         try {
             Write-LogEntry "Setting monitor timeout to: $MonitorTimeout minutes" 'INFO'
-            
-            if ($PSCmdlet.ShouldProcess("Monitor Timeout", "Set to $MonitorTimeout minutes")) {
-                # Set for both AC and DC power
-                $resultAC = powercfg.exe /change monitor-timeout-ac $MonitorTimeout 2>&1
-                $resultDC = powercfg.exe /change monitor-timeout-dc $MonitorTimeout 2>&1
-                
-                if ($LASTEXITCODE -eq 0) {
-                    $configResults += @{
-                        Setting = "Monitor Timeout"
-                        Value = "$MonitorTimeout minutes"
-                        Success = $true
-                    }
-                    Write-LogEntry "[OK] Monitor timeout set to: $MonitorTimeout minutes" 'SUCCESS'
-                } else {
-                    throw "Failed to set monitor timeout: AC=$resultAC, DC=$resultDC"
-                }
+            if ($PSCmdlet.ShouldProcess('Monitor Timeout', "Set to $MonitorTimeout minutes")) {
+                Invoke-PowerCfg -Arguments @('/change', 'monitor-timeout-ac', $MonitorTimeout) -Description 'Set AC monitor timeout' | Out-Null
+                Invoke-PowerCfg -Arguments @('/change', 'monitor-timeout-dc', $MonitorTimeout) -Description 'Set DC monitor timeout' | Out-Null
+                Invoke-PowerCfg -Arguments @('/setacvalueindex', $SchemeGUID, 'SUB_VIDEO', 'VIDEOIDLE', $monitorSeconds) -Description 'Force AC display idle timeout' | Out-Null
+                Invoke-PowerCfg -Arguments @('/setdcvalueindex', $SchemeGUID, 'SUB_VIDEO', 'VIDEOIDLE', $monitorSeconds) -Description 'Force DC display idle timeout' | Out-Null
+                $configResults += Add-Result -Setting 'Monitor Timeout' -Value "$MonitorTimeout minutes"
+                Write-LogEntry "[OK] Monitor timeout set to: $MonitorTimeout minutes" 'SUCCESS'
             }
         } catch {
-            $configResults += @{
-                Setting = "Monitor Timeout"
-                Value = "$MonitorTimeout minutes"
-                Success = $false
-                Error = $_.Exception.Message
-            }
+            $configResults += Add-Result -Setting 'Monitor Timeout' -Value "$MonitorTimeout minutes" -Success $false -Error $_.Exception.Message
             Write-LogEntry "[X] Failed to set monitor timeout: $_" 'ERROR'
         }
+
+        try {
+            $sleepLabel = if ($SleepTimeout -eq 0) { 'Never' } else { "$SleepTimeout minutes" }
+            Write-LogEntry "Setting sleep timeout to: $sleepLabel" 'INFO'
+            if ($PSCmdlet.ShouldProcess('Sleep Timeout', "Set to $sleepLabel")) {
+                Invoke-PowerCfg -Arguments @('/change', 'standby-timeout-ac', $SleepTimeout) -Description 'Set AC sleep timeout' | Out-Null
+                Invoke-PowerCfg -Arguments @('/change', 'standby-timeout-dc', $SleepTimeout) -Description 'Set DC sleep timeout' | Out-Null
+                Invoke-PowerCfg -Arguments @('/setacvalueindex', $SchemeGUID, 'SUB_SLEEP', 'STANDBYIDLE', $SleepTimeout) -Description 'Force AC sleep idle timeout' | Out-Null
+                Invoke-PowerCfg -Arguments @('/setdcvalueindex', $SchemeGUID, 'SUB_SLEEP', 'STANDBYIDLE', $SleepTimeout) -Description 'Force DC sleep idle timeout' | Out-Null
+                $configResults += Add-Result -Setting 'Sleep Timeout' -Value $sleepLabel
+                Write-LogEntry "[OK] Sleep timeout set to: $sleepLabel" 'SUCCESS'
+            }
+        } catch {
+            $sleepValue = if ($SleepTimeout -eq 0) { 'Never' } else { "$SleepTimeout minutes" }
+            $configResults += Add-Result -Setting 'Sleep Timeout' -Value $sleepValue -Success $false -Error $_.Exception.Message
+            Write-LogEntry "[X] Failed to set sleep timeout: $_" 'ERROR'
+        }
         
-        # Configure disk timeout
         if ($DiskTimeout -eq 0) {
             try {
                 Write-LogEntry "Disabling disk timeout (never turn off)" 'INFO'
-                
-                if ($PSCmdlet.ShouldProcess("Disk Timeout", "Disable")) {
-                    $resultAC = powercfg.exe /change disk-timeout-ac 0 2>&1
-                    $resultDC = powercfg.exe /change disk-timeout-dc 0 2>&1
-                    
-                    if ($LASTEXITCODE -eq 0) {
-                        $configResults += @{
-                            Setting = "Disk Timeout"
-                            Value = "Disabled"
-                            Success = $true
-                        }
-                        Write-LogEntry "[OK] Disk timeout disabled" 'SUCCESS'
-                    } else {
-                        throw "Failed to disable disk timeout: AC=$resultAC, DC=$resultDC"
-                    }
+                if ($PSCmdlet.ShouldProcess('Disk Timeout', 'Disable')) {
+                    Invoke-PowerCfg -Arguments @('/change', 'disk-timeout-ac', 0) -Description 'Disable AC disk timeout' | Out-Null
+                    Invoke-PowerCfg -Arguments @('/change', 'disk-timeout-dc', 0) -Description 'Disable DC disk timeout' | Out-Null
+                    $configResults += Add-Result -Setting 'Disk Timeout' -Value 'Disabled'
+                    Write-LogEntry "[OK] Disk timeout disabled" 'SUCCESS'
                 }
             } catch {
-                $configResults += @{
-                    Setting = "Disk Timeout"
-                    Value = "Disabled"
-                    Success = $false
-                    Error = $_.Exception.Message
-                }
+                $configResults += Add-Result -Setting 'Disk Timeout' -Value 'Disabled' -Success $false -Error $_.Exception.Message
                 Write-LogEntry "[X] Failed to disable disk timeout: $_" 'ERROR'
             }
         } else {
             try {
                 Write-LogEntry "Setting disk timeout to: $DiskTimeout minutes" 'INFO'
-                
-                if ($PSCmdlet.ShouldProcess("Disk Timeout", "Set to $DiskTimeout minutes")) {
-                    $resultAC = powercfg.exe /change disk-timeout-ac $DiskTimeout 2>&1
-                    $resultDC = powercfg.exe /change disk-timeout-dc $DiskTimeout 2>&1
-                    
-                    if ($LASTEXITCODE -eq 0) {
-                        $configResults += @{
-                            Setting = "Disk Timeout"
-                            Value = "$DiskTimeout minutes"
-                            Success = $true
-                        }
-                        Write-LogEntry "[OK] Disk timeout set to: $DiskTimeout minutes" 'SUCCESS'
-                    } else {
-                        throw "Failed to set disk timeout: AC=$resultAC, DC=$resultDC"
-                    }
+                if ($PSCmdlet.ShouldProcess('Disk Timeout', "Set to $DiskTimeout minutes")) {
+                    Invoke-PowerCfg -Arguments @('/change', 'disk-timeout-ac', $DiskTimeout) -Description 'Set AC disk timeout' | Out-Null
+                    Invoke-PowerCfg -Arguments @('/change', 'disk-timeout-dc', $DiskTimeout) -Description 'Set DC disk timeout' | Out-Null
+                    $configResults += Add-Result -Setting 'Disk Timeout' -Value "$DiskTimeout minutes"
+                    Write-LogEntry "[OK] Disk timeout set to: $DiskTimeout minutes" 'SUCCESS'
                 }
             } catch {
-                $configResults += @{
-                    Setting = "Disk Timeout"
-                    Value = "$DiskTimeout minutes"
-                    Success = $false
-                    Error = $_.Exception.Message
-                }
+                $configResults += Add-Result -Setting 'Disk Timeout' -Value "$DiskTimeout minutes" -Success $false -Error $_.Exception.Message
                 Write-LogEntry "[X] Failed to set disk timeout: $_" 'ERROR'
             }
         }
-        
-        # Disable hibernation
+
         try {
-            Write-LogEntry "Disabling hibernation" 'INFO'
-            
-            if ($PSCmdlet.ShouldProcess("Hibernation", "Disable")) {
-                $result = powercfg.exe /hibernate off 2>&1
-                if ($LASTEXITCODE -eq 0) {
-                    $configResults += @{
-                        Setting = "Hibernation"
-                        Value = "Disabled"
-                        Success = $true
-                    }
-                    Write-LogEntry "[OK] Hibernation disabled" 'SUCCESS'
-                } else {
-                    throw "Failed to disable hibernation: $result"
-                }
+            Write-LogEntry 'Disabling hibernation' 'INFO'
+            if ($PSCmdlet.ShouldProcess('Hibernation', 'Disable')) {
+                Invoke-PowerCfg -Arguments @('/hibernate', 'off') -Description 'Disable hibernation' | Out-Null
+                $configResults += Add-Result -Setting 'Hibernation' -Value 'Disabled'
+                Write-LogEntry '[OK] Hibernation disabled' 'SUCCESS'
             }
         } catch {
-            $configResults += @{
-                Setting = "Hibernation"
-                Value = "Disabled"
-                Success = $false
-                Error = $_.Exception.Message
-            }
+            $configResults += Add-Result -Setting 'Hibernation' -Value 'Disabled' -Success $false -Error $_.Exception.Message
             Write-LogEntry "[X] Failed to disable hibernation: $_" 'ERROR'
+        }
+
+        try {
+            Write-LogEntry 'Reapplying active power scheme to commit all values' 'INFO'
+            if ($PSCmdlet.ShouldProcess($SchemeName, 'Reapply active power scheme')) {
+                Invoke-PowerCfg -Arguments @('/S', $SchemeGUID) -Description 'Reapply active power scheme' | Out-Null
+                $configResults += Add-Result -Setting 'Scheme Reapply' -Value 'Completed'
+                Write-LogEntry '[OK] Active power scheme reapplied' 'SUCCESS'
+            }
+        } catch {
+            $configResults += Add-Result -Setting 'Scheme Reapply' -Value 'Completed' -Success $false -Error $_.Exception.Message
+            Write-LogEntry "[X] Failed to reapply active power scheme: $_" 'ERROR'
         }
         
         return $configResults
     }
 
     try {
-        Write-LogEntry "=== Desktop Power Settings Configuration Started ===" 'INFO'
+        Write-LogEntry '=== Desktop Power Settings Configuration Started ===' 'INFO'
         Write-LogEntry "Power Plan: $PowerPlan" 'INFO'
         Write-LogEntry "Monitor Timeout: $MonitorTimeoutMinutes minutes" 'INFO'
+        Write-LogEntry "Sleep Timeout: $(if($SleepTimeoutMinutes -eq 0){'Never'}else{"$SleepTimeoutMinutes minutes"})" 'INFO'
         Write-LogEntry "Disk Timeout: $(if($DiskTimeoutMinutes -eq 0){'Disabled'}else{"$DiskTimeoutMinutes minutes"})" 'INFO'
         
         if ($WhatIfPreference) {
-            Write-LogEntry "WhatIf mode - no power settings will be changed" 'INFO'
+            Write-LogEntry 'WhatIf mode - no power settings will be changed' 'INFO'
         }
 
-        # Hardware detection and validation
         if (-not $SkipHardwareDetection) {
             Write-LogEntry "`n[SCAN] Detecting system hardware type..." 'HARDWARE'
             $hardwareInfo = Get-SystemHardwareType
             
-            Write-LogEntry "Hardware Analysis:" 'HARDWARE'
+            Write-LogEntry 'Hardware Analysis:' 'HARDWARE'
             Write-LogEntry "  - System Type: $(if($hardwareInfo.IsLaptop){'Laptop'}elseif($hardwareInfo.IsDesktop){'Desktop'}elseif($hardwareInfo.IsServer){'Server'}else{'Workstation'})" 'HARDWARE'
             Write-LogEntry "  - Has Battery: $($hardwareInfo.HasBattery)" 'HARDWARE'
             Write-LogEntry "  - Manufacturer: $($hardwareInfo.Manufacturer)" 'HARDWARE'
             Write-LogEntry "  - Model: $($hardwareInfo.Model)" 'HARDWARE'
             Write-LogEntry "  - Memory: $($hardwareInfo.TotalPhysicalMemory) GB" 'HARDWARE'
             
-            # Security: Prevent accidental laptop configuration
             if ($hardwareInfo.IsLaptop -and -not $AllowLaptops -and -not $Force) {
                 Write-Host "`n" + "="*60 -ForegroundColor Red
-                Write-Host "LAPTOP DETECTED - OPERATION BLOCKED" -ForegroundColor Red -BackgroundColor Black
+                Write-Host 'LAPTOP DETECTED - OPERATION BLOCKED' -ForegroundColor Red -BackgroundColor Black
                 Write-Host "="*60 -ForegroundColor Red
-                Write-Host "This system appears to be a LAPTOP with battery power." -ForegroundColor Yellow
-                Write-Host "Desktop power settings may negatively impact battery life!" -ForegroundColor Yellow
+                Write-Host 'This system appears to be a LAPTOP with battery power.' -ForegroundColor Yellow
+                Write-Host 'Desktop power settings may negatively impact battery life!' -ForegroundColor Yellow
                 Write-Host "`nTo proceed anyway, use one of these options:" -ForegroundColor Cyan
-                Write-Host "  - Use -AllowLaptops parameter" -ForegroundColor Cyan
-                Write-Host "  - Use -Force parameter" -ForegroundColor Cyan
-                Write-Host "  - Use -SkipHardwareDetection parameter" -ForegroundColor Cyan
+                Write-Host '  - Use -AllowLaptops parameter' -ForegroundColor Cyan
+                Write-Host '  - Use -Force parameter' -ForegroundColor Cyan
+                Write-Host '  - Use -SkipHardwareDetection parameter' -ForegroundColor Cyan
                 Write-Host "="*60 -ForegroundColor Red
                 
-                $global:LastStatus = "[WARN] Operation blocked - laptop detected."
+                $global:LastStatus = '[WARN] Operation blocked - laptop detected.'
                 return
             }
             
             if ($hardwareInfo.IsLaptop -and ($AllowLaptops -or $Force)) {
-                Write-LogEntry "[WARN] Proceeding with laptop configuration (overridden)" 'WARNING'
+                Write-LogEntry '[WARN] Proceeding with laptop configuration (overridden)' 'WARNING'
             }
         }
 
-        # User confirmation for desktop systems
         if (-not $Force -and -not $WhatIfPreference) {
             Write-Host "`n" + "="*60 -ForegroundColor Yellow
-            Write-Host "POWER SETTINGS CONFIGURATION" -ForegroundColor Yellow -BackgroundColor Black
+            Write-Host 'POWER SETTINGS CONFIGURATION' -ForegroundColor Yellow -BackgroundColor Black
             Write-Host "="*60 -ForegroundColor Yellow
-            Write-Host "This will configure the following settings:" -ForegroundColor White
+            Write-Host 'This will configure the following settings:' -ForegroundColor White
             Write-Host "  - Power Plan: $PowerPlan" -ForegroundColor Cyan
             Write-Host "  - Monitor Timeout: $MonitorTimeoutMinutes minutes" -ForegroundColor Cyan
+            Write-Host "  - Sleep Timeout: $(if($SleepTimeoutMinutes -eq 0){'Never'}else{"$SleepTimeoutMinutes minutes"})" -ForegroundColor Cyan
             Write-Host "  - Disk Timeout: $(if($DiskTimeoutMinutes -eq 0){'Disabled'}else{"$DiskTimeoutMinutes minutes"})" -ForegroundColor Cyan
-            Write-Host "  - Hibernation: Disabled" -ForegroundColor Cyan
+            Write-Host '  - Hibernation: Disabled' -ForegroundColor Cyan
             Write-Host "`nNote: These settings optimize for desktop performance" -ForegroundColor Yellow
             Write-Host "="*60 -ForegroundColor Yellow
             
             $confirmation = Read-Host "`n[?] Continue with power configuration? (Y/N)"
             if ($confirmation -notin @('Y', 'y', 'Yes', 'yes')) {
-                Write-LogEntry "Operation cancelled by user" 'WARNING'
-                $global:LastStatus = "[WARN] User cancelled power settings configuration."
+                Write-LogEntry 'Operation cancelled by user' 'WARNING'
+                $global:LastStatus = '[WARN] User cancelled power settings configuration.'
                 return
             }
         }
 
-        # Get available power schemes
         Write-LogEntry "`n[SCAN] Scanning available power schemes..." 'INFO'
         $powerSchemes = Get-PowerSchemes
         
         if ($powerSchemes.Count -eq 0) {
-            throw "No power schemes detected on this system"
+            throw 'No power schemes detected on this system'
         }
         
-        Write-LogEntry "Available power schemes:" 'INFO'
+        Write-LogEntry 'Available power schemes:' 'INFO'
         foreach ($scheme in $powerSchemes.GetEnumerator()) {
-            $activeIndicator = if ($scheme.Value.IsActive) { " (ACTIVE)" } else { "" }
+            $activeIndicator = if ($scheme.Value.IsActive) { ' (ACTIVE)' } else { '' }
             Write-LogEntry "  - $($scheme.Key)$activeIndicator" 'INFO'
         }
         
-        # Validate requested power plan
         if (-not $powerSchemes.ContainsKey($PowerPlan)) {
             Write-LogEntry "[WARN] Requested power plan '$PowerPlan' not found" 'WARNING'
             Write-LogEntry "Falling back to 'High Performance' scheme" 'WARNING'
             $PowerPlan = 'High Performance'
             
             if (-not $powerSchemes.ContainsKey($PowerPlan)) {
-                throw "Neither requested scheme nor High Performance scheme available"
+                throw 'Neither requested scheme nor High Performance scheme available'
             }
         }
         
         $selectedScheme = $powerSchemes[$PowerPlan]
         Write-LogEntry "Selected scheme: $PowerPlan (GUID: $($selectedScheme.GUID))" 'INFO'
 
-        # Backup current settings
         if (-not $WhatIfPreference) {
             Write-LogEntry "`n[SAVE] Backing up current power settings..." 'INFO'
             $backupFile = Backup-PowerSettings
@@ -10269,34 +10250,46 @@ function Set-DesktopPowerSettings {
             Write-LogEntry "`nWhatIf Summary:" 'INFO'
             Write-LogEntry "  - Would set power scheme to: $PowerPlan" 'INFO'
             Write-LogEntry "  - Would set monitor timeout to: $MonitorTimeoutMinutes minutes" 'INFO'
+            Write-LogEntry "  - Would set sleep timeout to: $(if($SleepTimeoutMinutes -eq 0){'Never'}else{"$SleepTimeoutMinutes minutes"})" 'INFO'
             Write-LogEntry "  - Would set disk timeout to: $(if($DiskTimeoutMinutes -eq 0){'Disabled'}else{"$DiskTimeoutMinutes minutes"})" 'INFO'
-            Write-LogEntry "  - Would disable hibernation" 'INFO'
-            $global:LastStatus = "[INFO] WhatIf completed - power settings would be configured."
+            Write-LogEntry '  - Would disable hibernation' 'INFO'
+            $global:LastStatus = '[INFO] WhatIf completed - power settings would be configured.'
             return
         }
 
-        # Apply power configuration
         Write-LogEntry "`n[FAST] Applying power configuration..." 'INFO'
-        $configResults = Set-PowerConfiguration -SchemeName $PowerPlan -SchemeGUID $selectedScheme.GUID -MonitorTimeout $MonitorTimeoutMinutes -DiskTimeout $DiskTimeoutMinutes
+        $configResults = Set-PowerConfiguration -SchemeName $PowerPlan -SchemeGUID $selectedScheme.GUID -MonitorTimeout $MonitorTimeoutMinutes -DiskTimeout $DiskTimeoutMinutes -SleepTimeout $SleepTimeoutMinutes
         
-        # Process results
         $successCount = ($configResults | Where-Object { $_.Success }).Count
         $failureCount = ($configResults | Where-Object { -not $_.Success }).Count
         
         $script:appliedSettings = $configResults | Where-Object { $_.Success }
         $script:failedSettings = $configResults | Where-Object { -not $_.Success }
 
-        # Verify configuration
         Write-LogEntry "`n[SCAN] Verifying power configuration..." 'INFO'
         try {
             $currentScheme = powercfg.exe /getactivescheme 2>$null
-            if ($currentScheme -and $currentScheme -match $selectedScheme.GUID) {
-                Write-LogEntry "[OK] Power scheme verification passed" 'SUCCESS'
+            if ($currentScheme -and $currentScheme -match [regex]::Escape($selectedScheme.GUID)) {
+                Write-LogEntry '[OK] Power scheme verification passed' 'SUCCESS'
             } else {
-                Write-LogEntry "[WARN] Power scheme verification failed" 'WARNING'
+                Write-LogEntry '[WARN] Power scheme verification failed' 'WARNING'
+            }
+
+            $verifyDisplayAC = powercfg.exe /query $selectedScheme.GUID SUB_VIDEO VIDEOIDLE /AC 2>$null
+            $verifySleepAC = powercfg.exe /query $selectedScheme.GUID SUB_SLEEP STANDBYIDLE /AC 2>$null
+
+            if ($verifyDisplayAC -match 'Current AC Power Setting Index:\s*0x([0-9a-fA-F]+)') {
+                $displaySeconds = [Convert]::ToInt32($matches[1], 16)
+                Write-LogEntry "[OK] Verified AC display timeout: $([int]($displaySeconds / 60)) minutes" 'SUCCESS'
+            }
+
+            if ($verifySleepAC -match 'Current AC Power Setting Index:\s*0x([0-9a-fA-F]+)') {
+                $sleepValue = [Convert]::ToInt32($matches[1], 16)
+                $sleepDisplay = if ($sleepValue -eq 0) { 'Never' } else { "$sleepValue minutes" }
+                Write-LogEntry "[OK] Verified AC sleep timeout: $sleepDisplay" 'SUCCESS'
             }
         } catch {
-            Write-LogEntry "[WARN] Could not verify power scheme: $_" 'WARNING'
+            Write-LogEntry "[WARN] Could not fully verify power settings: $_" 'WARNING'
         }
 
     } catch {
@@ -10326,7 +10319,6 @@ function Set-DesktopPowerSettings {
             }
         }
         
-        # Write log file
         try {
             $logEntries | Out-File -FilePath $LogPath -Encoding UTF8 -Force
             Write-LogEntry "[NOTE] Detailed log saved to: $LogPath" 'INFO'
@@ -10334,18 +10326,17 @@ function Set-DesktopPowerSettings {
             Write-LogEntry "[WARN] Failed to save log file: $_" 'WARNING'
         }
         
-        # Set final status
         if ($appliedSettings.Count -gt 0) {
             if ($failedSettings.Count -eq 0) {
-                $global:LastStatus = "[OK] All power settings applied successfully."
+                $global:LastStatus = '[OK] All power settings applied successfully.'
             } else {
                 $global:LastStatus = "[WARN] Power settings partially applied ($($appliedSettings.Count) success, $($failedSettings.Count) failed)."
             }
         } else {
-            $global:LastStatus = "[ERROR] No power settings were applied."
+            $global:LastStatus = '[ERROR] No power settings were applied.'
         }
         
-        Write-LogEntry "=== Power Settings Configuration Completed ===" 'INFO'
+        Write-LogEntry '=== Power Settings Configuration Completed ===' 'INFO'
     }
 }
 
