@@ -1,7 +1,7 @@
 # =====================================================================
 # ScriptName: Compton_Tech_Utils.ps1
-# ScriptVersion: 1.9.2
-# LastUpdated: 2026-04-22
+# ScriptVersion: 1.10.0
+# LastUpdated: 2026-04-27
 # =====================================================================
 
 # -----------------------------------------------------------------------------
@@ -5441,2141 +5441,2440 @@ finally {
 }
 
 # -----------------------------------------------------------------------------
-# Option 10 - HP Driver Updates
+# Option 10 - Vendor Driver Updates (HP/Dell)
 # -----------------------------------------------------------------------------
-
 function Update-HPDrivers {
     <#
     .SYNOPSIS
-    Runs the HP driver update workflow used by Option 10.
+    Runs the Option 10 vendor driver update workflow.
 
     .DESCRIPTION
-    Replaces the prior Option 10 implementation with the contents of
-    05_Weekend_HP_Drivers_Update.ps1, adapted to run as a callable menu
-    function instead of a standalone script. Logging is YAML-only.
+    Uses the merged code from 05_Weekend_HP_Drivers_Update.ps1 v2.3.8.
+    Detects HP or Dell systems, applies local desktop power policy, runs the
+    matching vendor driver workflow, excludes BIOS/Firmware, writes YAML logs,
+    and performs cleanup before returning to the Compton Tech Tools menu.
     #>
     [CmdletBinding()]
     param(
-
-    [switch]$IncludeBIOS = $true,
-    [switch]$IncludeSoftware = $false,
-    [switch]$SuspendBitLockerForBIOS = $true,
-    [string]$WorkingRoot = 'C:\Temp\HPDrivers',
-    [string]$YamlLogFolder = 'C:\Logs',
-    [int]$CleanupRetryCount = 12,
-    [int]$CleanupRetryDelaySeconds = 10
+        [string]$WorkingRoot = 'C:\Temp\DriverUpdates',
+        [string]$YamlLogFolder = 'C:\Logs',
+        [switch]$IncludeSoftware,
+        [switch]$IncludeBIOS,
+        [string]$HpiaSourceFolder = '\\filesvr\Labscripts\HPImageAssistant',
+        [string]$LocalHpiaFolder = 'C:\ProgramData\Compton\HPImageAssistant'
     )
 
-$ErrorActionPreference = 'Stop'
+    Set-StrictMode -Version Latest
+    $ErrorActionPreference = 'Stop'
 
-$script:RunStart = Get-Date
-$script:ComputerName = $env:COMPUTERNAME
-$script:YamlLogPath = $null
-$script:OverallResult = 'Unknown'
-$script:FailureMessage = $null
-$script:CleanupResult = $false
-$script:DetectedSoftPaqs = New-Object System.Collections.Generic.List[object]
-$script:InstalledSoftPaqResults = New-Object System.Collections.Generic.List[object]
+    # -----------------------------
+    # Script metadata
+    # -----------------------------
+    $script:ScriptName        = '05_Weekend_HP_Drivers_Update.ps1'
+    $script:ScriptVersion     = '2.3.8'
+    $script:StartTime         = Get-Date
+    $script:RunFailures       = New-Object System.Collections.Generic.List[string]
+    $script:InstalledList     = New-Object System.Collections.Generic.List[string]
+    $script:SkippedList       = New-Object System.Collections.Generic.List[string]
+    $script:YamlActionLines   = New-Object System.Collections.Generic.List[string]
+    $script:DriverResults     = New-Object System.Collections.Generic.List[object]
+    $script:DetectedVendor    = $null
+    $script:YamlPath          = $null
+    $script:ComputerName      = $env:COMPUTERNAME
 
-function Write-Log {
-    param(
-        [string]$Message,
-        [ValidateSet('INFO','OK','WARN','ERROR')]
-        [string]$Level = 'INFO'
-    )
+    # -----------------------------
+    # Logging helpers
+    # -----------------------------
+    function Write-Log {
+        param(
+            [Parameter(Mandatory)][string]$Message,
+            [ValidateSet('INFO','OK','WARN','ERROR')][string]$Level = 'INFO'
+        )
 
-    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    $line = "[$timestamp] [$('{0,-5}' -f $Level)] $Message"
+        $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+        $line = "[{0}] [{1}] {2}" -f $timestamp, $Level.PadRight(5), $Message
 
-    switch ($Level) {
-        'INFO'  { Write-Host $line -ForegroundColor Cyan }
-        'OK'    { Write-Host $line -ForegroundColor Green }
-        'WARN'  { Write-Host $line -ForegroundColor Yellow }
-        'ERROR' { Write-Host $line -ForegroundColor Red }
-    }
-}
-
-function Test-IsAdministrator {
-    try {
-        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-        $principal = New-Object Security.Principal.WindowsPrincipal($identity)
-        return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-    }
-    catch {
-        return $false
-    }
-}
-
-function Test-IsHPSystem {
-    try {
-        $manufacturer = (Get-CimInstance -ClassName Win32_ComputerSystem).Manufacturer
-        return ($manufacturer -match 'HP|Hewlett-Packard')
-    }
-    catch {
-        return $false
-    }
-}
-
-function Ensure-Folder {
-    param([string]$Path)
-
-    if (-not (Test-Path -LiteralPath $Path)) {
-        New-Item -Path $Path -ItemType Directory -Force | Out-Null
-    }
-}
-
-function ConvertTo-YamlSafeValue {
-    param(
-        [AllowNull()]
-        [object]$Value
-    )
-
-    if ($null -eq $Value) {
-        return 'null'
+        switch ($Level) {
+            'INFO'  { Write-Host $line -ForegroundColor Cyan }
+            'OK'    { Write-Host $line -ForegroundColor Green }
+            'WARN'  { Write-Host $line -ForegroundColor Yellow }
+            'ERROR' { Write-Host $line -ForegroundColor Red }
+            default { Write-Host $line }
+        }
     }
 
-    $text = [string]$Value
-    $text = $text -replace "`r", ' '
-    $text = $text -replace "`n", ' '
-    $text = $text -replace '"', '\"'
-    return '"' + $text + '"'
-}
+    function Write-Section {
+        param([Parameter(Mandatory)][string]$Title)
 
-function Initialize-YamlLog {
-    Ensure-Folder -Path $YamlLogFolder
+        $border = ('=' * 72)
+        Write-Host ''
+        Write-Host $border -ForegroundColor Magenta
+        Write-Host ("  {0}" -f $Title) -ForegroundColor Magenta
+        Write-Host $border -ForegroundColor Magenta
+        Add-YamlAction ("Section: {0}" -f $Title)
+    }
 
-    $timestamp = Get-Date -Format 'yyyy-MM-dd_HHmmss'
-    $fileName = "$($script:ComputerName)-HPDrivers-$timestamp.yml"
-    $script:YamlLogPath = Join-Path $YamlLogFolder $fileName
+    function Add-RunFailure {
+        param([Parameter(Mandatory)][string]$Message)
+        $script:RunFailures.Add($Message) | Out-Null
+        Write-Log $Message 'WARN'
+    }
 
-    Write-Log "YAML log will be written to: $($script:YamlLogPath)" 'INFO'
-}
+    function Add-DriverResult {
+        param(
+            [Parameter(Mandatory)][string]$Vendor,
+            [Parameter(Mandatory)][string]$Name,
+            [string]$Id,
+            [string]$Category,
+            [ValidateSet('Detected','Installed','Downloaded','Skipped','Failed','Blocked')][string]$Status,
+            [string]$Message = ''
+        )
 
-function Add-DetectedSoftPaq {
-    param(
-        [string]$Id,
-        [string]$Name,
-        [string]$Version,
-        [string]$Category
-    )
+        $script:DriverResults.Add([pscustomobject]@{
+            Vendor   = $Vendor
+            Name     = $Name
+            Id       = $Id
+            Category = $Category
+            Status   = $Status
+            Message  = $Message
+        }) | Out-Null
+    }
 
-    $script:DetectedSoftPaqs.Add([PSCustomObject]@{
-        Id       = $Id
-        Name     = $Name
-        Version  = $Version
-        Category = $Category
-    }) | Out-Null
-}
+    function ConvertTo-YamlSafeString {
+        param([AllowNull()][object]$Value)
 
-function Add-InstalledSoftPaqResult {
-    param(
-        [string]$Id,
-        [string]$Name,
-        [string]$Version,
-        [string]$Status,
-        [string]$Message
-    )
+        if ($null -eq $Value) { return 'null' }
 
-    $script:InstalledSoftPaqResults.Add([PSCustomObject]@{
-        Id      = $Id
-        Name    = $Name
-        Version = $Version
-        Status  = $Status
-        Message = $Message
-    }) | Out-Null
-}
+        $text = [string]$Value
+        $text = $text -replace "`r", ''
+        $text = $text -replace "`n", ' '
+        $text = $text -replace "'", "''"
+        return "'$text'"
+    }
 
-function Write-YamlLog {
-    try {
-        if ([string]::IsNullOrWhiteSpace($script:YamlLogPath)) {
-            Initialize-YamlLog
+    function Initialize-YamlLog {
+        param(
+            [Parameter(Mandatory)][string]$ComputerName,
+            [Parameter(Mandatory)][string]$YamlPath
+        )
+
+        $script:YamlPath = $YamlPath
+        $script:YamlActionLines.Clear()
+
+        Add-YamlAction 'Script initialized.'
+        Add-YamlAction ("Working root: {0}" -f $WorkingRoot)
+        Add-YamlAction ("Computer: {0}" -f $ComputerName)
+    }
+
+    function Add-YamlAction {
+        param([Parameter(Mandatory)][string]$Text)
+        $script:YamlActionLines.Add(("    - {0}" -f (ConvertTo-YamlSafeString $Text))) | Out-Null
+    }
+
+    function Save-YamlLog {
+        param(
+            [Parameter(Mandatory)][string]$Status
+        )
+
+        if ([string]::IsNullOrWhiteSpace($script:YamlPath)) {
+            return
         }
 
-        $runEnd = Get-Date
-        $duration = [math]::Round(($runEnd - $script:RunStart).TotalSeconds, 0)
+        $endTime = Get-Date
+        $duration = [math]::Round(($endTime - $script:StartTime).TotalSeconds, 0)
 
-        $yamlLines = New-Object System.Collections.Generic.List[string]
+        $lines = New-Object System.Collections.Generic.List[string]
 
-        $yamlLines.Add('computer_name: ' + (ConvertTo-YamlSafeValue $script:ComputerName)) | Out-Null
-        $yamlLines.Add('script_name: "05_Weekend_HP_Drivers_Update.ps1"') | Out-Null
-        $yamlLines.Add('script_version: "1.2"') | Out-Null
-        $yamlLines.Add('run_started: ' + (ConvertTo-YamlSafeValue ($script:RunStart.ToString('yyyy-MM-dd HH:mm:ss')))) | Out-Null
-        $yamlLines.Add('run_finished: ' + (ConvertTo-YamlSafeValue ($runEnd.ToString('yyyy-MM-dd HH:mm:ss')))) | Out-Null
-        $yamlLines.Add('duration_seconds: ' + $duration) | Out-Null
+        $lines.Add('script:') | Out-Null
+        $lines.Add(("  name: {0}" -f (ConvertTo-YamlSafeString $script:ScriptName))) | Out-Null
+        $lines.Add(("  version: {0}" -f (ConvertTo-YamlSafeString $script:ScriptVersion))) | Out-Null
+        $lines.Add(("  computer: {0}" -f (ConvertTo-YamlSafeString $script:ComputerName))) | Out-Null
+        $lines.Add(("  started: {0}" -f (ConvertTo-YamlSafeString ($script:StartTime.ToString('s'))))) | Out-Null
+        $lines.Add(("  ended: {0}" -f (ConvertTo-YamlSafeString ($endTime.ToString('s'))))) | Out-Null
+        $lines.Add(("  duration_seconds: {0}" -f $duration)) | Out-Null
 
-        $yamlLines.Add('options:') | Out-Null
-        $yamlLines.Add('  include_bios: ' + ($(if ($IncludeBIOS) { 'true' } else { 'false' }))) | Out-Null
-        $yamlLines.Add('  include_software: ' + ($(if ($IncludeSoftware) { 'true' } else { 'false' }))) | Out-Null
-        $yamlLines.Add('  suspend_bitlocker_for_bios: ' + ($(if ($SuspendBitLockerForBIOS) { 'true' } else { 'false' }))) | Out-Null
-        $yamlLines.Add('  working_root: ' + (ConvertTo-YamlSafeValue $WorkingRoot)) | Out-Null
-        $yamlLines.Add('  cleanup_retry_count: ' + $CleanupRetryCount) | Out-Null
-        $yamlLines.Add('  cleanup_retry_delay_seconds: ' + $CleanupRetryDelaySeconds) | Out-Null
+        $lines.Add('run:') | Out-Null
+        $lines.Add(("  status: {0}" -f (ConvertTo-YamlSafeString $Status))) | Out-Null
+        $lines.Add(("  vendor: {0}" -f (ConvertTo-YamlSafeString $script:DetectedVendor))) | Out-Null
 
-        $yamlLines.Add('cleanup_successful: ' + ($(if ($script:CleanupResult) { 'true' } else { 'false' }))) | Out-Null
-        $yamlLines.Add('overall_result: ' + (ConvertTo-YamlSafeValue $script:OverallResult)) | Out-Null
-
-        if (-not [string]::IsNullOrWhiteSpace($script:FailureMessage)) {
-            $yamlLines.Add('failure_message: ' + (ConvertTo-YamlSafeValue $script:FailureMessage)) | Out-Null
+        $lines.Add('  actions:') | Out-Null
+        if ($script:YamlActionLines.Count -eq 0) {
+            $lines.Add('    []') | Out-Null
         }
         else {
-            $yamlLines.Add('failure_message: null') | Out-Null
-        }
-
-        $yamlLines.Add('detected_softpaqs:') | Out-Null
-        if ($script:DetectedSoftPaqs.Count -gt 0) {
-            foreach ($item in $script:DetectedSoftPaqs) {
-                $yamlLines.Add('  - id: ' + (ConvertTo-YamlSafeValue $item.Id)) | Out-Null
-                $yamlLines.Add('    name: ' + (ConvertTo-YamlSafeValue $item.Name)) | Out-Null
-                $yamlLines.Add('    version: ' + (ConvertTo-YamlSafeValue $item.Version)) | Out-Null
-                $yamlLines.Add('    category: ' + (ConvertTo-YamlSafeValue $item.Category)) | Out-Null
+            foreach ($line in $script:YamlActionLines) {
+                $lines.Add($line) | Out-Null
             }
         }
-        else {
-            $yamlLines.Add('  - id: null') | Out-Null
-            $yamlLines.Add('    name: "No applicable HP SoftPaq updates detected"') | Out-Null
-            $yamlLines.Add('    version: null') | Out-Null
-            $yamlLines.Add('    category: null') | Out-Null
-        }
 
-        $yamlLines.Add('install_results:') | Out-Null
-        if ($script:InstalledSoftPaqResults.Count -gt 0) {
-            foreach ($item in $script:InstalledSoftPaqResults) {
-                $yamlLines.Add('  - id: ' + (ConvertTo-YamlSafeValue $item.Id)) | Out-Null
-                $yamlLines.Add('    name: ' + (ConvertTo-YamlSafeValue $item.Name)) | Out-Null
-                $yamlLines.Add('    version: ' + (ConvertTo-YamlSafeValue $item.Version)) | Out-Null
-                $yamlLines.Add('    status: ' + (ConvertTo-YamlSafeValue $item.Status)) | Out-Null
-                $yamlLines.Add('    message: ' + (ConvertTo-YamlSafeValue $item.Message)) | Out-Null
+        $lines.Add('  installed:') | Out-Null
+        if ($script:InstalledList.Count -eq 0) {
+            $lines.Add('    []') | Out-Null
+        }
+        else {
+            foreach ($item in $script:InstalledList) {
+                $lines.Add(("    - {0}" -f (ConvertTo-YamlSafeString $item))) | Out-Null
             }
         }
+
+        $lines.Add('  skipped:') | Out-Null
+        if ($script:SkippedList.Count -eq 0) {
+            $lines.Add('    []') | Out-Null
+        }
         else {
-            $yamlLines.Add('  - id: null') | Out-Null
-            $yamlLines.Add('    name: "No SoftPaq install operations were performed"') | Out-Null
-            $yamlLines.Add('    version: null') | Out-Null
-            $yamlLines.Add('    status: "None"') | Out-Null
-            $yamlLines.Add('    message: "None"') | Out-Null
+            foreach ($item in $script:SkippedList) {
+                $lines.Add(("    - {0}" -f (ConvertTo-YamlSafeString $item))) | Out-Null
+            }
         }
 
-        Set-Content -Path $script:YamlLogPath -Value $yamlLines -Encoding UTF8
-        Write-Log "YAML log written successfully: $($script:YamlLogPath)" 'OK'
-    }
-    catch {
-        Write-Log "Failed to write YAML log: $($_.Exception.Message)" 'WARN'
-    }
-}
+        $lines.Add('  failures:') | Out-Null
+        if ($script:RunFailures.Count -eq 0) {
+            $lines.Add('    []') | Out-Null
+        }
+        else {
+            foreach ($item in $script:RunFailures) {
+                $lines.Add(("    - {0}" -f (ConvertTo-YamlSafeString $item))) | Out-Null
+            }
+        }
 
-function Save-PowerSettings {
-    $settings = [ordered]@{}
+        $lines.Add('drivers:') | Out-Null
+        if ($script:DriverResults.Count -eq 0) {
+            $lines.Add('  []') | Out-Null
+        }
+        else {
+            foreach ($driver in $script:DriverResults) {
+                $lines.Add('  -') | Out-Null
+                $lines.Add(("    vendor: {0}" -f (ConvertTo-YamlSafeString $driver.Vendor))) | Out-Null
+                $lines.Add(("    name: {0}" -f (ConvertTo-YamlSafeString $driver.Name))) | Out-Null
+                $lines.Add(("    id: {0}" -f (ConvertTo-YamlSafeString $driver.Id))) | Out-Null
+                $lines.Add(("    category: {0}" -f (ConvertTo-YamlSafeString $driver.Category))) | Out-Null
+                $lines.Add(("    status: {0}" -f (ConvertTo-YamlSafeString $driver.Status))) | Out-Null
+                $lines.Add(("    message: {0}" -f (ConvertTo-YamlSafeString $driver.Message))) | Out-Null
+            }
+        }
 
-    $settings.DisplayTimeoutDC = (
-        Get-CimInstance -Namespace root\cimv2\power -Class Win32_PowerSettingDataIndex |
-        Where-Object InstanceID -EQ 'Microsoft:PowerSettingDataIndex\{381b4222-f694-41f0-9685-ff5bb260df2e}\DC\{3c0bc021-c8a8-4e07-a973-6b14cbcb2b7e}'
-    ).SettingIndexValue / 60
-
-    $settings.DisplayTimeoutAC = (
-        Get-CimInstance -Namespace root\cimv2\power -Class Win32_PowerSettingDataIndex |
-        Where-Object InstanceID -EQ 'Microsoft:PowerSettingDataIndex\{381b4222-f694-41f0-9685-ff5bb260df2e}\AC\{3c0bc021-c8a8-4e07-a973-6b14cbcb2b7e}'
-    ).SettingIndexValue / 60
-
-    $settings.SleepTimeoutDC = (
-        Get-CimInstance -Namespace root\cimv2\power -Class Win32_PowerSettingDataIndex |
-        Where-Object InstanceID -EQ 'Microsoft:PowerSettingDataIndex\{381b4222-f694-41f0-9685-ff5bb260df2e}\DC\{29f6c1db-86da-48c5-9fdb-f2b67b1f44da}'
-    ).SettingIndexValue / 60
-
-    $settings.SleepTimeoutAC = (
-        Get-CimInstance -Namespace root\cimv2\power -Class Win32_PowerSettingDataIndex |
-        Where-Object InstanceID -EQ 'Microsoft:PowerSettingDataIndex\{381b4222-f694-41f0-9685-ff5bb260df2e}\AC\{29f6c1db-86da-48c5-9fdb-f2b67b1f44da}'
-    ).SettingIndexValue / 60
-
-    return [PSCustomObject]$settings
-}
-
-function Set-UnlimitedPowerTimeouts {
-    Write-Log "Temporarily disabling monitor and sleep timeouts..." 'INFO'
-    powercfg -change -monitor-timeout-dc 0 | Out-Null
-    powercfg -change -monitor-timeout-ac 0 | Out-Null
-    powercfg -change -standby-timeout-dc 0 | Out-Null
-    powercfg -change -standby-timeout-ac 0 | Out-Null
-}
-
-function Restore-PowerSettings {
-    param($Saved)
-
-    if ($null -eq $Saved) { return }
-
-    Write-Log "Restoring previous power timeout settings..." 'INFO'
-    powercfg -change -monitor-timeout-dc $Saved.DisplayTimeoutDC | Out-Null
-    powercfg -change -monitor-timeout-ac $Saved.DisplayTimeoutAC | Out-Null
-    powercfg -change -standby-timeout-dc $Saved.SleepTimeoutDC | Out-Null
-    powercfg -change -standby-timeout-ac $Saved.SleepTimeoutAC | Out-Null
-}
-
-function Ensure-Tls12 {
-    try {
-        [Net.ServicePointManager]::SecurityProtocol =
-            [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-        Write-Log "Enabled TLS 1.2 for PowerShell Gallery access." 'OK'
-    }
-    catch {
-        Write-Log "Could not explicitly enable TLS 1.2: $($_.Exception.Message)" 'WARN'
-    }
-}
-
-
-function Initialize-HPNetworkAccess {
-    Write-Log "Applying HP download network compatibility fixes..." 'INFO'
-
-    try {
-        & netsh winhttp reset proxy | Out-Null
-        Write-Log "Reset WinHTTP proxy to direct access." 'OK'
-    }
-    catch {
-        Write-Log "Could not reset WinHTTP proxy: $($_.Exception.Message)" 'WARN'
+        Set-Content -LiteralPath $script:YamlPath -Value $lines -Encoding UTF8
+        Write-Host ("YAML log written successfully: {0}" -f $script:YamlPath) -ForegroundColor Green
     }
 
-    try {
-        [System.Net.WebRequest]::DefaultWebProxy = New-Object System.Net.WebProxy
-        [System.Net.WebRequest]::DefaultWebProxy.Credentials = [System.Net.CredentialCache]::DefaultCredentials
-        Write-Log "Configured .NET web requests to use direct proxy settings with default credentials." 'OK'
-    }
-    catch {
-        Write-Log "Could not adjust .NET proxy settings: $($_.Exception.Message)" 'WARN'
+    # -----------------------------
+    # File/folder helpers
+    # -----------------------------
+    function Ensure-Folder {
+        param([Parameter(Mandatory)][string]$Path)
+
+        if (-not (Test-Path -LiteralPath $Path)) {
+            New-Item -Path $Path -ItemType Directory -Force | Out-Null
+        }
     }
 
-    try {
-        [System.Net.ServicePointManager]::Expect100Continue = $false
-    }
-    catch {}
+    function Ensure-WorkingFolderPermissions {
+        param([Parameter(Mandatory)][string]$Path)
 
-    Ensure-Tls12
-
-    try {
-        $dnsOk = $false
         try {
-            if (Get-Command Resolve-DnsName -ErrorAction SilentlyContinue) {
-                $null = Resolve-DnsName -Name 'ftp.hp.com' -Type A -ErrorAction Stop
-                $dnsOk = $true
+            & icacls.exe $Path '/grant' '*S-1-1-0:(OI)(CI)F' '/T' '/C' | Out-Null
+        }
+        catch {
+            Write-Log ("Unable to relax working folder permissions on {0}: {1}" -f $Path, $_.Exception.Message) 'WARN'
+        }
+    }
+
+    function Remove-WorkingFolderRobust {
+        param(
+            [Parameter(Mandatory)][string]$Path,
+            [int]$RetryCount = 6,
+            [int]$RetryDelaySeconds = 5
+        )
+
+        if (-not (Test-Path -LiteralPath $Path)) {
+            Write-Log ("Working folder already absent: {0}" -f $Path) 'OK'
+            return
+        }
+
+        Write-Log ("Attempting to remove working folder: {0}" -f $Path) 'INFO'
+        for ($i = 1; $i -le $RetryCount; $i++) {
+            try {
+                Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+                Write-Log 'Working folder removed successfully.' 'OK'
+                return
+            }
+            catch {
+                if ($i -eq $RetryCount) {
+                    Add-RunFailure ("Failed to remove working folder after retries: {0}" -f $_.Exception.Message)
+                    return
+                }
+                Start-Sleep -Seconds $RetryDelaySeconds
             }
         }
-        catch {}
+    }
 
-        if (-not $dnsOk) {
+    # -----------------------------
+    # Power policy
+    # -----------------------------
+    function Set-LocalPowerPolicyDesktop {
+        try {
+            $base = 'HKLM:\SOFTWARE\Policies\Microsoft\Power\PowerSettings'
+
+            $displayGuid         = '3C0BC021-C8A8-4E07-A973-6B14CBCB2B7E'
+            $sleepGuid           = '29F6C1DB-86DA-48C5-9FDB-F2B67B1F44DA'
+            $unattendedSleepGuid = '7BC4A2F9-D8FC-4469-B07B-33EB785AACA0'
+            $hybridSleepGuid     = '94AC6D29-73CE-41A6-809F-6363BA21B47E'
+            $hibernateGuid       = '9D7815A6-7EE4-497E-8888-515A05F02364'
+
+            foreach ($guid in @($displayGuid,$sleepGuid,$unattendedSleepGuid,$hybridSleepGuid,$hibernateGuid)) {
+                $path = Join-Path $base $guid
+                if (-not (Test-Path -LiteralPath $path)) {
+                    New-Item -Path $path -Force | Out-Null
+                }
+            }
+
+            New-ItemProperty -Path (Join-Path $base $displayGuid) -Name ACSettingIndex -PropertyType DWord -Value 3600 -Force | Out-Null
+            New-ItemProperty -Path (Join-Path $base $displayGuid) -Name DCSettingIndex -PropertyType DWord -Value 3600 -Force | Out-Null
+            New-ItemProperty -Path (Join-Path $base $sleepGuid) -Name ACSettingIndex -PropertyType DWord -Value 0 -Force | Out-Null
+            New-ItemProperty -Path (Join-Path $base $sleepGuid) -Name DCSettingIndex -PropertyType DWord -Value 0 -Force | Out-Null
+            New-ItemProperty -Path (Join-Path $base $unattendedSleepGuid) -Name ACSettingIndex -PropertyType DWord -Value 0 -Force | Out-Null
+            New-ItemProperty -Path (Join-Path $base $unattendedSleepGuid) -Name DCSettingIndex -PropertyType DWord -Value 0 -Force | Out-Null
+            New-ItemProperty -Path (Join-Path $base $hybridSleepGuid) -Name ACSettingIndex -PropertyType DWord -Value 1 -Force | Out-Null
+            New-ItemProperty -Path (Join-Path $base $hybridSleepGuid) -Name DCSettingIndex -PropertyType DWord -Value 1 -Force | Out-Null
+            New-ItemProperty -Path (Join-Path $base $hibernateGuid) -Name ACSettingIndex -PropertyType DWord -Value 0 -Force | Out-Null
+            New-ItemProperty -Path (Join-Path $base $hibernateGuid) -Name DCSettingIndex -PropertyType DWord -Value 0 -Force | Out-Null
+
+            powercfg -change -monitor-timeout-ac 60 > $null 2>&1
+            powercfg -change -monitor-timeout-dc 60 > $null 2>&1
+            powercfg -change -standby-timeout-ac 0 > $null 2>&1
+            powercfg -change -standby-timeout-dc 0 > $null 2>&1
+            powercfg -hibernate off > $null 2>&1
+
+            Add-YamlAction 'Applied local power policy (display 60 minutes, sleep never).'
+            Write-Log 'Local power policy applied successfully.' 'OK'
+        }
+        catch {
+            if (($_ | Out-String) -match 'Group policy override settings exist') {
+                Write-Log 'Local power policy already enforced by policy.' 'WARN'
+            }
+            else {
+                Add-RunFailure ("Failed to apply local power policy: {0}" -f $_.Exception.Message)
+            }
+        }
+    }
+
+    function Enforce-DesktopPowerSettings {
+        $highPerf = (powercfg -l | Select-String 'High performance' | ForEach-Object {
+            if ($_ -match '([A-Fa-f0-9\-]{36})') { $matches[1] }
+        } | Select-Object -First 1)
+
+        if ($highPerf) {
+            powercfg -setactive $highPerf > $null 2>&1
+            Write-Log ("High Performance power plan available: {0}" -f $highPerf) 'OK'
+        }
+        else {
+            Write-Log 'High Performance power plan was not found. Continuing with current plan.' 'WARN'
+        }
+
+        powercfg -change -monitor-timeout-ac 60 > $null 2>&1
+        powercfg -change -monitor-timeout-dc 60 > $null 2>&1
+        powercfg -change -standby-timeout-ac 0 > $null 2>&1
+        powercfg -change -standby-timeout-dc 0 > $null 2>&1
+        powercfg -hibernate off > $null 2>&1
+
+        Write-Log 'Desktop power settings enforced successfully.' 'OK'
+    }
+
+    # -----------------------------
+    # Vendor detection
+    # -----------------------------
+    function Get-SystemManufacturer {
+        try {
+            return (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).Manufacturer
+        }
+        catch {
+            throw "Unable to determine system manufacturer. $($_.Exception.Message)"
+        }
+    }
+
+    function Get-DriverVendor {
+        $manufacturer = Get-SystemManufacturer
+        Write-Log ("Detected manufacturer: {0}" -f $manufacturer) 'INFO'
+
+        if ($manufacturer -match 'Dell') { return 'Dell' }
+        if ($manufacturer -match 'HP|Hewlett-Packard') { return 'HP' }
+
+        throw "Unsupported manufacturer for this script: $manufacturer"
+    }
+
+    # -----------------------------
+    # HP Support - HP Image Assistant extracted-folder deployment
+    # -----------------------------
+    function Get-HPSystemModelInfo {
+        [CmdletBinding()]
+        param()
+
+        $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
+        $csp = Get-CimInstance Win32_ComputerSystemProduct -ErrorAction SilentlyContinue
+        $bb = Get-CimInstance Win32_BaseBoard -ErrorAction SilentlyContinue
+
+        $platform = $null
+        if ($bb -and $bb.Product) {
+            $platform = $bb.Product.ToString().Trim().ToUpper()
+            if ($platform.Length -gt 4) {
+                $platform = $platform.Substring(0,4)
+            }
+        }
+
+        $model = if ($cs.Model) { $cs.Model.ToString().Trim() } else { 'Unknown' }
+        $sku = if ($csp -and $csp.Version) { $csp.Version.ToString().Trim() } else { 'Unknown' }
+
+        $info = [pscustomobject]@{
+            Manufacturer = $cs.Manufacturer
+            Model        = $model
+            SKU          = $sku
+            Platform     = $platform
+        }
+
+        Write-Log ("Detected HP system model: {0}" -f $info.Model) 'INFO'
+        Write-Log ("Detected HP platform/baseboard ID: {0}" -f $info.Platform) 'INFO'
+        Add-YamlAction ("Detected HP system model: {0}" -f $info.Model)
+        Add-YamlAction ("Detected HP platform/baseboard ID: {0}" -f $info.Platform)
+
+        return $info
+    }
+
+    function Install-HPIAFromExtractedFolder {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory)][string]$SourceFolder,
+            [Parameter(Mandatory)][string]$DestinationFolder
+        )
+
+        Write-Section 'HP Image Assistant Local Deployment'
+        Write-Log ("HPIA source folder: {0}" -f $SourceFolder) 'INFO'
+        Write-Log ("HPIA local folder: {0}" -f $DestinationFolder) 'INFO'
+        Add-YamlAction ("HPIA source folder: {0}" -f $SourceFolder)
+        Add-YamlAction ("HPIA local folder: {0}" -f $DestinationFolder)
+
+        if (-not (Test-Path -LiteralPath $SourceFolder)) {
+            throw "HPIA source folder not found: $SourceFolder"
+        }
+
+        $sourceFiles = @(Get-ChildItem -Path $SourceFolder -Recurse -File -ErrorAction SilentlyContinue)
+        Write-Log ("Source HPIA file count: {0}" -f $sourceFiles.Count) 'INFO'
+        Add-YamlAction ("Source HPIA file count: {0}" -f $sourceFiles.Count)
+
+        $sourceExe = Get-ChildItem -Path $SourceFolder -Recurse -Filter 'HPImageAssistant.exe' -File -ErrorAction SilentlyContinue |
+            Sort-Object FullName |
+            Select-Object -First 1
+
+        if (-not $sourceExe) {
+            throw "HPImageAssistant.exe was not found anywhere under source folder: $SourceFolder"
+        }
+
+        Write-Log ("Found source HPImageAssistant.exe: {0}" -f $sourceExe.FullName) 'OK'
+        Add-YamlAction ("Found source HPImageAssistant.exe: {0}" -f $sourceExe.FullName)
+
+        try {
+            if (Test-Path -LiteralPath $DestinationFolder) {
+                Write-Log ("Removing existing local HPIA folder: {0}" -f $DestinationFolder) 'INFO'
+                Remove-Item -LiteralPath $DestinationFolder -Recurse -Force -ErrorAction Stop
+            }
+
+            New-Item -Path $DestinationFolder -ItemType Directory -Force | Out-Null
+
+            Write-Log 'Copying extracted HPIA files locally with robocopy...' 'INFO'
+
+            $roboLog = Join-Path $DestinationFolder 'HPIA_robocopy.log'
+            $roboArgs = @(
+                ('"{0}"' -f $SourceFolder),
+                ('"{0}"' -f $DestinationFolder),
+                '/E',
+                '/COPY:DAT',
+                '/R:3',
+                '/W:5',
+                '/NFL',
+                '/NDL',
+                '/NP',
+                ('/LOG:"{0}"' -f $roboLog)
+            )
+
+            $robo = Start-Process -FilePath "$env:SystemRoot\System32\robocopy.exe" -ArgumentList ($roboArgs -join ' ') -Wait -PassThru -NoNewWindow
+
+            # Robocopy exit codes 0-7 are success/non-fatal. 8+ indicates failure.
+            if ($robo.ExitCode -ge 8) {
+                throw "Robocopy failed copying HPIA files. Exit code: $($robo.ExitCode). Log: $roboLog"
+            }
+
+            Write-Log ("HPIA files copied locally with robocopy exit code {0}." -f $robo.ExitCode) 'OK'
+            Add-YamlAction ("HPIA files copied locally with robocopy exit code {0}." -f $robo.ExitCode)
+
             try {
-                $null = [System.Net.Dns]::GetHostAddresses('ftp.hp.com')
-                $dnsOk = $true
+                Get-ChildItem -Path $DestinationFolder -Recurse -File -ErrorAction SilentlyContinue |
+                    ForEach-Object { Unblock-File -Path $_.FullName -ErrorAction SilentlyContinue }
+            }
+            catch {}
+
+            $copiedFiles = @(Get-ChildItem -Path $DestinationFolder -Recurse -File -ErrorAction SilentlyContinue)
+            Write-Log ("Local HPIA folder file count after copy: {0}" -f $copiedFiles.Count) 'INFO'
+            Add-YamlAction ("Local HPIA folder file count after copy: {0}" -f $copiedFiles.Count)
+
+            $localExeItem = Get-ChildItem -Path $DestinationFolder -Recurse -Filter 'HPImageAssistant.exe' -File -ErrorAction SilentlyContinue |
+                Sort-Object FullName |
+                Select-Object -First 1
+
+            if (-not $localExeItem) {
+                $sampleFiles = $copiedFiles | Select-Object -First 20 | ForEach-Object { $_.FullName }
+                foreach ($sample in $sampleFiles) {
+                    Write-Log ("Local HPIA sample file: {0}" -f $sample) 'WARN'
+                }
+
+                throw "HPImageAssistant.exe was not found anywhere under local copy folder: $DestinationFolder"
+            }
+
+            $localExe = $localExeItem.FullName
+
+            Write-Log ("Resolved local HPImageAssistant.exe location: {0}" -f $localExe) 'OK'
+            Add-YamlAction ("Resolved local HPImageAssistant.exe location: {0}" -f $localExe)
+
+            return $localExe
+        }
+        catch {
+            throw "Failed to deploy HP Image Assistant locally: $($_.Exception.Message)"
+        }
+    }
+
+    function Get-HpiaExitStatus {
+        param([int]$ExitCode)
+
+        switch ($ExitCode) {
+            0    { return 'success' }
+            1    { return 'failed' }
+            2    { return 'cancelled' }
+            3    { return 'needs_reboot' }
+            256  { return 'no_recommendations' }
+            257  { return 'recommendations_found' }
+            3010 { return 'needs_reboot' }
+            3011 { return 'not_auto_installable_skipped' }
+            4097 { return 'invalid_parameters' }
+            default { return 'unknown' }
+        }
+    }
+
+    function Get-HpiaRecommendationObjects {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory)][string]$ReportFolder
+        )
+
+        # Use a flexible PowerShell array instead of a strongly typed generic list.
+        # HPIA reports can contain mixed object types from JSON and XML parsing.
+        $recommendations = @()
+
+        $jsonFiles = @(Get-ChildItem -Path $ReportFolder -Filter '*.json' -Recurse -File -ErrorAction SilentlyContinue)
+        foreach ($jsonFile in $jsonFiles) {
+            try {
+                $json = Get-Content -LiteralPath $jsonFile.FullName -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+
+                if ($json.HPIA -and $json.HPIA.Recommendations) {
+                    foreach ($rec in @($json.HPIA.Recommendations)) {
+                        $recommendations += $rec
+                        try {
+                            Write-Log ("HPIA JSON recommendation type: {0}" -f $rec.GetType().FullName) 'INFO'
+                        }
+                        catch {}
+                    }
+                }
+                elseif ($json.Recommendations) {
+                    foreach ($rec in @($json.Recommendations)) {
+                        $recommendations += $rec
+                        try {
+                            Write-Log ("HPIA JSON recommendation type: {0}" -f $rec.GetType().FullName) 'INFO'
+                        }
+                        catch {}
+                    }
+                }
+            }
+            catch {
+                Write-Log ("Unable to parse HPIA JSON report {0}: {1}" -f $jsonFile.FullName, $_.Exception.Message) 'WARN'
+            }
+        }
+
+        $xmlFiles = @(Get-ChildItem -Path $ReportFolder -Filter '*.xml' -Recurse -File -ErrorAction SilentlyContinue)
+        foreach ($xmlFile in $xmlFiles) {
+            try {
+                [xml]$xml = Get-Content -LiteralPath $xmlFile.FullName -Raw -ErrorAction Stop
+
+                $nodes = @($xml.SelectNodes('//*[contains(translate(local-name(), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "recommend")]'))
+                foreach ($node in $nodes) {
+                    $recommendations += $node
+                    try {
+                        Write-Log ("HPIA XML recommendation node type: {0}" -f $node.GetType().FullName) 'INFO'
+                    }
+                    catch {}
+                }
+            }
+            catch {
+                Write-Log ("Unable to parse HPIA XML report {0}: {1}" -f $xmlFile.FullName, $_.Exception.Message) 'WARN'
+            }
+        }
+
+        return @($recommendations)
+    }
+
+    function Get-HpiaRecommendationValue {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory)]$Recommendation,
+            [Parameter(Mandatory)][string[]]$PropertyNames
+        )
+
+        foreach ($prop in $PropertyNames) {
+            try {
+                if ($Recommendation.PSObject.Properties.Name -contains $prop) {
+                    $value = $Recommendation.$prop
+                    if ($null -ne $value -and -not [string]::IsNullOrWhiteSpace($value.ToString())) {
+                        return $value.ToString()
+                    }
+                }
             }
             catch {}
         }
 
-        if ($dnsOk) {
-            Write-Log "DNS resolution for ftp.hp.com succeeded." 'OK'
+        # XML fallback
+        try {
+            foreach ($prop in $PropertyNames) {
+                $node = $Recommendation.SelectSingleNode('.//*[local-name()="' + $prop + '"]')
+                if ($node -and -not [string]::IsNullOrWhiteSpace($node.InnerText)) {
+                    return $node.InnerText.Trim()
+                }
+            }
+        }
+        catch {}
+
+        return $null
+    }
+
+    function Get-HpiaSoftPaqNumber {
+        [CmdletBinding()]
+        param([Parameter(Mandatory)]$Recommendation)
+
+        $candidate = Get-HpiaRecommendationValue -Recommendation $Recommendation -PropertyNames @(
+            'SoftPaqId','SoftpaqId','SoftPaq','Softpaq','SoftPaqNumber','SoftpaqNumber','SP','Id','ID','Number'
+        )
+
+        if ($candidate -match '(?i)sp?(\d{5,6})') {
+            return $matches[1]
+        }
+
+        $text = ($Recommendation | Out-String)
+        if ($text -match '(?i)sp(\d{5,6})') {
+            return $matches[1]
+        }
+
+        if ($text -match '\b(\d{5,6})\b') {
+            return $matches[1]
+        }
+
+        return $null
+    }
+
+    function Get-HpiaRecommendationCategory {
+        [CmdletBinding()]
+        param([Parameter(Mandatory)]$Recommendation)
+
+        return (Get-HpiaRecommendationValue -Recommendation $Recommendation -PropertyNames @(
+            'Category','Type','RecommendationType','ComponentType','Class','Group'
+        ))
+    }
+
+    function Get-HpiaRecommendationName {
+        [CmdletBinding()]
+        param([Parameter(Mandatory)]$Recommendation)
+
+        $name = Get-HpiaRecommendationValue -Recommendation $Recommendation -PropertyNames @(
+            'Name','Title','Component','ComponentName','Description','SoftPaqName','SoftpaqName'
+        )
+
+        if ($name) { return $name }
+
+        $text = ($Recommendation | Out-String).Trim()
+        if ($text.Length -gt 160) {
+            return $text.Substring(0,160)
+        }
+
+        return $text
+    }
+
+    function New-HpiaDriverSPList {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory)][string]$ReportFolder,
+            [Parameter(Mandatory)][string]$SPListPath
+        )
+
+        $recommendations = @(Get-HpiaRecommendationObjects -ReportFolder $ReportFolder)
+        Write-Log ("HPIA recommendations parsed from reports: {0}" -f $recommendations.Count) 'INFO'
+        Add-YamlAction ("HPIA recommendations parsed from reports: {0}" -f $recommendations.Count)
+
+        $selected = @()
+        $seen = @{}
+
+        foreach ($rec in $recommendations) {
+            $category = Get-HpiaRecommendationCategory -Recommendation $rec
+            $name = Get-HpiaRecommendationName -Recommendation $rec
+            $sp = Get-HpiaSoftPaqNumber -Recommendation $rec
+
+            if (-not $sp) {
+                continue
+            }
+
+            # Exclude BIOS/Firmware explicitly.
+            $combined = ("{0} {1}" -f $category, $name)
+            if ($combined -match '(?i)\bBIOS\b|Firmware') {
+                $script:SkippedList.Add(("SP{0} {1}" -f $sp, $name)) | Out-Null
+                Add-DriverResult -Vendor 'HP' -Name $name -Id $sp -Category $category -Status 'Blocked' -Message 'Excluded because it appears to be BIOS/Firmware.'
+                continue
+            }
+
+            # Prefer driver-like recommendations, but allow blank category if the SoftPaq was recommended and not BIOS/Firmware.
+            if ($combined -notmatch '(?i)Driver|Bluetooth|Chipset|Audio|Graphics|Video|LAN|WLAN|Wireless|NIC|Touch|Fingerprint|Card Reader|Storage|Serial|USB|Management Engine' -and $category) {
+                $script:SkippedList.Add(("SP{0} {1}" -f $sp, $name)) | Out-Null
+                Add-DriverResult -Vendor 'HP' -Name $name -Id $sp -Category $category -Status 'Skipped' -Message 'Excluded because it did not appear to be a driver recommendation.'
+                continue
+            }
+
+            if (-not $seen.ContainsKey($sp)) {
+                $seen[$sp] = $true
+                $selected += $sp
+                Add-DriverResult -Vendor 'HP' -Name $name -Id $sp -Category $category -Status 'Detected' -Message 'Selected for HPIA SPList install.'
+            }
+        }
+
+        if (@($selected).Count -gt 0) {
+            Set-Content -LiteralPath $SPListPath -Value $selected -Encoding ASCII
+            Write-Log ("Created filtered HPIA SPList with {0} SoftPaqs: {1}" -f @($selected).Count, $SPListPath) 'OK'
+            Add-YamlAction ("Created filtered HPIA SPList with {0} SoftPaqs: {1}" -f @($selected).Count, $SPListPath)
         }
         else {
-            Write-Log "DNS resolution for ftp.hp.com failed. HP SoftPaq downloads may fail until DNS/network access is restored." 'WARN'
+            Write-Log 'No non-BIOS/Firmware driver SoftPaq recommendations were selected from HPIA reports.' 'OK'
+            Add-YamlAction 'No non-BIOS/Firmware driver SoftPaq recommendations were selected from HPIA reports.'
         }
+
+        return @($selected)
     }
-    catch {
-        Write-Log "Could not validate DNS resolution for ftp.hp.com: $($_.Exception.Message)" 'WARN'
-    }
-}
 
-function Invoke-WithRetry {
-    param(
-        [Parameter(Mandatory)][scriptblock]$ScriptBlock,
-        [int]$RetryCount = 3,
-        [int]$DelaySeconds = 8,
-        [string]$ActionDescription = 'Operation'
-    )
 
-    $lastError = $null
+    function Invoke-HPDriverUpdates {
+        Write-Section 'HP Driver Analysis and Installation'
 
-    for ($attempt = 1; $attempt -le $RetryCount; $attempt++) {
-        try {
-            & $ScriptBlock
-            if ($attempt -gt 1) {
-                Write-Log "$ActionDescription succeeded on attempt $attempt of $RetryCount." 'OK'
-            }
-            return $true
+        $hpInfo = Get-HPSystemModelInfo
+
+        $hpiaExe = Install-HPIAFromExtractedFolder -SourceFolder $HpiaSourceFolder -DestinationFolder $LocalHpiaFolder
+
+        $hpiaReportFolder = Join-Path $YamlLogFolder 'HPIA'
+        $hpiaDownloadFolder = Join-Path $WorkingRoot 'HPIADownloads'
+        $hpiaExtractFolder = Join-Path $WorkingRoot 'HPIAExtracted'
+        $spListPath = Join-Path $WorkingRoot 'HPIA_Driver_SPList.txt'
+
+        Ensure-Folder -Path $hpiaReportFolder
+        Ensure-Folder -Path $hpiaDownloadFolder
+        Ensure-Folder -Path $hpiaExtractFolder
+
+        # Pass 1: List all recommendations so we can filter out BIOS/Firmware before install.
+        Write-Log 'Running HP Image Assistant list pass to detect recommended updates...' 'INFO'
+        Add-YamlAction 'Running HPIA list pass to detect recommendations.'
+
+        $listArgs = @(
+            '/Operation:Analyze',
+            '/Action:List',
+            '/Category:All',
+            '/Selection:All',
+            '/Silent',
+            "/ReportFolder:`"$hpiaReportFolder`"",
+            "/SoftpaqDownloadFolder:`"$hpiaDownloadFolder`""
+        )
+
+        Write-Log ("HPIA list command: {0} {1}" -f $hpiaExe, ($listArgs -join ' ')) 'INFO'
+        $listProc = Start-Process -FilePath $hpiaExe -ArgumentList ($listArgs -join ' ') -Wait -PassThru -NoNewWindow
+        $listExitCode = [int]$listProc.ExitCode
+        $listStatus = Get-HpiaExitStatus -ExitCode $listExitCode
+
+        Write-Log ("HPIA list pass completed with exit code {0} ({1})." -f $listExitCode, $listStatus) 'INFO'
+        Add-YamlAction ("HPIA list pass completed with exit code {0} ({1})." -f $listExitCode, $listStatus)
+
+        if ($listExitCode -eq 256) {
+            Write-Log 'HPIA found no recommendations for this system.' 'OK'
+            Add-YamlAction 'HPIA found no recommendations for this system.'
+            return
         }
-        catch {
-            $lastError = $_.Exception.Message
-            Write-Log "$ActionDescription failed on attempt $attempt of ${RetryCount}: $lastError" 'WARN'
 
-            if ($attempt -lt $RetryCount) {
-                Start-Sleep -Seconds $DelaySeconds
-                Initialize-HPNetworkAccess
-            }
+        if ($listExitCode -notin @(0, 257, 3010)) {
+            throw "HPIA list pass failed with exit code $listExitCode ($listStatus). Review reports in $hpiaReportFolder."
         }
-    }
 
-    throw "$ActionDescription failed after $RetryCount attempts. Last error: $lastError"
-}
+        $selectedSoftPaqs = @(New-HpiaDriverSPList -ReportFolder $hpiaReportFolder -SPListPath $spListPath)
 
-function Ensure-NuGetProvider {
-    Write-Log "Ensuring NuGet provider is installed..." 'INFO'
-    try {
-        Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope AllUsers | Out-Null
-        Write-Log "NuGet provider is ready." 'OK'
-    }
-    catch {
-        Write-Log "NuGet provider installation/check failed: $($_.Exception.Message)" 'WARN'
-    }
-}
-
-function Ensure-PSGalleryTrusted {
-    try {
-        $repo = Get-PSRepository -Name 'PSGallery' -ErrorAction Stop
-        if ($repo.InstallationPolicy -ne 'Trusted') {
-            Set-PSRepository -Name 'PSGallery' -InstallationPolicy Trusted
-            Write-Log "Set PSGallery repository to Trusted." 'OK'
+        if ($selectedSoftPaqs.Count -eq 0) {
+            Write-Log 'No recommended driver SoftPaqs were selected after excluding BIOS/Firmware.' 'OK'
+            Add-YamlAction 'No recommended driver SoftPaqs were selected after excluding BIOS/Firmware.'
+            return
         }
-        else {
-            Write-Log "PSGallery repository already Trusted." 'INFO'
+
+        Write-Log ("Installing recommended non-BIOS/Firmware driver SoftPaqs: {0}" -f ($selectedSoftPaqs -join ', ')) 'INFO'
+        Add-YamlAction ("Installing recommended non-BIOS/Firmware driver SoftPaqs: {0}" -f ($selectedSoftPaqs -join ', '))
+
+        # Pass 2: Install only the filtered SPList.
+        $installArgs = @(
+            '/Operation:Analyze',
+            '/Action:Install',
+            "/SPList:`"$spListPath`"",
+            '/Silent',
+            "/ReportFolder:`"$hpiaReportFolder`"",
+            "/SoftpaqDownloadFolder:`"$hpiaDownloadFolder`"",
+            "/SoftpaqExtractFolder:`"$hpiaExtractFolder`""
+        )
+
+        Write-Log ("HPIA install command: {0} {1}" -f $hpiaExe, ($installArgs -join ' ')) 'INFO'
+        Write-Progress -Activity 'HP Image Assistant' -Status ("Installing recommended drivers for {0}" -f $hpInfo.Model) -PercentComplete 50
+
+        $installProc = Start-Process -FilePath $hpiaExe -ArgumentList ($installArgs -join ' ') -Wait -PassThru -NoNewWindow
+        $exitCode = [int]$installProc.ExitCode
+        $status = Get-HpiaExitStatus -ExitCode $exitCode
+
+        Write-Progress -Activity 'HP Image Assistant' -Completed
+
+        Write-Log ("HP Image Assistant install pass completed with exit code {0} ({1})." -f $exitCode, $status) 'INFO'
+        Add-YamlAction ("HP Image Assistant install pass completed with exit code {0} ({1})." -f $exitCode, $status)
+
+        $downloadedFiles = @(Get-ChildItem -Path $hpiaDownloadFolder -File -Recurse -ErrorAction SilentlyContinue)
+        foreach ($file in $downloadedFiles) {
+            Add-DriverResult -Vendor 'HP' -Name $file.Name -Id $null -Category 'Driver' -Status 'Detected' -Message ("Downloaded/processed by HPIA: {0}" -f $file.FullName)
         }
-    }
-    catch {
-        Write-Log "Could not validate/set PSGallery trust: $($_.Exception.Message)" 'WARN'
-    }
-}
 
-function Install-ModuleIfPossible {
-    param(
-        [Parameter(Mandatory)][string]$Name,
-        [switch]$AllowClobber
-    )
+        $reportFiles = @(Get-ChildItem -Path $hpiaReportFolder -File -Recurse -ErrorAction SilentlyContinue)
+        foreach ($report in $reportFiles) {
+            Add-YamlAction ("HPIA report generated: {0}" -f $report.FullName)
+        }
 
-    $args = @{
-        Name        = $Name
-        Scope       = 'AllUsers'
-        Force       = $true
-        ErrorAction = 'Stop'
-    }
+        if ($exitCode -eq 3010 -or $status -eq 'needs_reboot') {
+            Write-Log 'HPIA installed one or more updates and a reboot may be required.' 'WARN'
+            Add-YamlAction 'HPIA installed updates and indicated reboot may be required.'
+            return
+        }
 
-    if ($AllowClobber) {
-        $args['AllowClobber'] = $true
-    }
+        if ($exitCode -eq 3011) {
+            Write-Log 'One or more HPIA SoftPaqs were not auto-installable and were skipped.' 'WARN'
+            Add-YamlAction 'One or more HPIA SoftPaqs were not auto-installable and were skipped.'
+            return
+        }
 
-    Install-Module @args | Out-Null
-}
+        if ($exitCode -eq 0 -or $exitCode -eq 257) {
+            Write-Log 'HPIA completed recommended driver install workflow.' 'OK'
+            Add-YamlAction 'HPIA completed recommended driver install workflow.'
+            return
+        }
 
-function Ensure-PackageTooling {
-    Write-Log "Ensuring PowerShell package tooling is current enough for HPCMSL..." 'INFO'
-
-    Initialize-HPNetworkAccess
-    Ensure-NuGetProvider
-    Ensure-PSGalleryTrusted
-
-    try {
-        Install-ModuleIfPossible -Name 'PowerShellGet' -AllowClobber
-        Write-Log "PowerShellGet installed/updated." 'OK'
-    }
-    catch {
-        Write-Log "PowerShellGet update failed: $($_.Exception.Message)" 'WARN'
+        throw "HP Image Assistant install pass failed or returned an unexpected exit code: $exitCode ($status). Review reports in $hpiaReportFolder."
     }
 
-    try {
-        Install-ModuleIfPossible -Name 'Microsoft.PowerShell.PSResourceGet'
-        Write-Log "Microsoft.PowerShell.PSResourceGet installed/updated." 'OK'
-    }
-    catch {
-        Write-Log "PSResourceGet install/update failed: $($_.Exception.Message)" 'WARN'
-    }
+    # -----------------------------
+    # Dell support
+    # -----------------------------
+    function Wait-ForFile {
+        param(
+            [Parameter(Mandatory)][string]$Path,
+            [int]$TimeoutSeconds = 30
+        )
 
-    try {
-        Import-Module PowerShellGet -Force -ErrorAction Stop
-    }
-    catch {
-        Write-Log "Could not import PowerShellGet: $($_.Exception.Message)" 'WARN'
-    }
-
-    try {
-        Import-Module Microsoft.PowerShell.PSResourceGet -Force -ErrorAction Stop
-    }
-    catch {
-        Write-Log "Could not import PSResourceGet yet: $($_.Exception.Message)" 'WARN'
-    }
-}
-
-function Ensure-HPCMSL {
-    Write-Log "Ensuring HP CMSL is available..." 'INFO'
-
-    Ensure-PackageTooling
-
-    $moduleLoaded = $false
-
-    if (-not (Get-Module -ListAvailable -Name HPCMSL)) {
-        try {
-            if (Get-Command -Name Install-PSResource -ErrorAction SilentlyContinue) {
-                Write-Log "Installing HPCMSL with Install-PSResource..." 'INFO'
-                Install-PSResource -Name HPCMSL -Scope AllUsers -TrustRepository -Quiet -AcceptLicense -ErrorAction Stop | Out-Null
-            }
-            else {
-                Write-Log "Install-PSResource not available. Falling back to Install-Module for HPCMSL..." 'WARN'
-                Install-ModuleIfPossible -Name 'HPCMSL' -AllowClobber
+        $start = Get-Date
+        while (-not (Test-Path -LiteralPath $Path)) {
+            Start-Sleep -Seconds 1
+            if (((Get-Date) - $start).TotalSeconds -ge $TimeoutSeconds) {
+                return $false
             }
         }
-        catch {
-            Write-Log "Primary HPCMSL install attempt failed: $($_.Exception.Message)" 'WARN'
-
-            try {
-                Write-Log "Trying fallback HPCMSL install with Install-Module..." 'INFO'
-                Install-ModuleIfPossible -Name 'HPCMSL' -AllowClobber
-            }
-            catch {
-                throw "Failed to install HPCMSL. $($_.Exception.Message)"
-            }
-        }
-    }
-    else {
-        Write-Log "HPCMSL already present on system." 'INFO'
-    }
-
-    try {
-        Import-Module HPCMSL -Force -ErrorAction Stop
-        $moduleLoaded = $true
-    }
-    catch {
-        try {
-            Import-Module HP.Softpaq -Force -ErrorAction Stop
-            $moduleLoaded = $true
-        }
-        catch {
-            throw "HPCMSL/HP.Softpaq could not be imported after installation. $($_.Exception.Message)"
-        }
-    }
-
-    if ($moduleLoaded) {
-        Write-Log "HP CMSL imported successfully." 'OK'
-    }
-}
-
-function Get-HPSoftpaqCategories {
-    $categories = @('Driver')
-
-    if ($IncludeBIOS) {
-        $categories += 'BIOS'
-    }
-
-    if ($IncludeSoftware) {
-        $categories += @('Diagnostic', 'Dock', 'Software', 'Utility')
-    }
-
-    return $categories
-}
-
-function Get-DriverList {
-    $categories = Get-HPSoftpaqCategories
-    Write-Log "Querying HP SoftPaq list for categories: $($categories -join ', ')" 'INFO'
-    Write-Log "BIOS category is enabled by default so Flash BIOS firmware updates can be downloaded and installed when applicable." 'INFO'
-
-    $list = Get-SoftpaqList -Category $categories
-
-    if (-not $list) {
-        Write-Log "No applicable HP SoftPaq updates were returned." 'OK'
-        return @()
-    }
-
-    $biosCount = 0
-
-    foreach ($item in $list) {
-        $category = $null
-        if ($item.PSObject.Properties.Name -contains 'Category') {
-            $category = [string]$item.Category
-        }
-
-        if ($category -match 'BIOS') {
-            $biosCount++
-        }
-
-        Add-DetectedSoftPaq -Id ([string]$item.Id) -Name ([string]$item.Name) -Version ([string]$item.Version) -Category $category
-        Write-Log "Detected: [$($item.Id)] $($item.Name) Version $($item.Version) Category [$category]" 'INFO'
-    }
-
-    if ($biosCount -gt 0) {
-        Write-Log "Detected $biosCount applicable BIOS/Flash BIOS firmware SoftPaq update(s)." 'INFO'
-    }
-    else {
-        Write-Log "No applicable BIOS/Flash BIOS firmware SoftPaq updates were detected." 'INFO'
-    }
-
-    return @($list)
-}
-
-function Install-SoftpaqList {
-    param([object[]]$Softpaqs)
-
-    $failures = 0
-
-    foreach ($item in $Softpaqs) {
-        try {
-            $category = $null
-            if ($item.PSObject.Properties.Name -contains 'Category') {
-                $category = [string]$item.Category
-            }
-
-            if ($category -match 'BIOS') {
-                Write-Log "Downloading and installing Flash BIOS firmware SoftPaq [$($item.Id)] $($item.Name)..." 'INFO'
-            }
-            else {
-                Write-Log "Installing SoftPaq [$($item.Id)] $($item.Name)..." 'INFO'
-            }
-
-            Get-Softpaq -Number $item.Id -Action SilentInstall | Out-Null
-
-            if ($category -match 'BIOS') {
-                Write-Log "Installed Flash BIOS firmware SoftPaq [$($item.Id)] $($item.Name). A reboot may be required to complete flashing." 'OK'
-                Add-InstalledSoftPaqResult -Id ([string]$item.Id) -Name ([string]$item.Name) -Version ([string]$item.Version) -Status 'Succeeded' -Message 'Flash BIOS firmware installed successfully; reboot may be required'
-            }
-            else {
-                Write-Log "Installed SoftPaq [$($item.Id)] $($item.Name)." 'OK'
-                Add-InstalledSoftPaqResult -Id ([string]$item.Id) -Name ([string]$item.Name) -Version ([string]$item.Version) -Status 'Succeeded' -Message 'Installed successfully'
-            }
-        }
-        catch {
-            $msg = $_.Exception.Message
-            Write-Log "Failed SoftPaq [$($item.Id)] $($item.Name): $msg" 'WARN'
-            Add-InstalledSoftPaqResult -Id ([string]$item.Id) -Name ([string]$item.Name) -Version ([string]$item.Version) -Status 'Failed' -Message $msg
-            $failures++
-        }
-    }
-
-    return $failures
-}
-
-function Suspend-BitLockerIfNeeded {
-    if (-not $SuspendBitLockerForBIOS) {
-        return
-    }
-
-    if (-not $IncludeBIOS) {
-        Write-Log "SuspendBitLockerForBIOS was requested, but IncludeBIOS is not enabled. Skipping BitLocker suspend." 'WARN'
-        return
-    }
-
-    try {
-        $vol = Get-BitLockerVolume -MountPoint 'C:'
-        if ($vol.VolumeStatus -ne 'FullyDecrypted') {
-            Suspend-BitLocker -MountPoint 'C:' -RebootCount 1
-            Write-Log "BitLocker suspended for one reboot." 'OK'
-        }
-        else {
-            Write-Log "BitLocker is not active on C:. No suspend needed." 'INFO'
-        }
-    }
-    catch {
-        Write-Log "Could not evaluate or suspend BitLocker: $($_.Exception.Message)" 'WARN'
-    }
-}
-
-function Remove-WorkingFolderRobust {
-    param(
-        [Parameter(Mandatory)][string]$Path,
-        [int]$RetryCount = 12,
-        [int]$RetryDelaySeconds = 10
-    )
-
-    if (-not (Test-Path -LiteralPath $Path)) {
-        Write-Log "Working folder already absent: $Path" 'OK'
         return $true
     }
 
-    Write-Log "Attempting to remove working folder: $Path" 'INFO'
+    function Get-DcuReportXmlSafely {
+        param(
+            [Parameter(Mandatory)][string]$Path,
+            [int]$RetryCount = 5,
+            [int]$RetryDelaySeconds = 2
+        )
 
-    for ($i = 1; $i -le $RetryCount; $i++) {
+        if (-not (Wait-ForFile -Path $Path -TimeoutSeconds 20)) {
+            throw "Dell DCU report file was not found: $Path"
+        }
+
+        Start-Sleep -Seconds 3
+
+        for ($i = 1; $i -le $RetryCount; $i++) {
+            try {
+                $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+                try {
+                    $sr = New-Object System.IO.StreamReader($fs)
+                    try {
+                        $content = $sr.ReadToEnd()
+                    }
+                    finally {
+                        $sr.Dispose()
+                    }
+                }
+                finally {
+                    $fs.Dispose()
+                }
+
+                $xml = New-Object System.Xml.XmlDocument
+                $xml.LoadXml($content)
+                return $xml
+            }
+            catch {
+                if ($i -eq $RetryCount) {
+                    throw
+                }
+                Start-Sleep -Seconds $RetryDelaySeconds
+            }
+        }
+    }
+
+    function Get-DellNodeText {
+        param(
+            [Parameter(Mandatory)][xml]$Node,
+            [Parameter(Mandatory)][string[]]$Names
+        )
+
+        foreach ($name in $Names) {
+            try {
+                $xpath = './/*[local-name()="' + $name + '"]'
+                $child = $Node.SelectSingleNode($xpath)
+                if ($child -and -not [string]::IsNullOrWhiteSpace($child.InnerText)) {
+                    return $child.InnerText.Trim()
+                }
+            }
+            catch {}
+        }
+
+        return $null
+    }
+
+    function Get-DellReportItems {
+        param([Parameter(Mandatory)][xml]$Xml)
+
+        $items = @()
         try {
-            Start-Sleep -Seconds 2
-            Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+            $xpath = '//*[local-name()="Update" or local-name()="Package" or local-name()="SoftwareComponent" or local-name()="component" or local-name()="Device"]'
+            $nodes = $Xml.SelectNodes($xpath)
+            foreach ($node in $nodes) {
+                $name = Get-DellNodeText -Node $node -Names @('Name','Title','PackageName')
+                $version = Get-DellNodeText -Node $node -Names @('Version','PackageVersion')
+                $category = Get-DellNodeText -Node $node -Names @('Category','Type')
+                $id = Get-DellNodeText -Node $node -Names @('Id','PackageId','ReleaseId')
 
-            if (-not (Test-Path -LiteralPath $Path)) {
-                Write-Log "Working folder removed successfully." 'OK'
-                return $true
+                if ($name -or $id) {
+                    $items += [pscustomobject]@{
+                        Id       = $id
+                        Name     = $name
+                        Version  = $version
+                        Category = $category
+                    }
+                }
+            }
+        }
+        catch {}
+
+        return @($items)
+    }
+
+    function Invoke-DellDriverUpdates {
+        Write-Section 'Dell Command Update Workflow'
+
+        $dcuCli = Join-Path ${env:ProgramFiles} 'Dell\CommandUpdate\dcu-cli.exe'
+        if (-not (Test-Path -LiteralPath $dcuCli)) {
+            throw "Dell Command | Update CLI was not found: $dcuCli"
+        }
+
+        Write-Log ("Using Dell Command | Update CLI: {0}" -f $dcuCli) 'OK'
+        Add-YamlAction 'Using Dell Command | Update CLI.'
+
+        $dcuScanLog  = Join-Path $WorkingRoot 'Dell-DCU-Scan.log'
+        $dcuApplyLog = Join-Path $WorkingRoot 'Dell-DCU-Apply.log'
+        $dcuReport   = Join-Path $WorkingRoot 'Dell-DCU-ApplicableUpdates.xml'
+
+        Write-Log 'Dell DCU Configure...' 'INFO'
+        Write-Progress -Activity 'Dell Driver Update Workflow' -Status 'Configuring Dell Command Update' -PercentComplete 10
+        $configureArgs = "/configure -silent -userConsent=disable -scheduleAuto -lockSettings=disable"
+        $proc = Start-Process -FilePath $dcuCli -ArgumentList $configureArgs -Wait -PassThru -NoNewWindow
+        Write-Log ("Dell DCU Configure exit code: {0}" -f $proc.ExitCode) 'INFO'
+
+        Write-Log 'Dell DCU Scan...' 'INFO'
+        Write-Progress -Activity 'Dell Driver Update Workflow' -Status 'Scanning for updates' -PercentComplete 35
+        $scanArgs = "/scan -silent -outputLog=""$dcuScanLog"" -report=""$dcuReport"""
+        $proc = Start-Process -FilePath $dcuCli -ArgumentList $scanArgs -Wait -PassThru -NoNewWindow
+        Write-Log ("Dell DCU Scan exit code: {0}" -f $proc.ExitCode) 'INFO'
+        Write-Log 'Waiting for Dell Command | Update to finish writing the report...' 'INFO'
+
+        try {
+            $xml = Get-DcuReportXmlSafely -Path $dcuReport
+            $items = Get-DellReportItems -Xml $xml
+
+            if ($items.Count -gt 0) {
+                Add-YamlAction ("Dell DCU report parsed successfully. Updates detected: {0}" -f $items.Count)
+
+                $total = $items.Count
+                $index = 0
+
+                foreach ($item in $items) {
+                    $index++
+                    $percent = 35 + [math]::Floor(($index / $total) * 35)
+                    $label = if ($item.Name) { $item.Name } elseif ($item.Id) { $item.Id } else { 'Dell update' }
+
+                    Write-Progress -Activity 'Dell Driver Update Workflow' -Status ("Parsing report: {0}" -f $label) -PercentComplete $percent
+
+                    if ($item.Category -match 'BIOS|Firmware') {
+                        $script:SkippedList.Add($label) | Out-Null
+                        Add-DriverResult -Vendor 'Dell' -Name $item.Name -Id $item.Id -Category $item.Category -Status 'Blocked' -Message 'BIOS/Firmware update blocked by script policy.'
+                        Write-Log ("Blocking Dell BIOS/Firmware update: {0}" -f $label) 'WARN'
+                    }
+                    else {
+                        Add-DriverResult -Vendor 'Dell' -Name $item.Name -Id $item.Id -Category $item.Category -Status 'Detected' -Message 'Detected in Dell DCU report.'
+                    }
+                }
+            }
+            else {
+                Add-YamlAction 'Dell DCU report parsed but returned no identifiable updates.'
             }
         }
         catch {
-            Write-Log "Cleanup attempt $i/$RetryCount failed: $($_.Exception.Message)" 'WARN'
+            Write-Log ("Failed to parse Dell DCU report: {0}" -f $_.Exception.Message) 'WARN'
         }
 
-        if ($i -lt $RetryCount) {
-            Start-Sleep -Seconds $RetryDelaySeconds
+        Write-Log 'Dell DCU ApplyUpdates...' 'INFO'
+        Write-Progress -Activity 'Dell Driver Update Workflow' -Status 'Applying updates' -PercentComplete 85
+        $applyArgs = "/applyUpdates -silent -reboot=disable -outputLog=""$dcuApplyLog"""
+        $proc = Start-Process -FilePath $dcuCli -ArgumentList $applyArgs -Wait -PassThru -NoNewWindow
+        Write-Log ("Dell DCU ApplyUpdates exit code: {0}" -f $proc.ExitCode) 'INFO'
+        Write-Log (("Dell DCU logs: {0} ; {1} ; {2}") -f $dcuScanLog, $dcuApplyLog, $dcuReport) 'OK'
+        Write-Progress -Activity 'Dell Driver Update Workflow' -Completed
+    }
+
+    # -----------------------------
+    # Main
+    # -----------------------------
+    $finalStatus = 'success'
+
+    try {
+        Write-Section 'Initialization'
+
+        Ensure-Folder -Path $YamlLogFolder
+        Ensure-Folder -Path $WorkingRoot
+        Ensure-WorkingFolderPermissions -Path $WorkingRoot
+
+        $yamlName = "{0}-{1}-{2}.yml" -f $script:ComputerName, '05_Weekend_Vendor_Drivers_Update', (Get-Date -Format 'yyyy-MM-dd_HHmmss')
+        $yamlPath = Join-Path $YamlLogFolder $yamlName
+
+        Write-Log ("YAML log will be written to: {0}" -f $yamlPath) 'INFO'
+        Initialize-YamlLog -ComputerName $script:ComputerName -YamlPath $yamlPath
+
+        Write-Log 'Initializing vendor driver update script...' 'INFO'
+
+        Write-Section 'Power Policy Enforcement'
+        Set-LocalPowerPolicyDesktop
+
+        Write-Section 'Vendor Detection'
+        $script:DetectedVendor = Get-DriverVendor
+        Write-Log ("Detected vendor workflow: {0}" -f $script:DetectedVendor) 'INFO'
+        Write-Log ("Working root: {0}" -f $WorkingRoot) 'INFO'
+
+        if ($script:DetectedVendor -eq 'HP') {
+            Invoke-HPDriverUpdates
         }
-    }
+        elseif ($script:DetectedVendor -eq 'Dell') {
+            Invoke-DellDriverUpdates
+        }
 
-    Write-Log "Working folder still exists after cleanup attempts: $Path" 'ERROR'
-    return $false
-}
-
-# Main
-if (-not (Test-IsAdministrator)) {
-    Write-Error "Please run this script as Administrator."
-    return 1
-}
-
-Initialize-YamlLog
-
-if (-not (Test-IsHPSystem)) {
-    Write-Log "This is not an HP or Hewlett-Packard system. Skipping HP driver update." 'WARN'
-    $script:OverallResult = 'SkippedNonHPSystem'
-    Write-YamlLog
-    return 0
-}
-
-Ensure-Folder -Path $WorkingRoot
-
-$SavedPower = $null
-$OriginalLocation = (Get-Location).Path
-$Failures = 0
-$CleanupOk = $false
-
-try {
-    Write-Log "Initializing HP driver update script..." 'INFO'
-    Write-Log "Working root: $WorkingRoot" 'INFO'
-
-    $SavedPower = Save-PowerSettings
-    Set-UnlimitedPowerTimeouts
-    Ensure-HPCMSL
-    Suspend-BitLockerIfNeeded
-
-    Set-Location -Path $WorkingRoot
-
-    $softpaqs = Get-DriverList
-    if ($softpaqs.Count -eq 0) {
-        $CleanupOk = Remove-WorkingFolderRobust -Path $WorkingRoot -RetryCount $CleanupRetryCount -RetryDelaySeconds $CleanupRetryDelaySeconds
-        $script:CleanupResult = $CleanupOk
-        $script:OverallResult = if ($CleanupOk) { 'SucceededNoApplicableUpdates' } else { 'SucceededNoApplicableUpdatesCleanupIncomplete' }
-        Write-YamlLog
-        return $(if ($CleanupOk) { 0 } else { 2 })
-    }
-
-    $Failures = Install-SoftpaqList -Softpaqs $softpaqs
-}
-catch {
-    $script:FailureMessage = $_.Exception.Message
-    Write-Log "Script failed: $($_.Exception.Message)" 'ERROR'
-    $Failures++
-}
-finally {
-    try {
-        Set-Location -Path $OriginalLocation
+        Write-Section 'Final Power Reapply'
+        Write-Log 'Reapplying enforced local desktop power policy (display 60 minutes, sleep never)...' 'INFO'
+        Set-LocalPowerPolicyDesktop
+        Enforce-DesktopPowerSettings
     }
     catch {
+        $finalStatus = 'failed'
+        Add-RunFailure ("Script failed: {0}" -f $_.Exception.Message)
     }
+    finally {
+        Write-Section 'Cleanup'
+        Remove-WorkingFolderRobust -Path $WorkingRoot
 
-    try {
-        Restore-PowerSettings -Saved $SavedPower
-    }
-    catch {
-        Write-Log "Failed restoring power settings: $($_.Exception.Message)" 'WARN'
-    }
+        if ($script:RunFailures.Count -gt 0 -and $finalStatus -ne 'failed') {
+            $finalStatus = 'completed_with_warnings'
+        }
 
-    $CleanupOk = Remove-WorkingFolderRobust -Path $WorkingRoot -RetryCount $CleanupRetryCount -RetryDelaySeconds $CleanupRetryDelaySeconds
-    $script:CleanupResult = $CleanupOk
-}
+        if ($script:RunFailures.Count -gt 0) {
+            Write-Log (("{0} driver update completed with one or more failures.") -f $script:DetectedVendor) 'WARN'
+        }
+        else {
+            Write-Log (("{0} driver update script completed successfully.") -f $script:DetectedVendor) 'OK'
+        }
 
-if ($Failures -eq 0 -and $CleanupOk) {
-    Write-Log "HP driver update script completed successfully." 'OK'
-    $script:OverallResult = 'Succeeded'
-    Write-YamlLog
-    return 0
-}
-elseif ($Failures -eq 0 -and -not $CleanupOk) {
-    Write-Log "HP driver update succeeded, but cleanup was incomplete." 'WARN'
-    $script:OverallResult = 'SucceededCleanupIncomplete'
-    Write-YamlLog
-    return 2
-}
-else {
-    Write-Log "HP driver update completed with one or more failures." 'WARN'
-    if ([string]::IsNullOrWhiteSpace($script:FailureMessage)) {
-        $script:FailureMessage = 'One or more SoftPaq installations failed.'
+        Save-YamlLog -Status $finalStatus
     }
-    $script:OverallResult = 'Failed'
-    Write-YamlLog
-    return 3
-}
 }
 
+# -----------------------------------------------------------------------------
 # -----------------------------------------------------------------------------
 # Option 11 - Windows Updates
 # -----------------------------------------------------------------------------
 function Update-WindowsOS {
     <#
     .SYNOPSIS
-    Performs comprehensive Windows OS updates with enhanced security and progress tracking
-    
-    .DESCRIPTION
-    Executes a complete Windows update cycle including Group Policy refresh, Windows Update
-    component reset, update installation, and post-update validation. Includes security
-    validation, progress monitoring, and enterprise-ready features.
-    
-    .PARAMETER UpdateCategory
-    Categories of updates to install (All, Security, Critical, Recommended, Optional)
-    
-    .PARAMETER CreateRestorePoint
-    Create system restore point before installing updates
-    
-    .PARAMETER SkipGroupPolicyReset
-    Skip Group Policy folder reset and update
-    
-    .PARAMETER SkipComponentReset
-    Skip Windows Update component reset for faster execution
-    
-    .PARAMETER MaxUpdateTimeout
-    Maximum timeout for individual update operations in minutes
-    
-    .PARAMETER AllowReboot
-    Allow automatic reboot if required by updates
-    
-    .PARAMETER DeferFeatureUpdates
-    Defer feature updates and install only quality updates
-    
-    .OUTPUTS
-    Returns hashtable with detailed update results and system status
-    
-    .EXAMPLE
-    Update-WindowsOS
-    
-    .EXAMPLE
-    Update-WindowsOS -UpdateCategory Security -CreateRestorePoint
-    
-    .EXAMPLE
-    Update-WindowsOS -SkipGroupPolicyReset -DeferFeatureUpdates -WhatIf
+    Runs the merged 06_Weekend_Windows_Updates logic from inside Compton Tech Utils.
     #>
+    # =====================================================================
+    # ScriptName: 06_Weekend_Windows_Updates.ps1
+    # ScriptVersion: 1.8
+    # LastUpdated: 2026-04-26
+    # Purpose: Installs Windows Updates using PSWindowsUpdate, writes a
+    #          YAML audit log in C:\Logs, and explicitly reboots if Windows
+    #          reports that a reboot is required.
+    # =====================================================================
     
-    [CmdletBinding(SupportsShouldProcess)]
-    param(
-        [Parameter()]
-        [ValidateSet('All', 'Security', 'Critical', 'Recommended', 'Optional')]
-        [string]$UpdateCategory = 'All',
-        
-        [Parameter()]
-        [switch]$CreateRestorePoint,
-        
-        [Parameter()]
-        [switch]$SkipGroupPolicyReset,
-        
-        [Parameter()]
-        [switch]$SkipComponentReset,
-        
-        [Parameter()]
-        [ValidateRange(5, 120)]
-        [int]$MaxUpdateTimeout = 60,
-        
-        [Parameter()]
-        [switch]$AllowReboot,
-        
-        [Parameter()]
-        [switch]$DeferFeatureUpdates
-    )
-    
-    Write-StatusLog "Starting comprehensive Windows OS update process..." -Level "Info"
-    
-    # Initialize results tracking
-    $results = @{
-        PrerequisitesReady = $false
-        GroupPolicyReset = $false
-        ComponentsReset = $false
-        RestorePointCreated = $false
-        AvailableUpdates = @()
-        InstalledUpdates = @()
-        FailedUpdates = @()
-        SecurityUpdates = @()
-        RebootRequired = $false
-        UpdateDuration = $null
-        SystemValidation = @{}
-        Errors = @()
-        ProgressDetails = @()
-    }
-    
-    $startTime = Get-Date
-    
-    try {
-        # Step 1: Validate prerequisites and prepare system
-        Write-StatusLog "Validating system prerequisites..." -Level "Info"
-        $prereqResult = Ensure-WindowsUpdatePrerequisites
-        $results.PrerequisitesReady = $prereqResult.Success
-        
-        if (-not $results.PrerequisitesReady) {
-            $results.Errors += $prereqResult.Errors
-            throw "Windows Update prerequisites not ready"
-        }
-        
-        # Step 2: Create restore point if requested
-        if ($CreateRestorePoint) {
-            Write-StatusLog "Creating system restore point..." -Level "Info"
-            $restoreResult = New-SystemRestorePointSafe -Description "Before Windows Updates"
-            $results.RestorePointCreated = $restoreResult.Success
-            
-            if (-not $restoreResult.Success) {
-                Write-StatusLog "[WARN] Failed to create restore point: $($restoreResult.Error)" -Level "Warning"
-            }
-        }
-        
-        # Step 3: Group Policy management
-        if (-not $SkipGroupPolicyReset) {
-            Write-StatusLog "Managing Group Policy configuration..." -Level "Info"
-            $gpResult = Reset-GroupPolicyConfiguration
-            $results.GroupPolicyReset = $gpResult.Success
-            
-            if (-not $gpResult.Success) {
-                $results.Errors += $gpResult.Errors
-            }
-        }
-        
-        # Step 4: Windows Update component reset
-        if (-not $SkipComponentReset) {
-            Write-StatusLog "Resetting Windows Update components..." -Level "Info"
-            $componentResult = Reset-WindowsUpdateComponents -MaxTimeout $MaxUpdateTimeout
-            $results.ComponentsReset = $componentResult.Success
-            
-            if (-not $componentResult.Success) {
-                $results.Errors += $componentResult.Errors
-            }
-        }
-        
-        # Step 5: Discover available updates
-        Write-StatusLog "Discovering available Windows updates..." -Level "Info"
-        $updateDiscovery = Get-AvailableWindowsUpdates -Category $UpdateCategory -DeferFeatureUpdates:$DeferFeatureUpdates
-        $results.AvailableUpdates = $updateDiscovery.Updates
-        
-        if ($updateDiscovery.Errors.Count -gt 0) {
-            $results.Errors += $updateDiscovery.Errors
-        }
-        
-        if ($results.AvailableUpdates.Count -eq 0) {
-            Write-StatusLog "No Windows updates available for installation" -Level "Info"
-            $global:LastStatus = "[OK] Windows is up to date"
-            return $results
-        }
-        
-        Write-StatusLog "Found $($results.AvailableUpdates.Count) available updates" -Level "Success"
-        
-        # Step 6: Display update plan
-        Show-WindowsUpdatePlan -Updates $results.AvailableUpdates -Category $UpdateCategory
-        
-        # Step 7: Install updates with progress tracking
-        Write-StatusLog "Installing Windows updates with security validation..." -Level "Info"
-        $installationResult = Install-WindowsUpdatesSecurely -Updates $results.AvailableUpdates -MaxTimeout $MaxUpdateTimeout -AllowReboot:$AllowReboot
-        
-        $results.InstalledUpdates = $installationResult.Installed
-        $results.FailedUpdates = $installationResult.Failed
-        $results.SecurityUpdates = $installationResult.SecurityUpdates
-        $results.RebootRequired = $installationResult.RebootRequired
-        $results.ProgressDetails = $installationResult.ProgressDetails
-        
-        if ($installationResult.Errors.Count -gt 0) {
-            $results.Errors += $installationResult.Errors
-        }
-        
-        # Step 8: Post-update system validation
-        Write-StatusLog "Performing post-update system validation..." -Level "Info"
-        $validationResult = Test-PostUpdateSystemHealth
-        $results.SystemValidation = $validationResult
-        
-        if ($validationResult.Errors.Count -gt 0) {
-            $results.Errors += $validationResult.Errors
-        }
-        
-        # Calculate final statistics
-        $results.UpdateDuration = (Get-Date) - $startTime
-        
-        # Display comprehensive summary
-        Show-WindowsUpdateSummary -Results $results
-        
-        # Set global status
-        $successCount = $results.InstalledUpdates.Count
-        $failCount = $results.FailedUpdates.Count
-        
-        if ($results.RebootRequired -and -not $AllowReboot) {
-            Write-StatusLog "[WARN] System restart required to complete updates" -Level "Warning"
-        }
-        
-        $global:LastStatus = if ($failCount -eq 0) {
-            "[OK] Windows updates completed successfully ($successCount updates)"
-        } else {
-            "[WARN] Windows updates completed with $failCount failures ($successCount successful)"
-        }
-        
-    } catch {
-        $errorMsg = "Critical error during Windows updates: $($_.Exception.Message)"
-        Write-StatusLog "[ERROR] $errorMsg" -Level "Error"
-        $results.Errors += $errorMsg
-        $global:LastStatus = "[ERROR] Windows updates failed"
-    } finally {
-        $results.UpdateDuration = (Get-Date) - $startTime
-    }
-    
-    return $results
-}
-
-function Ensure-WindowsUpdatePrerequisites {
-    <#
-    .SYNOPSIS
-    Ensures Windows Update prerequisites are met
-    
-    .OUTPUTS
-    Returns hashtable with prerequisite validation results
-    #>
-    
-    $result = @{
-        Success = $false
-        PSWindowsUpdateInstalled = $false
-        WingetReady = $false
-        ServicesRunning = $false
-        DiskSpaceAvailable = $false
-        Errors = @()
-    }
-    
-    try {
-        if ($WhatIfPreference) {
-            Write-Host "   Would validate Windows Update prerequisites" -ForegroundColor Yellow
-            $result.Success = $true
-            return $result
-        }
-        
-        # Check disk space (minimum 10GB free)
-        $systemDrive = Get-WmiObject -Class Win32_LogicalDisk | Where-Object { $_.DeviceID -eq $env:SystemDrive }
-        $freeSpaceGB = [math]::Round($systemDrive.FreeSpace / 1GB, 2)
-        
-        if ($freeSpaceGB -lt 10) {
-            $result.Errors += "Insufficient disk space: $freeSpaceGB GB available (minimum 10GB required)"
-        } else {
-            $result.DiskSpaceAvailable = $true
-            Write-StatusLog "[OK] Sufficient disk space available: $freeSpaceGB GB" -Level "Success"
-        }
-        
-        # Ensure Winget dependencies
-        Write-StatusLog "Verifying Winget dependencies..." -Level "Info"
-        $wingetResult = Ensure-WingetDependenciesReady
-        $result.WingetReady = $wingetResult.Success
-        
-        if (-not $result.WingetReady) {
-            $result.Errors += "Winget dependencies not ready"
-        }
-        
-        # Check and install PSWindowsUpdate module
-        Write-StatusLog "Checking PSWindowsUpdate module..." -Level "Info"
-        $psModule = Get-Module -ListAvailable -Name "PSWindowsUpdate" -ErrorAction SilentlyContinue
-        
-        if (-not $psModule) {
-            Write-StatusLog "Installing PSWindowsUpdate module..." -Level "Info"
-            try {
-                Install-Module -Name "PSWindowsUpdate" -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
-                $result.PSWindowsUpdateInstalled = $true
-                Write-StatusLog "[OK] PSWindowsUpdate module installed successfully" -Level "Success"
-            } catch {
-                $result.Errors += "Failed to install PSWindowsUpdate module: $($_.Exception.Message)"
-            }
-        } else {
-            $result.PSWindowsUpdateInstalled = $true
-            Write-StatusLog "[OK] PSWindowsUpdate module already available" -Level "Success"
-            
-            # Check for updates
-            try {
-                $latestVersion = Find-Module -Name "PSWindowsUpdate" -ErrorAction SilentlyContinue
-                $currentVersion = $psModule | Sort-Object Version -Descending | Select-Object -First 1
-                
-                if ($latestVersion -and $currentVersion.Version -lt $latestVersion.Version) {
-                    Write-StatusLog "Updating PSWindowsUpdate module..." -Level "Info"
-                    Update-Module -Name "PSWindowsUpdate" -Force -ErrorAction Stop
-                    Write-StatusLog "[OK] PSWindowsUpdate module updated successfully" -Level "Success"
-                }
-            } catch {
-                Write-StatusLog "[WARN] Could not check for PSWindowsUpdate module updates: $($_.Exception.Message)" -Level "Warning"
-            }
-        }
-        
-        # Import the module
-        try {
-            Import-Module -Name "PSWindowsUpdate" -Force -ErrorAction Stop
-            Write-StatusLog "[OK] PSWindowsUpdate module imported successfully" -Level "Success"
-        } catch {
-            $result.Errors += "Failed to import PSWindowsUpdate module: $($_.Exception.Message)"
-        }
-        
-        # Validate Windows Update services
-        $requiredServices = @('wuauserv', 'cryptsvc', 'bits', 'msiserver')
-        $servicesStatus = @()
-        
-        foreach ($serviceName in $requiredServices) {
-            $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
-            if ($service) {
-                if ($service.Status -ne 'Running') {
-                    try {
-                        Start-Service -Name $serviceName -ErrorAction Stop
-                        Write-StatusLog "[OK] Started service: $serviceName" -Level "Success"
-                    } catch {
-                        $result.Errors += "Failed to start service $serviceName`: $($_.Exception.Message)"
-                    }
-                }
-                $servicesStatus += $true
-            } else {
-                $result.Errors += "Required service not found: $serviceName"
-                $servicesStatus += $false
-            }
-        }
-        
-        $result.ServicesRunning = ($servicesStatus | Where-Object { $_ -eq $false }).Count -eq 0
-        
-        $result.Success = $result.PSWindowsUpdateInstalled -and $result.WingetReady -and $result.ServicesRunning -and $result.DiskSpaceAvailable
-        
-    } catch {
-        $result.Errors += "Failed to validate prerequisites: $($_.Exception.Message)"
-    }
-    
-    return $result
-}
-
-function Reset-GroupPolicyConfiguration {
-    <#
-    .SYNOPSIS
-    Resets Group Policy configuration and forces update
-    
-    .OUTPUTS
-    Returns hashtable with Group Policy reset results
-    #>
-    
-    $result = @{
-        Success = $false
-        FolderRemoved = $false
-        PolicyUpdated = $false
-        Errors = @()
-    }
-    
-    try {
-        if ($WhatIfPreference) {
-            Write-Host "   Would reset Group Policy configuration" -ForegroundColor Yellow
-            $result.Success = $true
-            return $result
-        }
-        
-        # Remove local Group Policy folder
-        $gpPath = Join-Path $env:Windir 'System32\GroupPolicy'
-        
-        if (Test-Path $gpPath) {
-            Write-StatusLog "Removing local GroupPolicy folder..." -Level "Info"
-            try {
-                # Take ownership and reset permissions first
-                takeown /f $gpPath /r /d y 2>$null | Out-Null
-                icacls $gpPath /grant administrators:F /t 2>$null | Out-Null
-                
-                Remove-Item -Path $gpPath -Recurse -Force -ErrorAction Stop
-                $result.FolderRemoved = $true
-                Write-StatusLog "[OK] Group Policy folder removed successfully" -Level "Success"
-            } catch {
-                $result.Errors += "Failed to remove Group Policy folder: $($_.Exception.Message)"
-                Write-StatusLog "[ERROR] Failed to remove Group Policy folder: $($_.Exception.Message)" -Level "Error"
-            }
-        } else {
-            Write-StatusLog "[INFO] Group Policy folder not found, skipping removal" -Level "Info"
-            $result.FolderRemoved = $true  # Consider this successful
-        }
-        
-        # Force Group Policy update
-        Write-StatusLog "Forcing Group Policy update..." -Level "Info"
-        try {
-            $gpupdateResult = & gpupdate /force 2>&1
-            $exitCode = $LASTEXITCODE
-            
-            if ($exitCode -eq 0) {
-                $result.PolicyUpdated = $true
-                Write-StatusLog "[OK] Group Policy update completed successfully" -Level "Success"
-            } else {
-                $result.Errors += "gpupdate failed with exit code: $exitCode. Output: $gpupdateResult"
-                Write-StatusLog "[ERROR] Group Policy update failed with exit code: $exitCode" -Level "Error"
-            }
-        } catch {
-            $result.Errors += "Failed to execute gpupdate: $($_.Exception.Message)"
-            Write-StatusLog "[ERROR] Failed to execute gpupdate: $($_.Exception.Message)" -Level "Error"
-        }
-        
-        $result.Success = $result.FolderRemoved -and $result.PolicyUpdated
-        
-    } catch {
-        $result.Errors += "Group Policy reset failed: $($_.Exception.Message)"
-    }
-    
-    return $result
-}
-
-function Reset-WindowsUpdateComponents {
-    <#
-    .SYNOPSIS
-    Resets Windows Update components with timeout and retry logic
-
-    .PARAMETER MaxTimeout
-    Maximum timeout in minutes for the operation
-
-    .OUTPUTS
-    Returns hashtable with component reset results
-    #>
-
     [CmdletBinding()]
     param(
-        [Parameter()]
-        [int]$MaxTimeout = 60
+        [switch]$ResetWUComponentsFirst = $false,
+        [int]$OperationTimeoutSeconds = 1800,
+        [int]$RebootDelaySeconds = 30,
+        [string]$YamlLogFolder = "$env:SystemDrive\Logs"
     )
-
-    $result = @{
-        Success = $false
-        ComponentsReset = $false
-        Errors = @()
-        Duration = $null
-    }
-
-    $resetStart = Get-Date
-
-    try {
-        if ($WhatIfPreference) {
-            Write-Host "   Would reset Windows Update components" -ForegroundColor Yellow
-            $result.Success = $true
-            return $result
-        }
-
-        Write-StatusLog "Resetting Windows Update components using built-in manual routine..." -Level "Info"
-        $result = Reset-WUComponentsManually
-
-    } catch {
-        $result.Errors += "Component reset process failed: $($_.Exception.Message)"
-        Write-StatusLog "[ERROR] Component reset process failed: $($_.Exception.Message)" -Level "Error"
-    } finally {
-        $result.Duration = (Get-Date) - $resetStart
-    }
-
-    return $result
-}
-
-function Reset-WUComponentsManually {
-    <#
-    .SYNOPSIS
-    Manually resets Windows Update components when PSWindowsUpdate module is not available
     
-    .OUTPUTS
-    Returns hashtable with manual reset results
-    #>
+    $ErrorActionPreference = 'Stop'
     
-    $result = @{
-        Success = $false
-        ComponentsReset = $false
-        Errors = @()
-    }
+    $script:RunStart        = Get-Date
+    $script:ComputerName    = $env:COMPUTERNAME
+    $script:YamlLogPath     = $null
+    $script:RuntimeLogPath  = $null
+    $script:UpdateEntries   = New-Object System.Collections.Generic.List[object]
+    $script:RawUpdateLines  = New-Object System.Collections.Generic.List[string]
+    $script:ActionHistory   = New-Object System.Collections.Generic.List[object]
+    $script:OverallResult   = 'Unknown'
+    $script:RebootRequired  = $false
+    $script:FailureMessage  = $null
     
-    try {
-        Write-StatusLog "Performing manual Windows Update component reset..." -Level "Info"
+    function Invoke-WindowsUpdateServicesEnablement {
+        <#
+        .SYNOPSIS
+        Runs the merged 01_Enable_Windows_Update_Services logic before the Windows Update install phase.
+        #>
+        # =====================================================================
+        # ScriptName: 01_Enable_Windows_Update_Services.ps1
+        # ScriptVersion: 1.8
+        # LastUpdated: 2026-04-25
+        # Purpose: Restore Windows Update services, tasks, policy settings,
+        #          and Windows 11 classic right-click context menu behavior;
+        #          verify required services are running, retry startup failures
+        #          up to 4 total attempts, and force a reboot if critical
+        #          services still refuse to start.
+        # =====================================================================
         
-        # Stop Windows Update services
-        $services = @('wuauserv', 'cryptsvc', 'bits', 'msiserver')
-        foreach ($service in $services) {
-            try {
-                Stop-Service -Name $service -Force -ErrorAction Stop
-                Write-StatusLog "Stopped service: $service" -Level "Info"
-            } catch {
-                Write-StatusLog "[WARN] Could not stop service $service`: $($_.Exception.Message)" -Level "Warning"
+        [CmdletBinding()]
+        param()
+        
+        $ErrorActionPreference = 'Stop'
+        
+        function Write-Status {
+            param(
+                [string]$Message,
+                [ValidateSet('INFO','OK','WARN','ERROR')]
+                [string]$Level = 'INFO'
+            )
+        
+            $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+            switch ($Level) {
+                'INFO'  { Write-Host "[$timestamp] [INFO ] $Message" -ForegroundColor Cyan }
+                'OK'    { Write-Host "[$timestamp] [ OK  ] $Message" -ForegroundColor Green }
+                'WARN'  { Write-Host "[$timestamp] [WARN ] $Message" -ForegroundColor Yellow }
+                'ERROR' { Write-Host "[$timestamp] [ERROR] $Message" -ForegroundColor Red }
             }
         }
         
-        # Clear Windows Update cache
-        $cachePaths = @(
+        function Test-IsAdmin {
+            $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+            $principal = New-Object Security.Principal.WindowsPrincipal($currentIdentity)
+            return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+        }
+        
+        function Set-ServiceStartRegistry {
+            param(
+                [Parameter(Mandatory)]
+                [string]$ServiceName,
+        
+                [Parameter(Mandatory)]
+                [int]$StartValue
+            )
+        
+            $paths = @(
+                "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName",
+                "HKLM:\SYSTEM\ControlSet001\Services\$ServiceName"
+            )
+        
+            foreach ($path in $paths) {
+                if (Test-Path $path) {
+                    try {
+                        Set-ItemProperty -Path $path -Name Start -Value $StartValue -Type DWord -ErrorAction Stop
+                        Write-Status "Set registry Start=$StartValue for $ServiceName at $path" 'OK'
+                    }
+                    catch {
+                        Write-Status "Failed setting Start for $ServiceName at $path : $($_.Exception.Message)" 'WARN'
+                    }
+                }
+                else {
+                    Write-Status "Registry path not found for $ServiceName at $path" 'WARN'
+                }
+            }
+        }
+        
+        function Set-ServiceStartupAndStart {
+            param(
+                [Parameter(Mandatory)]
+                [string]$Name,
+        
+                [Parameter(Mandatory)]
+                [ValidateSet('Automatic','Manual')]
+                [string]$StartupType
+            )
+        
+            try {
+                $svc = Get-Service -Name $Name -ErrorAction Stop
+        
+                try {
+                    Set-Service -Name $Name -StartupType $StartupType -ErrorAction Stop
+                    Write-Status "Set startup type for $Name to $StartupType" 'OK'
+                }
+                catch {
+                    Write-Status "Set-Service failed for $Name. Trying sc.exe config..." 'WARN'
+                    $startValue = if ($StartupType -eq 'Automatic') { 'auto' } else { 'demand' }
+                    & sc.exe config $Name start= $startValue | Out-Null
+                    Write-Status "Configured startup type for $Name via sc.exe" 'OK'
+                }
+        
+                try {
+                    Start-Service -Name $Name -ErrorAction Stop
+                    Write-Status "Started service: $Name" 'OK'
+                }
+                catch {
+                    Write-Status "Could not start service $Name immediately: $($_.Exception.Message)" 'WARN'
+                }
+            }
+            catch {
+                Write-Status "Service not found or inaccessible: $Name" 'WARN'
+            }
+        }
+        
+        function Get-ServiceStateSafe {
+            param(
+                [Parameter(Mandatory)]
+                [string]$Name
+            )
+        
+            try {
+                return (Get-Service -Name $Name -ErrorAction Stop).Status
+            }
+            catch {
+                return $null
+            }
+        }
+        
+        function Wait-ForServiceRunning {
+            param(
+                [Parameter(Mandatory)]
+                [string]$Name,
+        
+                [int]$TimeoutSeconds = 15
+            )
+        
+            $stopWatch = [System.Diagnostics.Stopwatch]::StartNew()
+        
+            while ($stopWatch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
+                $status = Get-ServiceStateSafe -Name $Name
+                if ($status -eq 'Running') {
+                    return $true
+                }
+        
+                Start-Sleep -Seconds 2
+            }
+        
+            return $false
+        }
+        
+        function Ensure-ServiceRunningWithRetry {
+            param(
+                [Parameter(Mandatory)]
+                [string]$Name,
+        
+                [Parameter(Mandatory)]
+                [ValidateSet('Automatic','Manual')]
+                [string]$StartupType,
+        
+                [int]$MaxAttempts = 4,
+        
+                [int]$WaitPerAttemptSeconds = 15
+            )
+        
+            for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+                $currentState = Get-ServiceStateSafe -Name $Name
+        
+                if ($currentState -eq 'Running') {
+                    Write-Status "Service $Name is already running." 'OK'
+                    return $true
+                }
+        
+                Write-Status "Attempt $attempt of $MaxAttempts to start service $Name..." 'INFO'
+        
+                try {
+                    Set-ServiceStartupAndStart -Name $Name -StartupType $StartupType
+                }
+                catch {
+                    Write-Status "Unexpected error while attempting to start $Name : $($_.Exception.Message)" 'WARN'
+                }
+        
+                if (Wait-ForServiceRunning -Name $Name -TimeoutSeconds $WaitPerAttemptSeconds) {
+                    Write-Status "Verified service is running: $Name" 'OK'
+                    return $true
+                }
+        
+                $stateAfterWait = Get-ServiceStateSafe -Name $Name
+                Write-Status "Service $Name did not reach Running state after attempt $attempt. Current state: $stateAfterWait" 'WARN'
+        
+                if ($attempt -lt $MaxAttempts) {
+                    Start-Sleep -Seconds 5
+                }
+            }
+        
+            Write-Status "Service $Name failed to reach Running state after $MaxAttempts attempts." 'ERROR'
+            return $false
+        }
+        
+        function Force-RebootNow {
+            param(
+                [string]$Reason = 'Required Windows Update services failed to start after multiple attempts.'
+            )
+        
+            Write-Status "FORCING REBOOT: $Reason" 'ERROR'
+        
+            try {
+                shutdown.exe /r /f /t 30 /c "$Reason" | Out-Null
+                Write-Status "Forced reboot command issued successfully. System will restart in 30 seconds." 'ERROR'
+            }
+            catch {
+                Write-Status "Failed to issue shutdown.exe reboot command: $($_.Exception.Message)" 'ERROR'
+            }
+        
+            exit 1
+        }
+        
+        function Enable-ScheduledTaskSafe {
+            param(
+                [Parameter(Mandatory)]
+                [string]$TaskPath,
+        
+                [Parameter(Mandatory)]
+                [string]$TaskName
+            )
+        
+            try {
+                $task = Get-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction Stop
+                if ($task.State -eq 'Disabled') {
+                    Enable-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction Stop | Out-Null
+                    Write-Status "Enabled scheduled task: $TaskPath$TaskName" 'OK'
+                }
+                else {
+                    Write-Status "Scheduled task already enabled or available: $TaskPath$TaskName" 'INFO'
+                }
+            }
+            catch {
+                Write-Status "Scheduled task not found or could not be enabled: $TaskPath$TaskName" 'WARN'
+            }
+        }
+        
+        function Remove-RegistryValueSafe {
+            param(
+                [Parameter(Mandatory)]
+                [string]$Path,
+        
+                [Parameter(Mandatory)]
+                [string]$Name
+            )
+        
+            try {
+                if (Test-Path $Path) {
+                    $prop = Get-ItemProperty -Path $Path -Name $Name -ErrorAction SilentlyContinue
+                    if ($null -ne $prop) {
+                        Remove-ItemProperty -Path $Path -Name $Name -ErrorAction Stop
+                        Write-Status "Removed $Path\$Name" 'OK'
+                    }
+                    else {
+                        Write-Status "Registry value not present: $Path\$Name" 'INFO'
+                    }
+                }
+                else {
+                    Write-Status "Registry path not present: $Path" 'INFO'
+                }
+            }
+            catch {
+                Write-Status "Failed to remove $Path\$Name : $($_.Exception.Message)" 'WARN'
+            }
+        }
+        
+        function Set-RegistryDwordSafe {
+            param(
+                [Parameter(Mandatory)]
+                [string]$Path,
+        
+                [Parameter(Mandatory)]
+                [string]$Name,
+        
+                [Parameter(Mandatory)]
+                [int]$Value
+            )
+        
+            try {
+                if (-not (Test-Path $Path)) {
+                    New-Item -Path $Path -Force | Out-Null
+                }
+        
+                New-ItemProperty -Path $Path -Name $Name -PropertyType DWord -Value $Value -Force | Out-Null
+                Write-Status "Set $Path\$Name = $Value" 'OK'
+            }
+            catch {
+                Write-Status "Failed to set $Path\$Name : $($_.Exception.Message)" 'ERROR'
+            }
+        }
+        
+        function Set-ClassicRightClickForRegistryRoot {
+            [CmdletBinding()]
+            param(
+                [Parameter(Mandatory)]
+                [string]$RegistryRoot,
+
+                [Parameter(Mandatory)]
+                [string]$DisplayName
+            )
+
+            $basePath = Join-Path $RegistryRoot 'Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}'
+            $subPath  = Join-Path $basePath 'InprocServer32'
+
+            try {
+                if (-not (Test-Path -LiteralPath $basePath)) {
+                    New-Item -Path $basePath -Force -ErrorAction Stop | Out-Null
+                    Write-Status "Created classic right-click menu CLSID key for $DisplayName" 'OK'
+                }
+                else {
+                    Write-Status "Classic right-click menu CLSID key already exists for $DisplayName" 'INFO'
+                }
+
+                if (-not (Test-Path -LiteralPath $subPath)) {
+                    New-Item -Path $subPath -Force -ErrorAction Stop | Out-Null
+                    Write-Status "Created classic right-click menu InprocServer32 key for $DisplayName" 'OK'
+                }
+                else {
+                    Write-Status "Classic right-click menu InprocServer32 key already exists for $DisplayName" 'INFO'
+                }
+
+                Set-Item -Path $subPath -Value '' -ErrorAction Stop
+                Write-Status "Enabled Windows 11 classic right-click menu for $DisplayName." 'OK'
+                return $true
+            }
+            catch {
+                Write-Status "Failed to enable Windows 11 classic right-click menu for $DisplayName : $($_.Exception.Message)" 'WARN'
+                return $false
+            }
+        }
+
+        function Enable-ClassicWindows11RightClickMenu {
+            [CmdletBinding()]
+            param()
+
+            $successCount = 0
+            $attemptCount = 0
+
+            try {
+                $loadedUserHives = Get-ChildItem -Path Registry::HKEY_USERS -ErrorAction Stop |
+                    Where-Object {
+                        $_.PSChildName -match '^S-1-5-21-' -and
+                        $_.PSChildName -notmatch '_Classes$'
+                    }
+
+                foreach ($hive in $loadedUserHives) {
+                    $attemptCount++
+                    if (Set-ClassicRightClickForRegistryRoot -RegistryRoot ("Registry::HKEY_USERS\{0}" -f $hive.PSChildName) -DisplayName ("loaded user hive {0}" -f $hive.PSChildName)) {
+                        $successCount++
+                    }
+                }
+            }
+            catch {
+                Write-Status "Unable to enumerate currently loaded user hives: $($_.Exception.Message)" 'WARN'
+            }
+
+            try {
+                $profileListPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
+                $profiles = Get-ChildItem -Path $profileListPath -ErrorAction Stop |
+                    ForEach-Object {
+                        $props = Get-ItemProperty -Path $_.PSPath -ErrorAction SilentlyContinue
+                        if ($props.ProfileImagePath -and $_.PSChildName -match '^S-1-5-21-') {
+                            [pscustomobject]@{
+                                Sid = $_.PSChildName
+                                ProfilePath = [Environment]::ExpandEnvironmentVariables($props.ProfileImagePath)
+                            }
+                        }
+                    } |
+                    Where-Object {
+                        $_.ProfilePath -and
+                        (Test-Path -LiteralPath (Join-Path $_.ProfilePath 'NTUSER.DAT')) -and
+                        $_.ProfilePath -notmatch '\\(Default|Default User|Public|All Users)$'
+                    }
+
+                foreach ($profile in $profiles) {
+                    $hkuPath = "Registry::HKEY_USERS\$($profile.Sid)"
+                    if (Test-Path -LiteralPath $hkuPath) {
+                        continue
+                    }
+
+                    $tempHiveName = "TempClassicContext_$($profile.Sid -replace '[^A-Za-z0-9]', '_')"
+                    $ntUserDat = Join-Path $profile.ProfilePath 'NTUSER.DAT'
+                    $loaded = $false
+
+                    try {
+                        $loadOutput = & reg.exe load "HKU\$tempHiveName" "$ntUserDat" 2>&1
+                        if ($LASTEXITCODE -eq 0) {
+                            $loaded = $true
+                            $attemptCount++
+                            if (Set-ClassicRightClickForRegistryRoot -RegistryRoot "Registry::HKEY_USERS\$tempHiveName" -DisplayName ("offline profile {0}" -f $profile.ProfilePath)) {
+                                $successCount++
+                            }
+                        }
+                        else {
+                            Write-Status "Unable to load offline user hive for $($profile.ProfilePath): $loadOutput" 'WARN'
+                        }
+                    }
+                    catch {
+                        Write-Status "Unable to load offline user hive for $($profile.ProfilePath): $($_.Exception.Message)" 'WARN'
+                    }
+                    finally {
+                        if ($loaded) {
+                            [gc]::Collect()
+                            [gc]::WaitForPendingFinalizers()
+                            $unloadOutput = & reg.exe unload "HKU\$tempHiveName" 2>&1
+                            if ($LASTEXITCODE -ne 0) {
+                                Write-Status "Unable to unload temporary hive HKU\${tempHiveName}: $unloadOutput" 'WARN'
+                            }
+                        }
+                    }
+                }
+            }
+            catch {
+                Write-Status "Unable to enumerate local user profiles for classic right-click menu: $($_.Exception.Message)" 'WARN'
+            }
+
+            try {
+                $defaultHive = 'C:\Users\Default\NTUSER.DAT'
+                if (Test-Path -LiteralPath $defaultHive) {
+                    $defaultHiveName = 'TempClassicContext_DefaultUser'
+                    $loadOutput = & reg.exe load "HKU\$defaultHiveName" "$defaultHive" 2>&1
+                    if ($LASTEXITCODE -eq 0) {
+                        try {
+                            $attemptCount++
+                            if (Set-ClassicRightClickForRegistryRoot -RegistryRoot "Registry::HKEY_USERS\$defaultHiveName" -DisplayName 'Default User profile for future users') {
+                                $successCount++
+                            }
+                        }
+                        finally {
+                            [gc]::Collect()
+                            [gc]::WaitForPendingFinalizers()
+                            $unloadOutput = & reg.exe unload "HKU\$defaultHiveName" 2>&1
+                            if ($LASTEXITCODE -ne 0) {
+                                Write-Status "Unable to unload temporary Default User hive: $unloadOutput" 'WARN'
+                            }
+                        }
+                    }
+                    else {
+                        Write-Status "Unable to load Default User hive for future users: $loadOutput" 'WARN'
+                    }
+                }
+                else {
+                    Write-Status "Default User hive was not found at $defaultHive" 'WARN'
+                }
+            }
+            catch {
+                Write-Status "Failed to apply classic right-click menu to Default User profile: $($_.Exception.Message)" 'WARN'
+            }
+
+            if ($attemptCount -gt 0 -and $successCount -gt 0) {
+                Write-Status "Classic Windows 11 right-click menu applied to $successCount of $attemptCount targeted user profile hive(s). Users may need to sign out/in or restart Explorer." 'OK'
+            }
+            elseif ($attemptCount -eq 0) {
+                Write-Status 'No user profile hives were available for classic right-click menu enforcement.' 'WARN'
+            }
+            else {
+                Write-Status 'Classic Windows 11 right-click menu was not applied to any user profile hive.' 'WARN'
+            }
+        }
+
+        # Script updater staging and scheduled-task repair were intentionally removed from Option 11.
+        # Option 11 should only restore Windows Update prerequisites and then run Windows Updates.
+        # This prevents update runs from failing or modifying updater tasks when the file share is unavailable.
+        
+        if (-not (Test-IsAdmin)) {
+            Write-Host ""
+            Write-Host "This script must be run as Administrator." -ForegroundColor Red
+            exit 1
+        }
+        
+        Write-Status "Initializing Windows Update service restoration..." 'INFO'
+        Enable-ClassicWindows11RightClickMenu
+        Write-Status "Skipping script updater checks by design for Option 11." 'INFO'
+        
+        # Restore registry startup values first
+        # Common defaults used for Windows Update-related services:
+        # wuauserv = Manual (3)
+        # bits = Manual (3)
+        # dosvc = Automatic family (2)
+        # UsoSvc = Automatic (2)
+        # WaaSMedicSvc = Manual/triggered on many systems (3)
+        
+        Set-ServiceStartRegistry -ServiceName 'wuauserv'     -StartValue 3
+        Set-ServiceStartRegistry -ServiceName 'bits'         -StartValue 3
+        Set-ServiceStartRegistry -ServiceName 'dosvc'        -StartValue 2
+        Set-ServiceStartRegistry -ServiceName 'UsoSvc'       -StartValue 2
+        Set-ServiceStartRegistry -ServiceName 'WaaSMedicSvc' -StartValue 3
+        
+        # Initial restore and startup
+        Set-ServiceStartupAndStart -Name 'wuauserv' -StartupType Manual
+        Set-ServiceStartupAndStart -Name 'bits'     -StartupType Manual
+        Set-ServiceStartupAndStart -Name 'dosvc'    -StartupType Automatic
+        Set-ServiceStartupAndStart -Name 'UsoSvc'   -StartupType Automatic
+        
+        # WaaSMedicSvc can be protected; set registry above, then try starting via sc.exe
+        try {
+            & sc.exe config WaaSMedicSvc start= demand | Out-Null
+            Write-Status "Configured WaaSMedicSvc startup via sc.exe" 'OK'
+        }
+        catch {
+            Write-Status "Could not configure WaaSMedicSvc via sc.exe" 'WARN'
+        }
+        
+        try {
+            & sc.exe start WaaSMedicSvc | Out-Null
+            Write-Status "Attempted to start WaaSMedicSvc" 'INFO'
+        }
+        catch {
+            Write-Status "Could not start WaaSMedicSvc directly" 'WARN'
+        }
+        
+        # Restore Automatic Updates policy
+        $wuPolicyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
+        $auPolicyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'
+        
+        Set-RegistryDwordSafe -Path $auPolicyPath -Name 'NoAutoUpdate' -Value 0
+        Set-RegistryDwordSafe -Path $auPolicyPath -Name 'AUOptions'    -Value 3
+        
+        # Remove common WSUS redirection values if they were previously set
+        Remove-RegistryValueSafe -Path $wuPolicyPath -Name 'WUServer'
+        Remove-RegistryValueSafe -Path $wuPolicyPath -Name 'WUStatusServer'
+        Remove-RegistryValueSafe -Path $wuPolicyPath -Name 'UpdateServiceUrlAlternate'
+        Remove-RegistryValueSafe -Path $wuPolicyPath -Name 'SetProxyBehaviorForUpdateDetection'
+        Remove-RegistryValueSafe -Path $wuPolicyPath -Name 'DisableWindowsUpdateAccess'
+        Remove-RegistryValueSafe -Path $auPolicyPath -Name 'UseWUServer'
+        
+        # Re-enable common update scheduled tasks
+        $tasks = @(
+            @{ Path = '\Microsoft\Windows\WindowsUpdate\';      Name = 'Scheduled Start' },
+            @{ Path = '\Microsoft\Windows\UpdateOrchestrator\'; Name = 'Schedule Scan' },
+            @{ Path = '\Microsoft\Windows\UpdateOrchestrator\'; Name = 'Schedule Scan Static Task' },
+            @{ Path = '\Microsoft\Windows\UpdateOrchestrator\'; Name = 'USO_UxBroker' },
+            @{ Path = '\Microsoft\Windows\UpdateOrchestrator\'; Name = 'Reboot' },
+            @{ Path = '\Microsoft\Windows\UpdateOrchestrator\'; Name = 'Maintenance Install' },
+            @{ Path = '\Microsoft\Windows\UpdateOrchestrator\'; Name = 'Refresh Settings' },
+            @{ Path = '\Microsoft\Windows\WaaSMedic\';          Name = 'PerformRemediation' }
+        )
+        
+        foreach ($task in $tasks) {
+            Enable-ScheduledTaskSafe -TaskPath $task.Path -TaskName $task.Name
+        }
+        
+        # Restart key services in a sensible order
+        $restartOrder = @('bits', 'dosvc', 'wuauserv', 'UsoSvc')
+        foreach ($svc in $restartOrder) {
+            try {
+                Restart-Service -Name $svc -Force -ErrorAction Stop
+                Write-Status "Restarted service: $svc" 'OK'
+            }
+            catch {
+                Write-Status "Could not restart $svc : $($_.Exception.Message)" 'WARN'
+            }
+        }
+        
+        # Verify and retry critical services
+        $requiredServices = @(
+            @{ Name = 'wuauserv'; StartupType = 'Manual' },
+            @{ Name = 'bits';     StartupType = 'Manual' },
+            @{ Name = 'dosvc';    StartupType = 'Automatic' },
+            @{ Name = 'UsoSvc';   StartupType = 'Automatic' }
+        )
+        
+        $failedServices = @()
+        
+        foreach ($requiredService in $requiredServices) {
+            $serviceStarted = Ensure-ServiceRunningWithRetry -Name $requiredService.Name -StartupType $requiredService.StartupType -MaxAttempts 4 -WaitPerAttemptSeconds 15
+            if (-not $serviceStarted) {
+                $failedServices += $requiredService.Name
+            }
+        }
+        
+        if ($failedServices.Count -gt 0) {
+            $failedList = $failedServices -join ', '
+            Write-Status "One or more critical Windows Update services failed to start: $failedList" 'ERROR'
+            Force-RebootNow -Reason "Windows Update service recovery failed. Services not running: $failedList"
+        }
+        
+        Write-Status "Windows Update settings have been restored and critical services are running." 'OK'
+        Write-Status "No reboot required. Continuing normally." 'INFO'
+    }
+
+    function Write-ImmediateRuntimeLog {
+        param(
+            [Parameter(Mandatory)]
+            [string]$Line
+        )
+    
+        try {
+            if (-not [string]::IsNullOrWhiteSpace($script:RuntimeLogPath)) {
+                Add-Content -Path $script:RuntimeLogPath -Value $Line -Encoding UTF8
+            }
+        }
+        catch {
+            # Intentionally suppress runtime log write failures to avoid masking the main task.
+        }
+    }
+    
+    function Write-Log {
+        param(
+            [string]$Message,
+            [ValidateSet('INFO','OK','WARN','ERROR')]
+            [string]$Level = 'INFO'
+        )
+    
+        $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+        $line = "[$timestamp] [$('{0,-5}' -f $Level)] $Message"
+    
+        switch ($Level) {
+            'INFO'  { Write-Host $line -ForegroundColor Cyan }
+            'OK'    { Write-Host $line -ForegroundColor Green }
+            'WARN'  { Write-Host $line -ForegroundColor Yellow }
+            'ERROR' { Write-Host $line -ForegroundColor Red }
+        }
+    
+        $script:ActionHistory.Add([PSCustomObject]@{
+            Time    = $timestamp
+            Level   = $Level
+            Message = $Message
+        }) | Out-Null
+    
+        Write-ImmediateRuntimeLog -Line $line
+    
+        if (-not [string]::IsNullOrWhiteSpace($script:YamlLogPath)) {
+            try {
+                Write-YamlLog
+            }
+            catch {
+                # Intentionally suppress checkpoint write failures to avoid recursion from logging.
+            }
+        }
+    }
+    
+    function Test-IsAdministrator {
+        try {
+            $identity  = [Security.Principal.WindowsIdentity]::GetCurrent()
+            $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+            return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+        }
+        catch {
+            return $false
+        }
+    }
+    
+    function Ensure-Folder {
+        param(
+            [Parameter(Mandatory)]
+            [string]$Path
+        )
+    
+        if (-not (Test-Path -LiteralPath $Path)) {
+            New-Item -Path $Path -ItemType Directory -Force | Out-Null
+        }
+    }
+    
+    function ConvertTo-YamlSafeValue {
+        param(
+            [AllowNull()]
+            [object]$Value
+        )
+    
+        if ($null -eq $Value) {
+            return 'null'
+        }
+    
+        if ($Value -is [bool]) {
+            return $Value.ToString().ToLowerInvariant()
+        }
+    
+        if ($Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal]) {
+            return [string]$Value
+        }
+    
+        $text = [string]$Value
+        $text = $text -replace "`r", ' '
+        $text = $text -replace "`n", ' '
+        $text = $text -replace '"', '\"'
+        return '"' + $text + '"'
+    }
+    
+    function Initialize-YamlLog {
+        Ensure-Folder -Path $YamlLogFolder
+    
+        $timestamp = Get-Date -Format 'yyyy-MM-dd_HHmmss'
+        $baseName = "$($script:ComputerName)-WindowsUpdates-$timestamp"
+        $script:YamlLogPath = Join-Path $YamlLogFolder ($baseName + '.yaml')
+        $script:RuntimeLogPath = Join-Path $YamlLogFolder ($baseName + '.log')
+    
+        Set-Content -Path $script:RuntimeLogPath -Value @(
+            "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [INFO ] Runtime log initialized.",
+            "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [INFO ] YAML checkpoint file: $($script:YamlLogPath)"
+        ) -Encoding UTF8
+    
+        Set-Content -Path $script:YamlLogPath -Value @(
+            'computer_name: ' + (ConvertTo-YamlSafeValue $script:ComputerName),
+            'script_name: "06_Weekend_Windows_Updates.ps1"',
+            'script_version: "1.8"',
+            'status: "Initializing"',
+            'run_started: ' + (ConvertTo-YamlSafeValue ($script:RunStart.ToString('yyyy-MM-dd HH:mm:ss'))),
+            'yaml_log_path: ' + (ConvertTo-YamlSafeValue $script:YamlLogPath),
+            'runtime_log_path: ' + (ConvertTo-YamlSafeValue $script:RuntimeLogPath),
+            'actions:',
+            '  - time: ' + (ConvertTo-YamlSafeValue (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')),
+            '    level: "INFO"',
+            '    message: "Logging initialized"'
+        ) -Encoding UTF8
+    
+        Write-Log "Runtime log will be written to: $($script:RuntimeLogPath)" 'INFO'
+        Write-Log "YAML log will be written to: $($script:YamlLogPath)" 'INFO'
+    }
+    
+    function Add-UpdateEntry {
+        param(
+            [string]$Title,
+            [string]$KB,
+            [string]$Size,
+            [string]$Status,
+            [string]$Result,
+            [string]$Source = 'PSWindowsUpdate'
+        )
+    
+        $entry = [PSCustomObject]@{
+            Title  = $Title
+            KB     = $KB
+            Size   = $Size
+            Status = $Status
+            Result = $Result
+            Source = $Source
+        }
+    
+        $script:UpdateEntries.Add($entry) | Out-Null
+    }
+    
+    function Try-ParseUpdateObject {
+        param(
+            [Parameter(Mandatory)]
+            [object]$Item
+        )
+    
+        if ($null -eq $Item) {
+            return $false
+        }
+    
+        $properties = $Item.PSObject.Properties.Name
+        if (-not $properties -or $properties.Count -eq 0) {
+            return $false
+        }
+    
+        $title = $null
+        foreach ($name in @('Title','KBArticleTitle')) {
+            if ($properties -contains $name -and -not [string]::IsNullOrWhiteSpace([string]$Item.$name)) {
+                $title = [string]$Item.$name
+                break
+            }
+        }
+    
+        $kb = $null
+        foreach ($name in @('KB','KBArticleIDs','KBArticleID')) {
+            if ($properties -contains $name -and $null -ne $Item.$name) {
+                $value = $Item.$name
+                if ($value -is [System.Array]) {
+                    $kb = (($value | ForEach-Object { [string]$_ }) -join ', ')
+                }
+                else {
+                    $kb = [string]$value
+                }
+                if (-not [string]::IsNullOrWhiteSpace($kb)) {
+                    break
+                }
+            }
+        }
+    
+        $size = $null
+        foreach ($name in @('Size','MaxDownloadSize')) {
+            if ($properties -contains $name -and $null -ne $Item.$name) {
+                $size = [string]$Item.$name
+                if (-not [string]::IsNullOrWhiteSpace($size)) {
+                    break
+                }
+            }
+        }
+    
+        $status = $null
+        foreach ($name in @('Status','Result','UpdateState')) {
+            if ($properties -contains $name -and $null -ne $Item.$name) {
+                $status = [string]$Item.$name
+                if (-not [string]::IsNullOrWhiteSpace($status)) {
+                    break
+                }
+            }
+        }
+    
+        $result = $null
+        foreach ($name in @('Result','Status','HResult')) {
+            if ($properties -contains $name -and $null -ne $Item.$name) {
+                $result = [string]$Item.$name
+                if (-not [string]::IsNullOrWhiteSpace($result)) {
+                    break
+                }
+            }
+        }
+    
+        if (-not [string]::IsNullOrWhiteSpace($title) -or -not [string]::IsNullOrWhiteSpace($kb)) {
+            Add-UpdateEntry -Title $title -KB $kb -Size $size -Status $status -Result $result
+            return $true
+        }
+    
+        return $false
+    }
+    
+    function Write-YamlLog {
+        try {
+            if ([string]::IsNullOrWhiteSpace($script:YamlLogPath)) {
+                Initialize-YamlLog
+            }
+    
+            $runEnd = Get-Date
+            $duration = [math]::Round(($runEnd - $script:RunStart).TotalSeconds, 0)
+    
+            $yamlLines = New-Object System.Collections.Generic.List[string]
+    
+            $yamlLines.Add('computer_name: ' + (ConvertTo-YamlSafeValue $script:ComputerName)) | Out-Null
+            $yamlLines.Add('script_name: "06_Weekend_Windows_Updates.ps1"') | Out-Null
+            $yamlLines.Add('script_version: "1.8"') | Out-Null
+            $yamlLines.Add('run_started: ' + (ConvertTo-YamlSafeValue ($script:RunStart.ToString('yyyy-MM-dd HH:mm:ss')))) | Out-Null
+            $yamlLines.Add('run_finished: ' + (ConvertTo-YamlSafeValue ($runEnd.ToString('yyyy-MM-dd HH:mm:ss')))) | Out-Null
+            $yamlLines.Add('duration_seconds: ' + $duration) | Out-Null
+            $yamlLines.Add('yaml_log_path: ' + (ConvertTo-YamlSafeValue $script:YamlLogPath)) | Out-Null
+            $yamlLines.Add('runtime_log_path: ' + (ConvertTo-YamlSafeValue $script:RuntimeLogPath)) | Out-Null
+            $yamlLines.Add('reset_wu_components_first: ' + ($(if ($ResetWUComponentsFirst) { 'true' } else { 'false' }))) | Out-Null
+            $yamlLines.Add('operation_timeout_seconds: ' + $OperationTimeoutSeconds) | Out-Null
+            $yamlLines.Add('reboot_delay_seconds: ' + $RebootDelaySeconds) | Out-Null
+            $yamlLines.Add('reboot_required: ' + ($(if ($script:RebootRequired) { 'true' } else { 'false' }))) | Out-Null
+            $yamlLines.Add('overall_result: ' + (ConvertTo-YamlSafeValue $script:OverallResult)) | Out-Null
+    
+            if (-not [string]::IsNullOrWhiteSpace($script:FailureMessage)) {
+                $yamlLines.Add('failure_message: ' + (ConvertTo-YamlSafeValue $script:FailureMessage)) | Out-Null
+            }
+            else {
+                $yamlLines.Add('failure_message: null') | Out-Null
+            }
+    
+            $yamlLines.Add('updates:') | Out-Null
+            if ($script:UpdateEntries.Count -gt 0) {
+                foreach ($entry in $script:UpdateEntries) {
+                    $yamlLines.Add('  - title: '  + (ConvertTo-YamlSafeValue $entry.Title))  | Out-Null
+                    $yamlLines.Add('    kb: '     + (ConvertTo-YamlSafeValue $entry.KB))     | Out-Null
+                    $yamlLines.Add('    size: '   + (ConvertTo-YamlSafeValue $entry.Size))   | Out-Null
+                    $yamlLines.Add('    status: ' + (ConvertTo-YamlSafeValue $entry.Status)) | Out-Null
+                    $yamlLines.Add('    result: ' + (ConvertTo-YamlSafeValue $entry.Result)) | Out-Null
+                    $yamlLines.Add('    source: ' + (ConvertTo-YamlSafeValue $entry.Source)) | Out-Null
+                }
+            }
+            else {
+                $yamlLines.Add('  - title: "No structured update entries captured"') | Out-Null
+                $yamlLines.Add('    kb: null') | Out-Null
+                $yamlLines.Add('    size: null') | Out-Null
+                $yamlLines.Add('    status: "None"') | Out-Null
+                $yamlLines.Add('    result: "None"') | Out-Null
+                $yamlLines.Add('    source: "Script"') | Out-Null
+            }
+    
+            $yamlLines.Add('raw_output:') | Out-Null
+            if ($script:RawUpdateLines.Count -gt 0) {
+                foreach ($line in $script:RawUpdateLines) {
+                    $yamlLines.Add('  - ' + (ConvertTo-YamlSafeValue $line)) | Out-Null
+                }
+            }
+            else {
+                $yamlLines.Add('  - "No raw update output captured"') | Out-Null
+            }
+    
+            $yamlLines.Add('actions:') | Out-Null
+            if ($script:ActionHistory.Count -gt 0) {
+                foreach ($action in $script:ActionHistory) {
+                    $yamlLines.Add('  - time: ' + (ConvertTo-YamlSafeValue $action.Time)) | Out-Null
+                    $yamlLines.Add('    level: ' + (ConvertTo-YamlSafeValue $action.Level)) | Out-Null
+                    $yamlLines.Add('    message: ' + (ConvertTo-YamlSafeValue $action.Message)) | Out-Null
+                }
+            }
+            else {
+                $yamlLines.Add('  - "No actions recorded"') | Out-Null
+            }
+    
+            Set-Content -Path $script:YamlLogPath -Value $yamlLines -Encoding UTF8
+        }
+        catch {
+            Write-Warning "Failed to write YAML log: $($_.Exception.Message)"
+        }
+    }
+    
+    function Ensure-PSWindowsUpdate {
+        Write-Log "Ensuring PSWindowsUpdate module is available..." 'INFO'
+    
+        try {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        }
+        catch {}
+    
+        if (-not (Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue)) {
+            Write-Log "Installing NuGet package provider..." 'INFO'
+            Install-PackageProvider -Name NuGet -Force -Scope AllUsers | Out-Null
+        }
+    
+        try {
+            $repo = Get-PSRepository -Name 'PSGallery' -ErrorAction Stop
+            if ($repo.InstallationPolicy -ne 'Trusted') {
+                Write-Log "Setting PSGallery as Trusted..." 'INFO'
+                Set-PSRepository -Name 'PSGallery' -InstallationPolicy Trusted
+            }
+        }
+        catch {
+            Write-Log "Could not validate PSGallery repository settings: $($_.Exception.Message)" 'WARN'
+        }
+    
+        if (-not (Get-Module -ListAvailable -Name PSWindowsUpdate)) {
+            Write-Log "Installing PSWindowsUpdate module..." 'INFO'
+            Install-Module -Name PSWindowsUpdate -Force -AllowClobber -Scope AllUsers
+        }
+    
+        Import-Module PSWindowsUpdate -Force
+        Write-Log "PSWindowsUpdate module imported successfully." 'OK'
+    }
+    
+    function Reset-WUComponentsSafe {
+        Write-Log "Resetting Windows Update components using built-in manual routine..." 'INFO'
+    
+        $services = @('wuauserv', 'bits', 'cryptsvc', 'msiserver')
+    
+        foreach ($serviceName in $services) {
+            try {
+                $service = Get-Service -Name $serviceName -ErrorAction Stop
+                if ($service.Status -ne 'Stopped') {
+                    Write-Log "Stopping service: $serviceName" 'INFO'
+                    Stop-Service -Name $serviceName -Force -ErrorAction Stop
+                }
+                else {
+                    Write-Log "Service already stopped: $serviceName" 'INFO'
+                }
+            }
+            catch {
+                Write-Log "Failed to stop service ${serviceName}: $($_.Exception.Message)" 'WARN'
+            }
+        }
+    
+        Start-Sleep -Seconds 3
+    
+        $shouldDeleteUpdatePolicy = $false
+        $shouldDeletePolicyManagerUpdate = $false
+        $wuTriggerDetails = @()
+        $pmTriggerDetails = @()
+    
+        try {
+            $wuPolicyPath = 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UpdatePolicy'
+            $wuSettingsPath = 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UpdatePolicy\Settings'
+    
+            if (Test-Path -LiteralPath $wuPolicyPath) {
+                $shouldDeleteUpdatePolicy = $true
+                $wuTriggerDetails += "Detected registry hive: $wuPolicyPath"
+                Write-Log "Detected Windows Update policy hive: $wuPolicyPath" 'INFO'
+            }
+    
+            if (Test-Path -LiteralPath $wuSettingsPath) {
+                $wuSettings = Get-ItemProperty -Path $wuSettingsPath -ErrorAction SilentlyContinue
+                if ($wuSettings) {
+                    $pauseProps = $wuSettings.PSObject.Properties | Where-Object {
+                        $_.Name -like '*Pause*' -and $null -ne $_.Value -and "$($_.Value)".Trim() -ne ''
+                    }
+    
+                    if ($pauseProps) {
+                        $shouldDeleteUpdatePolicy = $true
+                        foreach ($prop in $pauseProps) {
+                            $detail = "{0} = {1}" -f $prop.Name, $prop.Value
+                            $wuTriggerDetails += $detail
+                        }
+    
+                        $pauseNames = ($pauseProps | Select-Object -ExpandProperty Name) -join ', '
+                        Write-Log "Detected pause-related Windows Update state: $pauseNames" 'INFO'
+                    }
+                }
+            }
+        }
+        catch {
+            Write-Log "Failed while checking Windows Update policy state: $($_.Exception.Message)" 'WARN'
+        }
+    
+        try {
+            $pmUpdatePath = 'HKLM:\SOFTWARE\Microsoft\PolicyManager\current\device\Update'
+    
+            if (Test-Path -LiteralPath $pmUpdatePath) {
+                $pmUpdate = Get-ItemProperty -Path $pmUpdatePath -ErrorAction SilentlyContinue
+                if ($pmUpdate) {
+                    $interestingProps = $pmUpdate.PSObject.Properties | Where-Object {
+                        $_.Name -match 'Pause|Paused|ProviderSet|WinningProvider|Enrolled'
+                    }
+    
+                    if ($interestingProps) {
+                        $shouldDeletePolicyManagerUpdate = $true
+                        foreach ($prop in $interestingProps) {
+                            $detail = "{0} = {1}" -f $prop.Name, $prop.Value
+                            $pmTriggerDetails += $detail
+                        }
+    
+                        $propNames = ($interestingProps | Select-Object -ExpandProperty Name) -join ', '
+                        Write-Log "Detected PolicyManager Update state: $propNames" 'INFO'
+                    }
+                }
+            }
+        }
+        catch {
+            Write-Log "Failed while checking PolicyManager Update state: $($_.Exception.Message)" 'WARN'
+        }
+    
+        if ($wuTriggerDetails.Count -gt 0) {
+            foreach ($detail in $wuTriggerDetails) {
+                Write-Log "Windows Update cleanup trigger: $detail" 'INFO'
+            }
+        }
+    
+        if ($pmTriggerDetails.Count -gt 0) {
+            foreach ($detail in $pmTriggerDetails) {
+                Write-Log "PolicyManager cleanup trigger: $detail" 'INFO'
+            }
+        }
+    
+        if ($shouldDeleteUpdatePolicy) {
+            try {
+                Write-Log "Deleting Windows Update policy registry hive..." 'INFO'
+                & reg.exe delete "HKLM\SOFTWARE\Microsoft\WindowsUpdate\UpdatePolicy" /f | Out-Null
+                Write-Log "Deleted HKLM\SOFTWARE\Microsoft\WindowsUpdate\UpdatePolicy" 'OK'
+            }
+            catch {
+                Write-Log "Failed to delete HKLM\SOFTWARE\Microsoft\WindowsUpdate\UpdatePolicy: $($_.Exception.Message)" 'WARN'
+            }
+        }
+        else {
+            Write-Log "No pause-related Windows Update policy state detected; skipping UpdatePolicy registry delete." 'INFO'
+        }
+    
+        if ($shouldDeletePolicyManagerUpdate) {
+            try {
+                Write-Log "Deleting PolicyManager Update registry hive..." 'INFO'
+                & reg.exe delete "HKLM\SOFTWARE\Microsoft\PolicyManager\current\device\Update" /f | Out-Null
+                Write-Log "Deleted HKLM\SOFTWARE\Microsoft\PolicyManager\current\device\Update" 'OK'
+            }
+            catch {
+                Write-Log "Failed to delete HKLM\SOFTWARE\Microsoft\PolicyManager\current\device\Update: $($_.Exception.Message)" 'WARN'
+            }
+        }
+        else {
+            Write-Log "No relevant PolicyManager Update state detected; skipping PolicyManager registry delete." 'INFO'
+        }
+    
+        $foldersToClear = @(
             "$env:SystemRoot\SoftwareDistribution",
             "$env:SystemRoot\System32\catroot2"
         )
-        
-        foreach ($path in $cachePaths) {
-            if (Test-Path $path) {
-                try {
-                    Get-ChildItem -Path $path -Recurse | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-                    Write-StatusLog "Cleared cache: $path" -Level "Info"
-                } catch {
-                    Write-StatusLog "[WARN] Could not clear cache $path`: $($_.Exception.Message)" -Level "Warning"
-                }
-            }
-        }
-        
-        # Restart Windows Update services
-        foreach ($service in $services) {
+    
+        foreach ($folder in $foldersToClear) {
             try {
-                Start-Service -Name $service -ErrorAction Stop
-                Write-StatusLog "Started service: $service" -Level "Info"
-            } catch {
-                $result.Errors += "Failed to start service $service`: $($_.Exception.Message)"
-            }
-        }
-        
-        $result.ComponentsReset = $true
-        $result.Success = $true
-        Write-StatusLog "[OK] Manual Windows Update component reset completed" -Level "Success"
-        
-    } catch {
-        $result.Errors += "Manual component reset failed: $($_.Exception.Message)"
-    }
-    
-    return $result
-}
-
-function Get-AvailableWindowsUpdates {
-    <#
-    .SYNOPSIS
-    Discovers available Windows updates with categorization and better error handling
-    
-    .PARAMETER Category
-    Category of updates to discover
-    
-    .PARAMETER DeferFeatureUpdates
-    Defer feature updates and get only quality updates
-    
-    .OUTPUTS
-    Returns hashtable with available updates
-    #>
-    
-    [CmdletBinding()]
-    param(
-        [Parameter()]
-        [string]$Category = 'All',
-        
-        [Parameter()]
-        [switch]$DeferFeatureUpdates
-    )
-    
-    $result = @{
-        Updates = @()
-        Errors = @()
-        DiscoveryDuration = $null
-    }
-    
-    $discoveryStart = Get-Date
-    
-    try {
-        if ($WhatIfPreference) {
-            Write-Host "   Would discover available Windows updates" -ForegroundColor Yellow
-            return $result
-        }
-        
-        Write-StatusLog "Querying Windows Update servers for available updates..." -Level "Info"
-        
-        # Build update criteria based on category
-        $updateCriteria = switch ($Category) {
-            'Security' { @{Category = @('SecurityUpdates', 'CriticalUpdates')} }
-            'Critical' { @{Category = @('CriticalUpdates')} }
-            'Recommended' { @{Category = @('Updates', 'SecurityUpdates', 'CriticalUpdates')} }
-            'Optional' { @{Category = @('OptionalUpdates')} }
-            default { @{} }  # All categories
-        }
-        
-        # Add feature update deferral if requested
-        if ($DeferFeatureUpdates) {
-            $updateCriteria.NotCategory = @('FeatureUpdates', 'Upgrades')
-        }
-        
-        # Get available updates using PSWindowsUpdate with error handling
-        try {
-            $availableUpdates = Get-WindowsUpdate @updateCriteria -MicrosoftUpdate -ErrorAction Stop
-        }
-        catch {
-            $result.Errors += "Failed to query Windows Update: $($_.Exception.Message)"
-            Write-StatusLog "[ERROR] Windows Update query failed: $($_.Exception.Message)" -Level "Error"
-            return $result
-        }
-        
-        # Process and categorize updates with safe property access
-        foreach ($update in $availableUpdates) {
-            try {
-                # Safe property access with comprehensive null checking
-                $title = if ($update -and $update.PSObject.Properties['Title'] -and $update.Title) { 
-                    $update.Title.ToString() 
-                } else { 
-                    "Unknown Update" 
+                if (Test-Path -LiteralPath $folder) {
+                    Write-Log "Clearing folder: $folder" 'INFO'
+                    Remove-Item -LiteralPath $folder -Recurse -Force -ErrorAction Stop
+                    Write-Log "Cleared folder: $folder" 'OK'
                 }
-                
-                $kb = if ($update -and $update.PSObject.Properties['KB'] -and $update.KB) { 
-                    $update.KB.ToString() 
-                } else { 
-                    "N/A" 
+                else {
+                    Write-Log "Folder not present, skipping: $folder" 'INFO'
                 }
-                
-                $size = if ($update -and $update.PSObject.Properties['Size'] -and $update.Size) { 
-                    try {
-                        [long]$update.Size
-                    } catch {
-                        0
-                    }
-                } else { 
-                    0 
-                }
-                
-                $categories = if ($update -and $update.PSObject.Properties['Categories'] -and $update.Categories) { 
-                    $update.Categories 
-                } else { 
-                    @() 
-                }
-                
-                $severity = if ($update -and $update.PSObject.Properties['MsrcSeverity'] -and $update.MsrcSeverity) { 
-                    $update.MsrcSeverity.ToString() 
-                } else { 
-                    "Unknown" 
-                }
-                
-                $rebootRequired = if ($update -and $update.PSObject.Properties['RebootRequired']) { 
-                    try {
-                        [bool]$update.RebootRequired
-                    } catch {
-                        $false
-                    }
-                } else { 
-                    $false 
-                }
-                
-                $description = if ($update -and $update.PSObject.Properties['Description'] -and $update.Description) { 
-                    $update.Description.ToString() 
-                } else { 
-                    "" 
-                }
-                
-                $lastDeployment = if ($update -and $update.PSObject.Properties['LastDeploymentChangeTime']) { 
-                    $update.LastDeploymentChangeTime 
-                } else { 
-                    $null 
-                }
-                
-                $maxDownloadSize = if ($update -and $update.PSObject.Properties['MaxDownloadSize'] -and $update.MaxDownloadSize) { 
-                    try {
-                        [long]$update.MaxDownloadSize
-                    } catch {
-                        0
-                    }
-                } else { 
-                    0 
-                }
-                
-                $updateID = if ($update -and $update.PSObject.Properties['UpdateID'] -and $update.UpdateID) { 
-                    $update.UpdateID.ToString() 
-                } else { 
-                    "" 
-                }
-                
-                # Clean up KB number comprehensively
-                if ($kb -match "^KBKB(\d+)$") {
-                    $kb = "KB$($Matches[1])"
-                } elseif ($kb -match "^KB(\d+)$") {
-                    $kb = "KB$($Matches[1])"
-                } elseif ($kb -eq "KB" -or [string]::IsNullOrEmpty($kb) -or $kb -eq "KBN/A" -or $kb -like "*N/A*") {
-                    $kb = "N/A"
-                }
-                
-                # Determine if security or critical with safe category checking
-                $isSecurity = $false
-                $isCritical = $false
-                
-                if ($categories -and $categories.Count -gt 0) {
-                    try {
-                        $categoryString = $categories -join " "
-                        $isSecurity = $categoryString -match 'Security'
-                        $isCritical = $categoryString -match 'Critical'
-                    }
-                    catch {
-                        # If category checking fails, default to false
-                        $isSecurity = $false
-                        $isCritical = $false
-                    }
-                }
-                
-                $processedUpdate = @{
-                    Title = $title
-                    KB = $kb
-                    Size = $size
-                    Category = $categories
-                    Severity = $severity
-                    IsSecurity = $isSecurity
-                    IsCritical = $isCritical
-                    IsRebootRequired = $rebootRequired
-                    Description = $description
-                    LastDeploymentChangeTime = $lastDeployment
-                    MaxDownloadSize = $maxDownloadSize
-                    UpdateID = $updateID
-                }
-                
-                $result.Updates += $processedUpdate
             }
             catch {
-                $result.Errors += "Error processing update: $($_.Exception.Message)"
-                Write-StatusLog "[WARN] Error processing update: $($_.Exception.Message)" -Level "Warning"
-                
-                # Add a minimal entry for the failed update so it doesn't get lost
-                $result.Updates += @{
-                    Title = "Error processing update"
-                    KB = "N/A"
-                    Size = 0
-                    Category = @()
-                    Severity = "Unknown"
-                    IsSecurity = $false
-                    IsCritical = $false
-                    IsRebootRequired = $false
-                    Description = "Failed to process update details"
-                    LastDeploymentChangeTime = $null
-                    MaxDownloadSize = 0
-                    UpdateID = ""
-                }
+                Write-Log "Failed to clear folder ${folder}: $($_.Exception.Message)" 'WARN'
             }
         }
-        
-        Write-StatusLog "Found $($result.Updates.Count) available updates" -Level "Success"
-        
-    } catch {
-        $result.Errors += "Failed to discover Windows updates: $($_.Exception.Message)"
-        Write-StatusLog "[ERROR] Update discovery failed: $($_.Exception.Message)" -Level "Error"
-    } finally {
-        $result.DiscoveryDuration = (Get-Date) - $discoveryStart
-    }
     
-    return $result
-}
-
-function Show-WindowsUpdatePlan {
-    <#
-    .SYNOPSIS
-    Displays the Windows update plan before installation
-    
-    .PARAMETER Updates
-    Array of available updates
-    
-    .PARAMETER Category
-    Update category being processed
-    #>
-    
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [array]$Updates,
-        
-        [Parameter(Mandatory)]
-        [string]$Category
-    )
-    
-    Write-Host "`n" + "="*100 -ForegroundColor Cyan
-    Write-Host "WINDOWS UPDATE PLAN ($Category Updates)" -ForegroundColor Cyan
-    Write-Host "="*100 -ForegroundColor Cyan
-    
-    # Group by severity and type
-    $securityUpdates = $Updates | Where-Object { $_.IsSecurity }
-    $criticalUpdates = $Updates | Where-Object { $_.IsCritical -and -not $_.IsSecurity }
-    $normalUpdates = $Updates | Where-Object { -not $_.IsCritical -and -not $_.IsSecurity }
-    $rebootRequired = $Updates | Where-Object { $_.IsRebootRequired }
-    
-    if ($securityUpdates.Count -gt 0) {
-        Write-Host "`nSECURITY UPDATES ($($securityUpdates.Count)):" -ForegroundColor Red
-        $securityUpdates | ForEach-Object {
-            $sizeText = if ($_.Size) { " - $([math]::Round($_.Size / 1MB, 1)) MB" } else { "" }
-            Write-Host "  [RED] $($_.Title) (KB$($_.KB))$sizeText" -ForegroundColor Red
-        }
-    }
-    
-    if ($criticalUpdates.Count -gt 0) {
-        Write-Host "`nCRITICAL UPDATES ($($criticalUpdates.Count)):" -ForegroundColor Yellow
-        $criticalUpdates | ForEach-Object {
-            $sizeText = if ($_.Size) { " - $([math]::Round($_.Size / 1MB, 1)) MB" } else { "" }
-            Write-Host "  [YELLOW] $($_.Title) (KB$($_.KB))$sizeText" -ForegroundColor Yellow
-        }
-    }
-    
-    if ($normalUpdates.Count -gt 0) {
-        Write-Host "`nSTANDARD UPDATES ($($normalUpdates.Count)):" -ForegroundColor Green
-        $normalUpdates | ForEach-Object {
-            $sizeText = if ($_.Size) { " - $([math]::Round($_.Size / 1MB, 1)) MB" } else { "" }
-            Write-Host "  [GREEN] $($_.Title) (KB$($_.KB))$sizeText" -ForegroundColor Green
-        }
-    }
-    
-    $totalSize = ($Updates | Where-Object { $_.Size } | Measure-Object -Property Size -Sum).Sum / 1MB
-    Write-Host "`nTotal Download Size: $($totalSize.ToString('F1')) MB" -ForegroundColor White
-    Write-Host "Total Updates: $($Updates.Count)" -ForegroundColor White
-    
-    if ($rebootRequired.Count -gt 0) {
-        Write-Host "`n[WARN]  WARNING: $($rebootRequired.Count) update(s) will require system restart!" -ForegroundColor Yellow
-    }
-    
-    Write-Host "="*100 -ForegroundColor Cyan
-}
-
-function Install-WindowsUpdatesSecurely {
-    <#
-    .SYNOPSIS
-    Installs Windows updates with security validation and progress tracking
-    
-    .PARAMETER Updates
-    Array of updates to install
-    
-    .PARAMETER MaxTimeout
-    Maximum timeout per update in minutes
-    
-    .PARAMETER AllowReboot
-    Allow automatic reboot if required
-    
-    .OUTPUTS
-    Returns hashtable with installation results
-    #>
-    
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [array]$Updates,
-        
-        [Parameter()]
-        [int]$MaxTimeout = 60,
-        
-        [Parameter()]
-        [switch]$AllowReboot
-    )
-    
-    $result = @{
-        Installed = @()
-        Failed = @()
-        SecurityUpdates = @()
-        RebootRequired = $false
-        ProgressDetails = @()
-        Errors = @()
-    }
-    
-    if ($WhatIfPreference) {
-        Write-Host "   Would install $($Updates.Count) Windows updates" -ForegroundColor Yellow
-        return $result
-    }
-    
-    Write-Host "`n[RESTART] Installing $($Updates.Count) Windows updates..." -ForegroundColor Cyan
-    
-    try {
-        # Install updates with progress tracking
-        $installParams = @{
-            AcceptAll = $true
-            Install = $true
-            Verbose = $true
-            ErrorAction = 'Continue'
-        }
-        
-        if ($AllowReboot) {
-            $installParams.AutoReboot = $true
-        }
-        
-        # Execute installation with error handling
-        try {
-            $installationResults = Install-WindowsUpdate @installParams
-        }
-        catch {
-            $result.Errors += "Failed to execute Install-WindowsUpdate: $($_.Exception.Message)"
-            Write-StatusLog "[ERROR] Install-WindowsUpdate failed: $($_.Exception.Message)" -Level "Error"
-            return $result
-        }
-        
-        # Process results with safe property access
-        if ($installationResults) {
-            foreach ($updateResult in $installationResults) {
-                try {
-                    # Safe property access with null checks
-                    $title = if ($updateResult.PSObject.Properties['Title']) { $updateResult.Title } else { "Unknown Update" }
-                    $kb = if ($updateResult.PSObject.Properties['KB']) { $updateResult.KB } else { "N/A" }
-                    $size = if ($updateResult.PSObject.Properties['Size']) { $updateResult.Size } else { 0 }
-                    $status = if ($updateResult.PSObject.Properties['Result']) { $updateResult.Result } else { "Unknown" }
-                    $categories = if ($updateResult.PSObject.Properties['Categories']) { $updateResult.Categories } else { @() }
-                    $rebootRequired = if ($updateResult.PSObject.Properties['RebootRequired']) { $updateResult.RebootRequired } else { $false }
-                    
-                    # Clean up KB number if it's duplicated
-                    if ($kb -match "^KBKB(\d+)$") {
-                        $kb = "KB$($Matches[1])"
-                    } elseif ($kb -eq "KB" -or [string]::IsNullOrEmpty($kb)) {
-                        $kb = "N/A"
-                    }
-                    
-                    $processedResult = @{
-                        Title = $title
-                        KB = $kb
-                        Size = $size
-                        Status = $status
-                        IsSecurity = $categories -match 'Security'
-                        RebootRequired = $rebootRequired
-                    }
-                    
-                    # Categorize based on status
-                    if ($status -eq 'Installed' -or $status -eq 'Downloaded' -or $status -eq 'Succeeded') {
-                        $result.Installed += $processedResult
-                        
-                        if ($processedResult.IsSecurity) {
-                            $result.SecurityUpdates += $processedResult
-                        }
-                        
-                        if ($processedResult.RebootRequired) {
-                            $result.RebootRequired = $true
-                        }
-                        
-                        Write-StatusLog "[OK] Installed: $title" -Level "Success"
-                    } else {
-                        $result.Failed += $processedResult
-                        Write-StatusLog "[ERROR] Failed: $title - $status" -Level "Error"
-                    }
-                }
-                catch {
-                    $result.Errors += "Error processing update result: $($_.Exception.Message)"
-                    Write-StatusLog "[WARN] Error processing update result: $($_.Exception.Message)" -Level "Warning"
-                }
+        foreach ($serviceName in $services) {
+            try {
+                Write-Log "Starting service: $serviceName" 'INFO'
+                Start-Service -Name $serviceName -ErrorAction Stop
+                Write-Log "Started service: $serviceName" 'OK'
             }
-        } else {
-            Write-StatusLog "[WARN] No installation results returned" -Level "Warning"
-            $result.Errors += "No installation results returned from Install-WindowsUpdate"
+            catch {
+                Write-Log "Failed to start service ${serviceName}: $($_.Exception.Message)" 'WARN'
+            }
         }
-        
-    } catch {
-        $result.Errors += "Windows update installation failed: $($_.Exception.Message)"
-        Write-StatusLog "[ERROR] Update installation failed: $($_.Exception.Message)" -Level "Error"
+    
+        Write-Log "Windows Update components reset complete." 'OK'
     }
     
-    return $result
-}
-
-function Install-WindowsUpdatesSecurely {
-    <#
-    .SYNOPSIS
-    Installs Windows updates with security validation and progress tracking
+    function Invoke-PSWindowsUpdateJobOnce {
+        param(
+            [Parameter(Mandatory)]
+            [int]$TimeoutSeconds
+        )
     
-    .PARAMETER Updates
-    Array of updates to install
-    
-    .PARAMETER MaxTimeout
-    Maximum timeout per update in minutes
-    
-    .PARAMETER AllowReboot
-    Allow automatic reboot if required
-    
-    .OUTPUTS
-    Returns hashtable with installation results
-    #>
-    
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [array]$Updates,
-        
-        [Parameter()]
-        [int]$MaxTimeout = 60,
-        
-        [Parameter()]
-        [switch]$AllowReboot
-    )
-    
-    $result = @{
-        Installed = @()
-        Failed = @()
-        SecurityUpdates = @()
-        RebootRequired = $false
-        ProgressDetails = @()
-        Errors = @()
-    }
-    
-    if ($WhatIfPreference) {
-        Write-Host "   Would install $($Updates.Count) Windows updates" -ForegroundColor Yellow
-        return $result
-    }
-    
-    Write-Host "`n[RESTART] Installing $($Updates.Count) Windows updates..." -ForegroundColor Cyan
-    Write-Host "[SUMMARY] Progress will be shown below - installation may take several minutes..." -ForegroundColor Yellow
-    
-    try {
-        # Install updates with progress tracking
-        $installParams = @{
-            AcceptAll = $true
-            Install = $true
-            Verbose = $true
-            ErrorAction = 'Continue'
-        }
-        
-        if ($AllowReboot) {
-            $installParams.AutoReboot = $true
-        }
-        
-        # Create a background job for installation with timeout monitoring
-        Write-StatusLog "[START] Starting Windows Update installation process..." -Level "Info"
-        
-        $installJob = Start-Job -ScriptBlock {
-            param($installParams)
-            
-            # Import the module in the job
+        Write-Log "Starting background job for Install-WindowsUpdate..." 'INFO'
+        $job = Start-Job -ScriptBlock {
             Import-Module PSWindowsUpdate -Force
-            
-            # Execute the installation
-            Install-WindowsUpdate @installParams
-            
-        } -ArgumentList $installParams
-        
-        # Monitor the job with periodic status updates
-        $startTime = Get-Date
-        $timeoutMinutes = $MaxTimeout
-        $lastStatusTime = Get-Date
-        $statusUpdateInterval = 30 # seconds
-        
-        Write-Host "[TIMER]  Installation started at $($startTime.ToString('HH:mm:ss'))" -ForegroundColor Cyan
-        Write-Host "[WAIT] Maximum timeout: $timeoutMinutes minutes" -ForegroundColor Gray
-        Write-Host "------------------------------------------------------------------------------------------------------" -ForegroundColor Cyan
-        
-        while ($installJob.State -eq 'Running') {
-            $currentTime = Get-Date
-            $elapsed = $currentTime - $startTime
-            
-            # Show periodic status updates
-            if (($currentTime - $lastStatusTime).TotalSeconds -ge $statusUpdateInterval) {
-                $elapsedMinutes = [math]::Round($elapsed.TotalMinutes, 1)
-                $remainingMinutes = [math]::Max(0, $timeoutMinutes - $elapsed.TotalMinutes)
-                
-                Write-Host "[RESTART] Still installing... Elapsed: $elapsedMinutes min | Remaining timeout: $([math]::Round($remainingMinutes, 1)) min" -ForegroundColor Yellow
-                
-                # Check Windows Update service status
-                $wuService = Get-Service -Name 'wuauserv' -ErrorAction SilentlyContinue
-                if ($wuService) {
-                    $serviceStatus = if ($wuService.Status -eq 'Running') { "[OK] Running" } else { "[WARN] $($wuService.Status)" }
-                    Write-Host "   Windows Update Service: $serviceStatus" -ForegroundColor Gray
-                }
-                
-                # Check for any pending reboots
-                $rebootPending = Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired" -ErrorAction SilentlyContinue
-                if ($rebootPending) {
-                    Write-Host "   [WARN] Reboot required flag detected" -ForegroundColor Yellow
-                }
-                
-                $lastStatusTime = $currentTime
-            }
-            
-            # Check for timeout
-            if ($elapsed.TotalMinutes -gt $timeoutMinutes) {
-                Write-Host "[TIME] Installation timeout reached ($timeoutMinutes minutes)" -ForegroundColor Red
-                Stop-Job $installJob -Force
-                Remove-Job $installJob -Force
-                $result.Errors += "Installation timed out after $timeoutMinutes minutes"
-                return $result
-            }
-            
-            # Brief pause before next check
-            Start-Sleep -Seconds 2
+            Install-WindowsUpdate -MicrosoftUpdate -AcceptAll -IgnoreReboot -Verbose *>&1
         }
-        
-        # Job completed - get results
-        $endTime = Get-Date
-        $totalTime = $endTime - $startTime
-        
-        Write-Host "------------------------------------------------------------------------------------------------------" -ForegroundColor Cyan
-        Write-Host "[OK] Installation process completed in $([math]::Round($totalTime.TotalMinutes, 1)) minutes" -ForegroundColor Green
-        
-        if ($installJob.State -eq 'Completed') {
-            try {
-                $installationResults = Receive-Job $installJob -ErrorAction Stop
-                Write-StatusLog "[REPORT] Processing installation results..." -Level "Info"
+    
+        Write-Log "Background job started with ID $($job.Id). Waiting for completion for up to $TimeoutSeconds seconds..." 'INFO'
+    
+        $pollIntervalSeconds = 5
+        $heartbeatIntervalSeconds = 60
+        $elapsedSeconds = 0
+        $completed = $null
+    
+        while (-not $completed -and $elapsedSeconds -lt $TimeoutSeconds) {
+            $completed = Wait-Job -Job $job -Timeout $pollIntervalSeconds
+            if ($completed) { break }
+    
+            $elapsedSeconds += $pollIntervalSeconds
+    
+            if (($elapsedSeconds % $heartbeatIntervalSeconds) -eq 0) {
+                $jobState = (Get-Job -Id $job.Id).State
+                Write-Log "Windows Update job still running after $elapsedSeconds seconds. Current job state: $jobState" 'INFO'
             }
-            catch {
-                $result.Errors += "Failed to receive job results: $($_.Exception.Message)"
-                Write-StatusLog "[ERROR] Failed to get installation results: $($_.Exception.Message)" -Level "Error"
-                return $result
-            }
-        } else {
-            $result.Errors += "Installation job failed with state: $($installJob.State)"
-            Write-StatusLog "[ERROR] Installation job failed with state: $($installJob.State)" -Level "Error"
-            
-            # Try to get any error output
-            try {
-                $jobErrors = Receive-Job $installJob -ErrorAction SilentlyContinue
-                if ($jobErrors) {
-                    $result.Errors += "Job errors: $jobErrors"
-                }
-            }
-            catch {
-                # Ignore errors when trying to get job errors
-            }
-            
-            return $result
         }
-        
-        # Clean up the job
-        Remove-Job $installJob -Force -ErrorAction SilentlyContinue
-        
-        # Process results with safe property access
-        if ($installationResults) {
-            Write-Host "[SUMMARY] Processing $($installationResults.Count) installation results..." -ForegroundColor Cyan
-            
-            $processedCount = 0
-            foreach ($updateResult in $installationResults) {
-                $processedCount++
-                Write-Progress -Activity "Processing Results" -Status "Update $processedCount of $($installationResults.Count)" -PercentComplete (($processedCount / $installationResults.Count) * 100)
-                
-                try {
-                    # Safe property access with null checks
-                    $title = if ($updateResult.PSObject.Properties['Title']) { $updateResult.Title } else { "Unknown Update" }
-                    $kb = if ($updateResult.PSObject.Properties['KB']) { $updateResult.KB } else { "N/A" }
-                    $size = if ($updateResult.PSObject.Properties['Size']) { $updateResult.Size } else { 0 }
-                    $status = if ($updateResult.PSObject.Properties['Result']) { $updateResult.Result } else { "Unknown" }
-                    $categories = if ($updateResult.PSObject.Properties['Categories']) { $updateResult.Categories } else { @() }
-                    $rebootRequired = if ($updateResult.PSObject.Properties['RebootRequired']) { $updateResult.RebootRequired } else { $false }
-                    
-                    # Clean up KB number if it's duplicated
-                    if ($kb -match "^KBKB(\d+)$") {
-                        $kb = "KB$($Matches[1])"
-                    } elseif ($kb -eq "KB" -or [string]::IsNullOrEmpty($kb)) {
-                        $kb = "N/A"
-                    }
-                    
-                    $processedResult = @{
-                        Title = $title
-                        KB = $kb
-                        Size = $size
-                        Status = $status
-                        IsSecurity = $categories -match 'Security'
-                        RebootRequired = $rebootRequired
-                    }
-                    
-                    # Categorize based on status
-                    if ($status -eq 'Installed' -or $status -eq 'Downloaded' -or $status -eq 'Succeeded') {
-                        $result.Installed += $processedResult
-                        
-                        if ($processedResult.IsSecurity) {
-                            $result.SecurityUpdates += $processedResult
-                        }
-                        
-                        if ($processedResult.RebootRequired) {
-                            $result.RebootRequired = $true
-                        }
-                        
-                        Write-StatusLog "[OK] Installed: $title" -Level "Success"
-                    } else {
-                        $result.Failed += $processedResult
-                        Write-StatusLog "[ERROR] Failed: $title - $status" -Level "Error"
-                    }
+    
+        if (-not $completed) {
+            $jobState = (Get-Job -Id $job.Id).State
+            Write-Log "Windows Update job did not finish before timeout. Final observed state: $jobState" 'ERROR'
+            Stop-Job -Job $job -Force | Out-Null
+            Remove-Job -Job $job -Force | Out-Null
+            throw "Install-WindowsUpdate exceeded timeout of $TimeoutSeconds seconds."
+        }
+    
+        Write-Log "Background job completed. Receiving Windows Update output..." 'INFO'
+    
+        $receiveErrors = @()
+        $results = Receive-Job -Job $job -ErrorAction SilentlyContinue -ErrorVariable receiveErrors
+    
+        $jobState = $job.State
+        $jobReason = $null
+        try {
+            if ($job.ChildJobs -and $job.ChildJobs.Count -gt 0 -and $job.ChildJobs[0].JobStateInfo.Reason) {
+                $jobReason = $job.ChildJobs[0].JobStateInfo.Reason.Message
+            }
+        }
+        catch {}
+    
+        Write-Log "Removing completed background job..." 'INFO'
+        Remove-Job -Job $job -Force | Out-Null
+    
+        if ($results) {
+            foreach ($item in $results) {
+                $line = [string]$item
+                if (-not [string]::IsNullOrWhiteSpace($line)) {
+                    $script:RawUpdateLines.Add($line) | Out-Null
+                    Write-Log $line 'INFO'
                 }
-                catch {
-                    $result.Errors += "Error processing update result: $($_.Exception.Message)"
-                    Write-StatusLog "[WARN] Error processing update result: $($_.Exception.Message)" -Level "Warning"
+    
+                [void](Try-ParseUpdateObject -Item $item)
+            }
+        }
+        else {
+            Write-Log "Install-WindowsUpdate returned no normal output objects." 'WARN'
+        }
+    
+        if ($receiveErrors -and $receiveErrors.Count -gt 0) {
+            foreach ($err in $receiveErrors) {
+                $errText = [string]$err
+                if (-not [string]::IsNullOrWhiteSpace($errText)) {
+                    $script:RawUpdateLines.Add("ERROR: $errText") | Out-Null
+                    Write-Log "Install-WindowsUpdate reported error output: $errText" 'WARN'
                 }
             }
-            
-            Write-Progress -Activity "Processing Results" -Completed
-            
-        } else {
-            Write-StatusLog "[WARN] No installation results returned" -Level "Warning"
-            $result.Errors += "No installation results returned from Install-WindowsUpdate"
+    
+            $errorText = (($receiveErrors | ForEach-Object { [string]$_ }) -join ' | ')
+            throw $errorText
         }
-        
-        # Final status summary
-        Write-Host "`n[REPORT] INSTALLATION SUMMARY:" -ForegroundColor Cyan
-        Write-Host "   [OK] Successfully installed: $($result.Installed.Count)" -ForegroundColor Green
-        Write-Host "   [ERROR] Failed installations: $($result.Failed.Count)" -ForegroundColor Red
-        Write-Host "   [LOCK] Security updates: $($result.SecurityUpdates.Count)" -ForegroundColor Yellow
-        Write-Host "   [RESTART] Reboot required: $(if($result.RebootRequired){'Yes'}else{'No'})" -ForegroundColor $(if($result.RebootRequired){'Yellow'}else{'Green'})
-        Write-Host "   [TIMER] Total time: $([math]::Round($totalTime.TotalMinutes, 1)) minutes" -ForegroundColor White
-        
-    } catch {
-        $result.Errors += "Windows update installation failed: $($_.Exception.Message)"
-        Write-StatusLog "[ERROR] Update installation failed: $($_.Exception.Message)" -Level "Error"
+    
+        if ($jobState -eq 'Failed') {
+            if ([string]::IsNullOrWhiteSpace($jobReason)) {
+                throw "Install-WindowsUpdate background job failed."
+            }
+            else {
+                throw "Install-WindowsUpdate background job failed: $jobReason"
+            }
+        }
+    
+        return $results
     }
     
-    return $result
-}
-
-function Test-PostUpdateSystemHealth {
-    <#
-    .SYNOPSIS
-    Validates system health after Windows updates
+    function Install-AvailableWindowsUpdates {
+        Write-Log "Scanning for and installing available Windows Updates..." 'INFO'
     
-    .OUTPUTS
-    Returns hashtable with system health validation results
-    #>
+        if (-not (Get-Command -Name Install-WindowsUpdate -ErrorAction SilentlyContinue)) {
+            throw "Install-WindowsUpdate command was not found."
+        }
     
-    $result = @{
-        SystemStable = $false
-        ServicesRunning = $false
-        EventLogErrors = @()
-        DiskSpaceAfter = 0
-        Errors = @()
+        $attempt = 1
+        $maxAttempts = 2
+    
+        while ($attempt -le $maxAttempts) {
+            try {
+                if ($attempt -gt 1) {
+                    Write-Log "Retrying Windows Update install phase. Attempt $attempt of $maxAttempts..." 'INFO'
+                }
+    
+                [void](Invoke-PSWindowsUpdateJobOnce -TimeoutSeconds $OperationTimeoutSeconds)
+                Write-Log "Windows Update installation command completed." 'OK'
+                return
+            }
+            catch {
+                $message = $_.Exception.Message
+                Write-Log "Windows Update install attempt $attempt failed: $message" 'WARN'
+    
+                if ($message -match '0x80248007' -and $attempt -lt $maxAttempts) {
+                    Write-Log "Detected Windows Update datastore/catalog error 0x80248007. Resetting Windows Update components and retrying once..." 'WARN'
+                    Reset-WUComponentsSafe
+                    $attempt++
+                    continue
+                }
+    
+                throw
+            }
+        }
     }
+    
+    function Test-WURebootRequired {
+        try {
+            if (Get-Command -Name Get-WURebootStatus -ErrorAction SilentlyContinue) {
+                $status = Get-WURebootStatus -Silent
+                return [bool]$status
+            }
+        }
+        catch {
+            Write-Log "Get-WURebootStatus check failed: $($_.Exception.Message)" 'WARN'
+        }
+    
+        try {
+            $sysInfo = New-Object -ComObject Microsoft.Update.SystemInfo
+            return [bool]$sysInfo.RebootRequired
+        }
+        catch {
+            Write-Log "Microsoft.Update.SystemInfo reboot check failed: $($_.Exception.Message)" 'WARN'
+        }
+    
+        return $false
+    }
+    
+    function Invoke-ExplicitReboot {
+        param(
+            [int]$Delay = 30
+        )
+    
+        $comment = 'Restarting to complete Windows Update installation.'
+    
+        $arguments = @(
+            '/r'
+            '/t', $Delay.ToString()
+            '/d', 'p:2:17'
+            '/c', "`"$comment`""
+            '/f'
+        )
+    
+        Write-Log "Issuing reboot command: shutdown.exe $($arguments -join ' ')" 'INFO'
+        Write-YamlLog
+    
+        & "$env:SystemRoot\System32\shutdown.exe" @arguments
+    
+        $exitCode = $LASTEXITCODE
+        if ($exitCode -ne 0) {
+            throw "shutdown.exe returned exit code $exitCode"
+        }
+    
+        Write-Log "Reboot command issued successfully." 'OK'
+    }
+    
+    # Main
+    if (-not (Test-IsAdministrator)) {
+        Write-Error "Please run this script as Administrator."
+        return 1
+    }
+    
+    Initialize-YamlLog
+    Write-Log "Initializing weekend Windows update script..." 'INFO'
     
     try {
-        if ($WhatIfPreference) {
-            Write-Host "   Would validate post-update system health" -ForegroundColor Yellow
-            $result.SystemStable = $true
-            return $result
-        }
-        
-        # Check critical services
-        $criticalServices = @('wuauserv', 'cryptsvc', 'bits', 'msiserver', 'eventlog', 'winmgmt', 'rpcss')
-        $serviceStatus = @()
-        
-        foreach ($serviceName in $criticalServices) {
-            $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
-            if ($service -and $service.Status -eq 'Running') {
-                $serviceStatus += $true
-            } else {
-                $result.Errors += "Critical service not running: $serviceName"
-                $serviceStatus += $false
-            }
-        }
-        
-        $result.ServicesRunning = ($serviceStatus | Where-Object { $_ -eq $false }).Count -eq 0
-        
-        # Check remaining disk space
-        $systemDrive = Get-WmiObject -Class Win32_LogicalDisk | Where-Object { $_.DeviceID -eq $env:SystemDrive }
-        $result.DiskSpaceAfter = [math]::Round($systemDrive.FreeSpace / 1GB, 2)
-        
-        # Check recent event log errors (last 30 minutes)
-        $cutoffTime = (Get-Date).AddMinutes(-30)
-        try {
-            $recentErrors = Get-WinEvent -FilterHashtable @{LogName='System'; Level=2; StartTime=$cutoffTime} -MaxEvents 10 -ErrorAction SilentlyContinue
-            if ($recentErrors) {
-                $result.EventLogErrors = $recentErrors | ForEach-Object { 
-                    @{
-                        TimeCreated = $_.TimeCreated
-                        Id = $_.Id
-                        LevelDisplayName = $_.LevelDisplayName
-                        Message = $_.Message.Substring(0, [Math]::Min(200, $_.Message.Length))
-                    }
-                }
-            }
-        } catch {
-            Write-StatusLog "[WARN] Could not check event log for errors: $($_.Exception.Message)" -Level "Warning"
-        }
-        
-        $result.SystemStable = $result.ServicesRunning -and ($result.EventLogErrors.Count -eq 0)
-        
-        if ($result.SystemStable) {
-            Write-StatusLog "[OK] Post-update system health validation passed" -Level "Success"
-        } else {
-            Write-StatusLog "[WARN] Post-update system health validation found issues" -Level "Warning"
-        }
-        
-    } catch {
-        $result.Errors += "System health validation failed: $($_.Exception.Message)"
-    }
+        Write-Log "Running Windows Update service/policy restoration before update scan..." 'INFO'
+        Invoke-WindowsUpdateServicesEnablement
+        Write-Log "Windows Update service/policy restoration completed. Continuing to Windows Update install phase..." 'OK'
+
+        Write-Log "Beginning prerequisite validation and module preparation..." 'INFO'
+        Ensure-PSWindowsUpdate
     
-    return $result
+        if ($ResetWUComponentsFirst) {
+            Write-Log "ResetWUComponentsFirst switch detected. Beginning Windows Update component reset..." 'INFO'
+            Reset-WUComponentsSafe
+        }
+    
+        Write-Log "Beginning Windows Update scan and install phase..." 'INFO'
+        Install-AvailableWindowsUpdates
+    
+        Write-Log "Checking whether Windows reports a reboot requirement..." 'INFO'
+        $script:RebootRequired = Test-WURebootRequired
+    
+        if ($script:RebootRequired) {
+            $script:OverallResult = 'SucceededWithRebootRequired'
+            Write-Log "Windows reports that a reboot is required." 'OK'
+            Write-YamlLog
+            Invoke-ExplicitReboot -Delay $RebootDelaySeconds
+            return 3010
+        }
+        else {
+            $script:OverallResult = 'Succeeded'
+            Write-Log "No reboot is currently required." 'OK'
+            Write-YamlLog
+            return 0
+        }
+    }
+    catch {
+        $script:OverallResult = 'Failed'
+        $script:FailureMessage = $_.Exception.Message
+        Write-Log "Script failed: $($_.Exception.Message)" 'ERROR'
+        Write-YamlLog
+        return 2
+    }
 }
-
-function Show-WindowsUpdateSummary {
-    <#
-    .SYNOPSIS
-    Displays comprehensive summary of Windows updates
-    
-    .PARAMETER Results
-    Results from the Windows update process
-    #>
-    
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [hashtable]$Results
-    )
-    
-    $actionText = if ($WhatIfPreference) { "SIMULATION" } else { "UPDATE" }
-    
-    Write-Host "`n" + "="*100 -ForegroundColor Cyan
-    Write-Host "WINDOWS $actionText SUMMARY" -ForegroundColor Cyan
-    Write-Host "="*100 -ForegroundColor Cyan
-    
-    # Safe property access with null checks
-    Write-Host "Prerequisites Ready: " -NoNewline
-    $prereqReady = if ($Results.ContainsKey('PrerequisitesReady')) { $Results.PrerequisitesReady } else { $false }
-    Write-Host $(if($prereqReady){"[OK] Yes"}else{"[ERROR] No"}) -ForegroundColor $(if($prereqReady){"Green"}else{"Red"})
-    
-    Write-Host "Group Policy Reset: " -NoNewline
-    $gpReset = if ($Results.ContainsKey('GroupPolicyReset')) { $Results.GroupPolicyReset } else { $false }
-    Write-Host $(if($gpReset){"[OK] Yes"}else{"[WARN] Skipped/Failed"}) -ForegroundColor $(if($gpReset){"Green"}else{"Yellow"})
-    
-    Write-Host "Components Reset: " -NoNewline
-    $compReset = if ($Results.ContainsKey('ComponentsReset')) { $Results.ComponentsReset } else { $false }
-    Write-Host $(if($compReset){"[OK] Yes"}else{"[WARN] Skipped/Failed"}) -ForegroundColor $(if($compReset){"Green"}else{"Yellow"})
-    
-    Write-Host "Available Updates: " -NoNewline
-    $availableCount = if ($Results.ContainsKey('AvailableUpdates') -and $Results.AvailableUpdates) { $Results.AvailableUpdates.Count } else { 0 }
-    Write-Host $availableCount -ForegroundColor White
-    
-    Write-Host "Successfully Installed: " -NoNewline
-    $installedCount = if ($Results.ContainsKey('InstalledUpdates') -and $Results.InstalledUpdates) { $Results.InstalledUpdates.Count } else { 0 }
-    Write-Host $installedCount -ForegroundColor Green
-    
-    Write-Host "Failed Installations: " -NoNewline
-    $failedCount = if ($Results.ContainsKey('FailedUpdates') -and $Results.FailedUpdates) { $Results.FailedUpdates.Count } else { 0 }
-    Write-Host $failedCount -ForegroundColor Red
-    
-    Write-Host "Security Updates: " -NoNewline
-    $securityCount = if ($Results.ContainsKey('SecurityUpdates') -and $Results.SecurityUpdates) { $Results.SecurityUpdates.Count } else { 0 }
-    Write-Host $securityCount -ForegroundColor $(if($securityCount -gt 0){"Green"}else{"Gray"})
-    
-    if ($Results.ContainsKey('RestorePointCreated') -and $Results.RestorePointCreated) {
-        Write-Host "Restore Point Created: " -NoNewline
-        Write-Host "[OK] Yes" -ForegroundColor Green
-    }
-    
-    Write-Host "Reboot Required: " -NoNewline
-    $rebootRequired = if ($Results.ContainsKey('RebootRequired')) { $Results.RebootRequired } else { $false }
-    Write-Host $(if($rebootRequired){"[WARN] Yes"}else{"[OK] No"}) -ForegroundColor $(if($rebootRequired){"Yellow"}else{"Green"})
-    
-    Write-Host "Total Duration: " -NoNewline
-    $duration = if ($Results.ContainsKey('UpdateDuration') -and $Results.UpdateDuration) { 
-        $Results.UpdateDuration.TotalMinutes.ToString('F1') 
-    } else { 
-        "0.0" 
-    }
-    Write-Host "$duration minutes" -ForegroundColor White
-    
-    # Show system health status with null checks
-    if ($Results.ContainsKey('SystemValidation') -and $Results.SystemValidation -and $Results.SystemValidation.ContainsKey('SystemStable')) {
-        Write-Host "System Health: " -NoNewline
-        $systemStable = $Results.SystemValidation.SystemStable
-        Write-Host $(if($systemStable){"[OK] Stable"}else{"[WARN] Issues Detected"}) -ForegroundColor $(if($systemStable){"Green"}else{"Yellow"})
-        
-        if ($Results.SystemValidation.ContainsKey('DiskSpaceAfter')) {
-            Write-Host "Disk Space After: " -NoNewline
-            Write-Host "$($Results.SystemValidation.DiskSpaceAfter) GB" -ForegroundColor White
-        }
-    }
-    
-    # Show successful installations with null checks
-    if ($Results.ContainsKey('InstalledUpdates') -and $Results.InstalledUpdates -and $Results.InstalledUpdates.Count -gt 0) {
-        Write-Host "`nSuccessfully Installed Updates:" -ForegroundColor Green
-        $Results.InstalledUpdates | ForEach-Object {
-            $securityIcon = if ($_.IsSecurity) { "[LOCK]" } else { "[PKG]" }
-            $rebootIcon = if ($_.RebootRequired) { "[RESTART]" } else { "" }
-            $sizeText = if ($_.Size) { " ($([math]::Round($_.Size / 1MB, 1)) MB)" } else { "" }
-            Write-Host "  [OK] $securityIcon $($_.Title) ($($_.KB))$sizeText $rebootIcon" -ForegroundColor Green
-        }
-    }
-    
-    # Show failed installations with null checks
-    if ($Results.ContainsKey('FailedUpdates') -and $Results.FailedUpdates -and $Results.FailedUpdates.Count -gt 0) {
-        Write-Host "`nFailed Update Installations:" -ForegroundColor Red
-        $Results.FailedUpdates | ForEach-Object {
-            Write-Host "  [ERROR] $($_.Title) ($($_.KB)): $($_.Status)" -ForegroundColor Red
-        }
-    }
-    
-    # Show recent system errors with null checks
-    if ($Results.ContainsKey('SystemValidation') -and 
-        $Results.SystemValidation -and 
-        $Results.SystemValidation.ContainsKey('EventLogErrors') -and 
-        $Results.SystemValidation.EventLogErrors -and 
-        $Results.SystemValidation.EventLogErrors.Count -gt 0) {
-        
-        Write-Host "`nRecent System Errors:" -ForegroundColor Yellow
-        $Results.SystemValidation.EventLogErrors | ForEach-Object {
-            Write-Host "  [WARN] [$($_.TimeCreated.ToString('HH:mm:ss'))] Event $($_.Id): $($_.Message)" -ForegroundColor Yellow
-        }
-    }
-    
-    # Show restart recommendation
-    if ($rebootRequired) {
-        Write-Host "`n[RESTART] IMPORTANT: System restart required to complete update installation" -ForegroundColor Yellow
-        Write-Host "   Some updates may not be fully functional until restart is performed." -ForegroundColor Yellow
-    }
-    
-    # Show errors if any with null checks
-    if ($Results.ContainsKey('Errors') -and $Results.Errors -and $Results.Errors.Count -gt 0) {
-        Write-Host "`nIssues Encountered:" -ForegroundColor Red
-        $Results.Errors | ForEach-Object {
-            Write-Host "  - $_" -ForegroundColor Red
-        }
-    }
-    
-    Write-Host "="*100 -ForegroundColor Cyan
-}
-
-
-# -----------------------------------------------------------------------------
 # Option 12 - Disk Cleanup
 # -----------------------------------------------------------------------------
 function Run-DiskCleanup {
@@ -8103,464 +8402,2605 @@ function Remove-FolderContents {
 
 # -----------------------------------------------------------------------------
 # Option 13 - System Repair
+# Updated from 08_System_Repair.ps1 v2.4 on 2026-04-27
 # -----------------------------------------------------------------------------
 function Invoke-SystemMaintenance {
     [CmdletBinding()]
-    param (
-        [switch]$ArchiveLogs,
-        [string]$LogArchivePath = 'C:\Logs',
-        [switch]$SkipReboot,
-        [int]$MaxParallelJobs = 4
+    param(
+        [switch]$AutoRepairOnDetection = $true,
+        [switch]$AllowWmiRepair = $true,
+        [switch]$AllowNetworkReset = $false,
+        [switch]$AllowWindowsUpdateReset = $false,
+        [switch]$AllowOfflineDiskRepair = $false,
+        [switch]$AllowFirewallReset = $false,
+        [switch]$AllowIconCacheRebuild = $false,
+        [switch]$AllowCopilotRemoval = $false,
+        [switch]$AggressiveCleanup = $false,
+        [switch]$ClearEventLogs = $false,
+        [switch]$AutoRebootIfNeeded = $false,
+        [int]$AutoRebootDelaySeconds = 60,
+        [string]$LogDirectory = 'C:\Logs'
     )
 
-    # Security: Require elevation
-    if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
-        throw "This script must be run as Administrator"
-    }
-
-    $ErrorActionPreference = 'Continue'
-    $ProgressPreference = 'SilentlyContinue'  # Speed: Disable progress bars
-    $WarningPreference = 'SilentlyContinue'   # Speed: Reduce console output
-    
-    # Security: Validate log path
-    if ($ArchiveLogs) {
-        if ($LogArchivePath -notmatch '^[C-Z]:\\[\w\s\\.-]*$') {
-            throw "Invalid log archive path. Must be a valid Windows path."
-        }
-        
-        if (-not (Test-Path $LogArchivePath)) {
-            try {
-                New-Item -Path $LogArchivePath -ItemType Directory -Force | Out-Null
-                Write-Host "[OK] Created log archive: $LogArchivePath" -ForegroundColor Green
-            } catch {
-                throw "Cannot create log archive directory: $_"
-            }
-        }
-    }
-
-    # Speed: Pre-calculate system drive once
-    $sysDriveLetter = $env:SystemDrive.Substring(0,1)
-    $tempPaths = @{
-        System = @("C:\SWSetup", "C:\Temp", "C:\system.sav")
-        WindowsTemp = "C:\Windows\Temp"
-        UserTemp = $env:TEMP
-        Additional = @(
-            "C:\Windows\SoftwareDistribution\Download",
-            "C:\Windows\Prefetch", 
-            "C:\Windows\Logs\CBS",
-            "$env:LOCALAPPDATA\Microsoft\Windows\INetCache",
-            "$env:LOCALAPPDATA\Microsoft\Windows\WebCache",
-            "C:\ProgramData\Microsoft\Windows\WER\ReportQueue",
-            "$env:LOCALAPPDATA\CrashDumps",
-            "$env:LOCALAPPDATA\Microsoft\Windows\DeliveryOptimization\Cache"
-        )
-    }
-
-    Write-Host "[TOOLS] Starting optimized system maintenance..." -ForegroundColor Cyan
-    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $previousErrorActionPreference = $ErrorActionPreference
 
     try {
-        # Speed: Run filesystem repair in background job
-        $fsRepairJob = Start-Job -ScriptBlock {
-            param($drive)
-            try {
-                if (Get-Volume -DriveLetter $drive -ErrorAction SilentlyContinue) {
-                    Repair-Volume -DriveLetter $drive -Scan -ErrorAction SilentlyContinue
-                    Repair-Volume -DriveLetter $drive -OfflineScanAndFix -ErrorAction SilentlyContinue
-                }
-                return "[OK] Filesystem repair completed"
-            } catch {
-                return "[WARN] Filesystem repair failed: $_"
-            }
-        } -ArgumentList $sysDriveLetter
-
-        Write-Host "[RUN] Component store maintenance..." -ForegroundColor Yellow
-        # Speed: Run critical DISM operations only, suppress output and input
-        $dismJobs = @()
-        $dismJobs += Start-Job -ScriptBlock { 
-            $null = DISM.exe /Online /Cleanup-Image /RestoreHealth /Quiet /NoRestart 2>&1
-            return "[OK] Component store restore completed"
+    $ErrorActionPreference = 'Stop'
+    
+    $script:RunStart = Get-Date
+    $script:ComputerName = $env:COMPUTERNAME
+    $script:TimestampForFile = $script:RunStart.ToString('yyyy-MM-dd_HH-mm-ss')
+    $script:BaseFileName = "{0}-SystemRepair-{1}" -f $script:ComputerName, $script:TimestampForFile
+    $script:YamlLogPath = Join-Path $LogDirectory ($script:BaseFileName + '.yaml')
+    
+    $script:Summary = [ordered]@{
+        ComputerName                 = $script:ComputerName
+        StartTime                    = $script:RunStart
+        EndTime                      = $null
+        StepsSucceeded               = 0
+        StepsFailed                  = 0
+        Warnings                     = 0
+        RebootRequired               = $false
+        PendingRebootDetected        = $false
+        DiskCorruptionSuspected      = $false
+        DismCorruptionDetected       = $false
+        SfcIntegrityViolations       = $false
+        WmiRepositoryInconsistent    = $false
+        RepairsAttempted             = New-Object System.Collections.Generic.List[string]
+        Notes                        = New-Object System.Collections.Generic.List[string]
+    }
+    
+    $script:DetailedResults = New-Object System.Collections.Generic.List[object]
+    
+    function Ensure-LogDirectory {
+        if (-not (Test-Path -LiteralPath $LogDirectory)) {
+            New-Item -Path $LogDirectory -ItemType Directory -Force | Out-Null
         }
-        $dismJobs += Start-Job -ScriptBlock { 
-            $null = DISM.exe /Online /Cleanup-Image /StartComponentCleanup /ResetBase /Quiet /NoRestart 2>&1
-            return "[OK] Component cleanup completed"
+    }
+    
+    function ConvertTo-YamlScalar {
+        param(
+            [Parameter(Mandatory)][AllowNull()]$Value
+        )
+    
+        if ($null -eq $Value) {
+            return 'null'
         }
-
-        Write-Host "[RUN] Network stack reset..." -ForegroundColor Yellow
-        # Speed: Combine network operations
-        $networkJob = Start-Job -ScriptBlock {
-            netsh winsock reset | Out-Null
-            netsh int ip reset | Out-Null  
-            ipconfig /flushdns | Out-Null
-            Clear-DnsClientCache
-            return "[OK] Network stack reset"
+    
+        if ($Value -is [bool]) {
+            return $Value.ToString().ToLowerInvariant()
         }
-
-        Write-Host "[RUN] Cleaning temporary files..." -ForegroundColor Yellow
-        # Speed: Parallel cleanup using runspaces
-        $cleanupJobs = @()
-        
-        # System paths cleanup
-        $cleanupJobs += Start-Job -ScriptBlock {
-            param($paths)
-            $results = @()
-            foreach ($path in $paths) {
-                if (Test-Path $path) {
-                    try {
-                        Remove-Item -Path $path -Recurse -Force -ErrorAction Stop
-                        $results += "[OK] Deleted: $path"
-                    } catch {
-                        $results += "[WARN] Failed: $path"
-                    }
-                }
-            }
-            return $results
-        } -ArgumentList (,$tempPaths.System)
-
-        # Windows Temp cleanup
-        $cleanupJobs += Start-Job -ScriptBlock {
-            param($winTemp, $additionalPaths)
-            $results = @()
-            
-            # Clean Windows\Temp
-            if (Test-Path $winTemp) {
-                try {
-                    Get-ChildItem -Path $winTemp -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-                    $results += "[OK] Cleared Windows Temp"
-                } catch {
-                    $results += "[WARN] Windows Temp cleanup failed"
-                }
-            }
-            
-            # Clean additional paths
-            foreach ($folder in $additionalPaths) {
-                if (Test-Path $folder) {
-                    try {
-                        Get-ChildItem -Path $folder -Force -ErrorAction SilentlyContinue | 
-                            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-                        $results += "[OK] Cleaned: $folder"
-                    } catch {
-                        $results += "[WARN] Failed: $folder"
-                    }
-                }
-            }
-            return $results
-        } -ArgumentList $tempPaths.WindowsTemp, $tempPaths.Additional
-
-        Write-Host "[RUN] Security hardening..." -ForegroundColor Yellow
-        # Security: Enhanced security operations
-        $securityJob = Start-Job -ScriptBlock {
-            $results = @()
-            
-            # Reset firewall to secure defaults
-            try {
-                netsh advfirewall reset | Out-Null
-                $results += "[OK] Firewall reset to secure defaults"
-            } catch {
-                $results += "[WARN] Firewall reset failed"
-            }
-            
-            # Enable Windows Defender
-            try {
-                Set-MpPreference -DisableRealtimeMonitoring $false -ErrorAction Stop
-                Set-MpPreference -DisableScriptScanning $false -ErrorAction SilentlyContinue
-                Set-MpPreference -DisableBehaviorMonitoring $false -ErrorAction SilentlyContinue
-                $results += "[OK] Windows Defender enhanced"
-            } catch {
-                $results += "[WARN] Defender configuration failed"
-            }
-            
-            return $results
+    
+        if ($Value -is [datetime]) {
+            return "'" + $Value.ToString('yyyy-MM-dd HH:mm:ss') + "'"
         }
-
-        Write-Host "[RUN] System optimization..." -ForegroundColor Yellow
-        # Speed: SSD optimization
-        $optimizationJob = Start-Job -ScriptBlock {
-            param($drive)
-            $results = @()
-            
-            # SSD Trim
-            try {
-                Optimize-Volume -DriveLetter $drive -ReTrim -ErrorAction Stop
-                $results += "[OK] SSD Trim completed"
-            } catch {
-                $results += "[WARN] SSD Trim failed"
-            }
-            
-            # Icon cache rebuild
-            try {
-                Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
-                Start-Sleep -Seconds 2
-                Remove-Item "$env:LOCALAPPDATA\IconCache.db" -Force -ErrorAction SilentlyContinue
-                Remove-Item "$env:LOCALAPPDATA\Microsoft\Windows\Explorer\iconcache*" -Recurse -Force -Confirm:$false -ErrorAction SilentlyContinue
-                Start-Process explorer
-                $results += "[OK] Icon cache rebuilt"
-            } catch {
-                $results += "[WARN] Icon cache rebuild failed"
-            }
-            
-            return $results
-        } -ArgumentList $sysDriveLetter
-
-        # Security: Safe bloatware removal with whitelist approach
-        Write-Host "[RUN] Removing unnecessary apps..." -ForegroundColor Yellow
-        $appRemovalJob = Start-Job -ScriptBlock {
-            $results = @()
-            # Security: Only remove specific known bloatware
-            $bloatwarePatterns = @(
-                '*Xbox*', '*Zune*', '*SkypeApp*', '*BingWeather*', 
-                '*Microsoft.3DBuilder*', '*CandyCrushSaga*', '*Facebook*'
-            )
-            
-            try {
-                foreach ($pattern in $bloatwarePatterns) {
-                    Get-AppxProvisionedPackage -Online | 
-                    Where-Object DisplayName -Like $pattern |
-                    ForEach-Object {
-                        try {
-                            Remove-AppxProvisionedPackage -Online -PackageName $_.PackageName -ErrorAction Stop
-                            $results += "[OK] Removed: $($_.DisplayName)"
-                        } catch {
-                            $results += "[WARN] Failed to remove: $($_.DisplayName)"
-                        }
-                    }
-                }
-            } catch {
-                $results += "[WARN] App removal enumeration failed"
-            }
-            return $results
+    
+        if ($Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal]) {
+            return [string]$Value
         }
-
-        # Wait for all jobs with timeout and real-time progress reporting
-        Write-Host "[PENDING] Monitoring operations in real-time..." -ForegroundColor Yellow
-        $allJobs = @($fsRepairJob, $networkJob, $securityJob, $optimizationJob, $appRemovalJob) + $dismJobs + $cleanupJobs
-        
-        # Create job tracking with descriptive names
-        $jobTracker = @{
-            $fsRepairJob.Id = @{ Name = "Filesystem Repair"; Status = "Running"; StartTime = Get-Date }
-            $networkJob.Id = @{ Name = "Network Stack Reset"; Status = "Running"; StartTime = Get-Date }
-            $securityJob.Id = @{ Name = "Security Hardening"; Status = "Running"; StartTime = Get-Date }
-            $optimizationJob.Id = @{ Name = "System Optimization"; Status = "Running"; StartTime = Get-Date }
-            $appRemovalJob.Id = @{ Name = "App Removal"; Status = "Running"; StartTime = Get-Date }
-        }
-        
-        # Add DISM jobs to tracker
-        for ($i = 0; $i -lt $dismJobs.Count; $i++) {
-            $jobTracker[$dismJobs[$i].Id] = @{ 
-                Name = "DISM Operation $($i + 1)"; 
-                Status = "Running"; 
-                StartTime = Get-Date 
-            }
-        }
-        
-        # Add cleanup jobs to tracker
-        for ($i = 0; $i -lt $cleanupJobs.Count; $i++) {
-            $jobTracker[$cleanupJobs[$i].Id] = @{ 
-                Name = "Cleanup Task $($i + 1)"; 
-                Status = "Running"; 
-                StartTime = Get-Date 
-            }
-        }
-        
-        $timeoutSeconds = 600  # 10 minutes
-        $startTime = Get-Date
-        $completedJobs = @()
-        $lastUpdate = Get-Date
-        
-        Write-Host "`n  [REPORT] Active Operations:" -ForegroundColor Cyan
-        $jobTracker.Values | ForEach-Object { 
-            Write-Host "    - $($_.Name) - Started" -ForegroundColor Gray 
-        }
-        Write-Host ""
-        
-        do {
-            $currentTime = Get-Date
-            
-            # Check job states and report changes
-            foreach ($job in $allJobs) {
-                $tracker = $jobTracker[$job.Id]
-                $newState = $job.State
-                
-                if ($tracker.Status -ne $newState) {
-                    $elapsed = ($currentTime - $tracker.StartTime).TotalSeconds
-                    
-                    switch ($newState) {
-                        'Completed' {
-                            Write-Host "    [OK] $($tracker.Name) completed ($($elapsed.ToString('F1'))s)" -ForegroundColor Green
-                            
-                            # Show job results immediately
-                            try {
-                                $result = Receive-Job $job
-                                if ($result) {
-                                    $result | ForEach-Object { 
-                                        Write-Host "       `-- $_" -ForegroundColor DarkGray 
-                                    }
-                                }
-                            } catch {
-                                Write-Host "       `-- [WARN] Could not retrieve results" -ForegroundColor Yellow
-                            }
-                        }
-                        'Failed' {
-                            Write-Host "    [ERROR] $($tracker.Name) failed ($($elapsed.ToString('F1'))s)" -ForegroundColor Red
-                        }
-                        'Stopped' {
-                            Write-Host "    [STOP] $($tracker.Name) stopped ($($elapsed.ToString('F1'))s)" -ForegroundColor Yellow
-                        }
-                        'Blocked' {
-                            Write-Host "    [PAUSE] $($tracker.Name) blocked - attempting to resume..." -ForegroundColor Yellow
-                            try {
-                                $null = Receive-Job $job -Keep
-                            } catch {
-                                # Continue if unable to receive job output
-                            }
-                        }
-                    }
-                    
-                    $tracker.Status = $newState
-                }
-            }
-            
-            # Show periodic status updates every 30 seconds for long-running jobs
-            if (($currentTime - $lastUpdate).TotalSeconds -gt 30) {
-                $runningCount = ($allJobs | Where-Object { $_.State -eq 'Running' }).Count
-                if ($runningCount -gt 0) {
-                    $elapsed = ($currentTime - $startTime).TotalMinutes
-                    Write-Host "    [PENDING] $runningCount operations still running... ($($elapsed.ToString('F1')) min elapsed)" -ForegroundColor Cyan
-                    
-                    # Show which jobs are still running
-                    $allJobs | Where-Object { $_.State -eq 'Running' } | ForEach-Object {
-                        $tracker = $jobTracker[$_.Id]
-                        $jobElapsed = ($currentTime - $tracker.StartTime).TotalSeconds
-                        Write-Host "       - $($tracker.Name) ($($jobElapsed.ToString('F0'))s)" -ForegroundColor DarkCyan
-                    }
-                }
-                $lastUpdate = $currentTime
-            }
-            
-            # Check for newly completed jobs
-            $runningJobs = $allJobs | Where-Object { $_.State -eq 'Running' -or $_.State -eq 'Blocked' }
-            
-            # Check timeout
-            $elapsed = ($currentTime - $startTime).TotalSeconds
-            if ($elapsed -gt $timeoutSeconds) {
-                Write-Host "`n    [WARN] Timeout reached after $($timeoutSeconds/60) minutes, stopping remaining jobs..." -ForegroundColor Yellow
-                $runningJobs | Stop-Job
-                break
-            }
-            
-            # Brief pause to prevent excessive CPU usage
-            Start-Sleep -Milliseconds 1000
-            
-        } while ($runningJobs.Count -gt 0)
-        
-        Write-Host "`n[SUMMARY] Final Results Summary:" -ForegroundColor Cyan
-        
-        # Clean up jobs and show final summary
-        $successCount = 0
-        $failedCount = 0
-        
-        foreach ($job in $allJobs) {
-            $tracker = $jobTracker[$job.Id]
-            $finalElapsed = ((Get-Date) - $tracker.StartTime).TotalSeconds
-            
-            switch ($job.State) {
-                'Completed' { 
-                    $successCount++
-                    Write-Host "  [OK] $($tracker.Name) - Success ($($finalElapsed.ToString('F1'))s)" -ForegroundColor Green
-                }
-                'Failed' { 
-                    $failedCount++
-                    Write-Host "  [ERROR] $($tracker.Name) - Failed ($($finalElapsed.ToString('F1'))s)" -ForegroundColor Red
-                }
-                default { 
-                    $failedCount++
-                    Write-Host "  [WARN] $($tracker.Name) - $($job.State) ($($finalElapsed.ToString('F1'))s)" -ForegroundColor Yellow
-                }
-            }
-            
-            Remove-Job $job -Force
-        }
-        
-        Write-Host "`n[STATS] Operation Summary: $successCount successful, $failedCount failed/incomplete" -ForegroundColor $(if ($failedCount -eq 0) { 'Green' } else { 'Yellow' })
-
-        # Security: Audit system state
-        Write-Host "`n[SCAN] Security audit..." -ForegroundColor Yellow
-        $auditResults = @()
-        
-        # Check for suspicious scheduled tasks
+    
+        $text = [string]$Value
+        $text = $text -replace "'", "''"
+        return "'" + $text + "'"
+    }
+    
+    function Add-DetailedResult {
+        param(
+            [Parameter(Mandatory)][string]$Step,
+            [Parameter(Mandatory)][string]$Status,
+            [Parameter(Mandatory)][string]$Message,
+            [AllowNull()]$Data = $null
+        )
+    
+        $script:DetailedResults.Add([PSCustomObject]@{
+            Timestamp = Get-Date
+            Step      = $Step
+            Status    = $Status
+            Message   = $Message
+            Data      = $Data
+        }) | Out-Null
+    }
+    
+    function Write-YamlLog {
         try {
-            Get-ScheduledTask | Where-Object { 
-                $_.State -eq 'Unknown' -or 
-                ($_.TaskPath -notlike '\Microsoft\*' -and $_.Author -eq '') 
-            } | ForEach-Object {
-                $auditResults += "[WARN] Suspicious task: $($_.TaskName)"
-            }
-        } catch {
-            $auditResults += "[WARN] Task audit failed"
-        }
-        
-        if ($auditResults.Count -eq 0) {
-            Write-Host "  [OK] No security issues detected" -ForegroundColor Green
-        } else {
-            $auditResults | ForEach-Object { Write-Host "  $_" -ForegroundColor Yellow }
-        }
-
-        # Speed: Smart event log clearing (keep critical logs)
-        Write-Host "`n[FILES] Clearing non-critical event logs..." -ForegroundColor Yellow
-        $criticalLogs = @('System', 'Application', 'Security')
-        $clearedCount = 0
-        
-        Get-WinEvent -ListLog * -ErrorAction SilentlyContinue | 
-        Where-Object { $_.LogName -notin $criticalLogs -and $_.RecordCount -gt 0 } |
-        ForEach-Object {
-            try {
-                [System.Diagnostics.Eventing.Reader.EventLogSession]::GlobalSession.ClearLog($_.LogName)
-                $clearedCount++
-            } catch {
-                # Silently continue for logs that can't be cleared
-            }
-        }
-        Write-Host "  [OK] Cleared $clearedCount non-critical event logs" -ForegroundColor Green
-
-        # Final system health check
-        Write-Host "`n[HP] System health verification..." -ForegroundColor Yellow
-        $healthCheck = Start-Job -ScriptBlock {
-            # Verify critical services
-            $criticalServices = @('Winmgmt', 'EventLog', 'RpcSs', 'DcomLaunch')
-            $serviceStatus = @()
-            
-            foreach ($service in $criticalServices) {
-                $svc = Get-Service -Name $service -ErrorAction SilentlyContinue
-                if ($svc.Status -ne 'Running') {
-                    $serviceStatus += "[WARN] Service $service is $($svc.Status)"
+            Ensure-LogDirectory
+    
+            $lines = New-Object System.Collections.Generic.List[string]
+    
+            $lines.Add('run:') | Out-Null
+            $lines.Add("  computer_name: $(ConvertTo-YamlScalar $script:ComputerName)") | Out-Null
+            $lines.Add("  start_time: $(ConvertTo-YamlScalar $script:Summary.StartTime)") | Out-Null
+            $lines.Add("  end_time: $(ConvertTo-YamlScalar $script:Summary.EndTime)") | Out-Null
+            $lines.Add("  yaml_log_path: $(ConvertTo-YamlScalar $script:YamlLogPath)") | Out-Null
+            $lines.Add('') | Out-Null
+    
+            $lines.Add('settings:') | Out-Null
+            $lines.Add("  auto_repair_on_detection: $(ConvertTo-YamlScalar $AutoRepairOnDetection)") | Out-Null
+            $lines.Add("  allow_wmi_repair: $(ConvertTo-YamlScalar $AllowWmiRepair)") | Out-Null
+            $lines.Add("  allow_network_reset: $(ConvertTo-YamlScalar $AllowNetworkReset)") | Out-Null
+            $lines.Add("  allow_windows_update_reset: $(ConvertTo-YamlScalar $AllowWindowsUpdateReset)") | Out-Null
+            $lines.Add("  allow_offline_disk_repair: $(ConvertTo-YamlScalar $AllowOfflineDiskRepair)") | Out-Null
+            $lines.Add("  allow_firewall_reset: $(ConvertTo-YamlScalar $AllowFirewallReset)") | Out-Null
+            $lines.Add("  allow_icon_cache_rebuild: $(ConvertTo-YamlScalar $AllowIconCacheRebuild)") | Out-Null
+            $lines.Add("  allow_copilot_removal: $(ConvertTo-YamlScalar $AllowCopilotRemoval)") | Out-Null
+            $lines.Add("  aggressive_cleanup: $(ConvertTo-YamlScalar $AggressiveCleanup)") | Out-Null
+            $lines.Add("  clear_event_logs: $(ConvertTo-YamlScalar $ClearEventLogs)") | Out-Null
+            $lines.Add("  auto_reboot_if_needed: $(ConvertTo-YamlScalar $AutoRebootIfNeeded)") | Out-Null
+            $lines.Add("  auto_reboot_delay_seconds: $(ConvertTo-YamlScalar $AutoRebootDelaySeconds)") | Out-Null
+            $lines.Add('') | Out-Null
+    
+            $lines.Add('summary:') | Out-Null
+            $lines.Add("  steps_succeeded: $(ConvertTo-YamlScalar $script:Summary.StepsSucceeded)") | Out-Null
+            $lines.Add("  steps_failed: $(ConvertTo-YamlScalar $script:Summary.StepsFailed)") | Out-Null
+            $lines.Add("  warnings: $(ConvertTo-YamlScalar $script:Summary.Warnings)") | Out-Null
+            $lines.Add("  reboot_required: $(ConvertTo-YamlScalar $script:Summary.RebootRequired)") | Out-Null
+            $lines.Add("  pending_reboot_detected: $(ConvertTo-YamlScalar $script:Summary.PendingRebootDetected)") | Out-Null
+            $lines.Add("  disk_corruption_suspected: $(ConvertTo-YamlScalar $script:Summary.DiskCorruptionSuspected)") | Out-Null
+            $lines.Add("  dism_corruption_detected: $(ConvertTo-YamlScalar $script:Summary.DismCorruptionDetected)") | Out-Null
+            $lines.Add("  sfc_integrity_violations: $(ConvertTo-YamlScalar $script:Summary.SfcIntegrityViolations)") | Out-Null
+            $lines.Add("  wmi_repository_inconsistent: $(ConvertTo-YamlScalar $script:Summary.WmiRepositoryInconsistent)") | Out-Null
+            $lines.Add('') | Out-Null
+    
+            $lines.Add('repairs_attempted:') | Out-Null
+            if ($script:Summary.RepairsAttempted.Count -gt 0) {
+                foreach ($repair in $script:Summary.RepairsAttempted) {
+                    $lines.Add("  - $(ConvertTo-YamlScalar $repair)") | Out-Null
                 }
             }
-            
-            if ($serviceStatus.Count -eq 0) {
-                return "[OK] All critical services running"
-            } else {
-                return $serviceStatus
+            else {
+                $lines.Add('  []') | Out-Null
+            }
+            $lines.Add('') | Out-Null
+    
+            $lines.Add('notes:') | Out-Null
+            if ($script:Summary.Notes.Count -gt 0) {
+                foreach ($note in $script:Summary.Notes) {
+                    $lines.Add("  - $(ConvertTo-YamlScalar $note)") | Out-Null
+                }
+            }
+            else {
+                $lines.Add('  []') | Out-Null
+            }
+            $lines.Add('') | Out-Null
+    
+            $lines.Add('detailed_results:') | Out-Null
+            if ($script:DetailedResults.Count -gt 0) {
+                foreach ($entry in $script:DetailedResults) {
+                    $lines.Add('  -') | Out-Null
+                    $lines.Add("    timestamp: $(ConvertTo-YamlScalar $entry.Timestamp)") | Out-Null
+                    $lines.Add("    step: $(ConvertTo-YamlScalar $entry.Step)") | Out-Null
+                    $lines.Add("    status: $(ConvertTo-YamlScalar $entry.Status)") | Out-Null
+                    $lines.Add("    message: $(ConvertTo-YamlScalar $entry.Message)") | Out-Null
+    
+                    if ($null -eq $entry.Data) {
+                        $lines.Add('    data: null') | Out-Null
+                    }
+                    elseif ($entry.Data -is [System.Collections.IDictionary]) {
+                        $lines.Add('    data:') | Out-Null
+                        foreach ($key in $entry.Data.Keys) {
+                            $lines.Add("      $key`: $(ConvertTo-YamlScalar $entry.Data[$key])") | Out-Null
+                        }
+                    }
+                    else {
+                        $lines.Add("    data: $(ConvertTo-YamlScalar $entry.Data)") | Out-Null
+                    }
+                }
+            }
+            else {
+                $lines.Add('  []') | Out-Null
+            }
+    
+            Set-Content -Path $script:YamlLogPath -Value $lines -Encoding UTF8
+        }
+        catch {
+            Write-Warning "Failed to write YAML log: $($_.Exception.Message)"
+        }
+    }
+    
+    function Write-Log {
+        param(
+            [Parameter(Mandatory)][string]$Message,
+            [ValidateSet('INFO','OK','WARN','ERROR')][string]$Level = 'INFO'
+        )
+    
+        $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+        $line = "[$timestamp] [$('{0,-5}' -f $Level)] $Message"
+    
+        switch ($Level) {
+            'INFO'  { Write-Host $line -ForegroundColor Cyan }
+            'OK'    { Write-Host $line -ForegroundColor Green }
+            'WARN'  { Write-Host $line -ForegroundColor Yellow }
+            'ERROR' { Write-Host $line -ForegroundColor Red }
+        }
+    }
+    
+    function Add-Note {
+        param([string]$Message)
+        $script:Summary.Notes.Add($Message) | Out-Null
+    }
+    
+    function Add-RepairAttempt {
+        param([string]$Message)
+        $script:Summary.RepairsAttempted.Add($Message) | Out-Null
+    }
+    
+    function Complete-Step {
+        param([string]$Name)
+        $script:Summary.StepsSucceeded++
+        Write-Log "$Name completed." 'OK'
+        Add-DetailedResult -Step $Name -Status 'Succeeded' -Message "$Name completed successfully."
+    }
+    
+    function Fail-Step {
+        param(
+            [string]$Name,
+            [string]$Reason
+        )
+        $script:Summary.StepsFailed++
+        Write-Log "$Name failed: $Reason" 'ERROR'
+        Add-Note "$Name failed: $Reason"
+        Add-DetailedResult -Step $Name -Status 'Failed' -Message $Reason
+    }
+    
+    function Warn-Step {
+        param(
+            [string]$Name,
+            [string]$Reason
+        )
+        $script:Summary.Warnings++
+        Write-Log "$Name warning: $Reason" 'WARN'
+        Add-Note "$Name warning: $Reason"
+        Add-DetailedResult -Step $Name -Status 'Warning' -Message $Reason
+    }
+    
+    function Test-IsAdministrator {
+        try {
+            $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+            $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+            return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+        }
+        catch {
+            return $false
+        }
+    }
+    
+    
+    function Set-ClassicContextMenuForHive {
+        param(
+            [Parameter(Mandatory)][string]$RootKey
+        )
+    
+        $basePath = Join-Path $RootKey 'Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}'
+        $inprocPath = Join-Path $basePath 'InprocServer32'
+    
+        if (-not (Test-Path -LiteralPath $basePath)) {
+            New-Item -Path $basePath -Force | Out-Null
+        }
+    
+        if (-not (Test-Path -LiteralPath $inprocPath)) {
+            New-Item -Path $inprocPath -Force | Out-Null
+        }
+    
+        New-ItemProperty -Path $inprocPath -Name '(default)' -Value '' -PropertyType String -Force | Out-Null
+        Write-Log "Classic context menu registry value set for hive: $RootKey" 'OK'
+        Add-DetailedResult -Step 'ClassicContextMenuRegistry' -Status 'Info' -Message "Classic context menu registry value set." -Data @{
+            RootKey = $RootKey
+            RegistryPath = $inprocPath
+        }
+    }
+    
+    function Enable-ClassicContextMenuAllUsers {
+        Write-Log 'Applying classic Windows 10-style context menu for all users...' 'INFO'
+    
+        Set-ClassicContextMenuForHive -RootKey 'Registry::HKEY_CURRENT_USER'
+    
+        $userSids = Get-ChildItem Registry::HKEY_USERS |
+            Where-Object {
+                $_.PSChildName -match '^S-1-5-21-' -and
+                $_.PSChildName -notmatch '_Classes$'
+            } |
+            Select-Object -ExpandProperty PSChildName
+    
+        foreach ($sid in $userSids) {
+            Set-ClassicContextMenuForHive -RootKey "Registry::HKEY_USERS\$sid"
+        }
+    
+        $defaultHiveName = 'HKU\DefaultTemp'
+        $defaultHivePsPath = 'Registry::HKEY_USERS\DefaultTemp'
+        $defaultUserNtUserDat = 'C:\Users\Default\NTUSER.DAT'
+    
+        if (Test-Path -LiteralPath $defaultUserNtUserDat) {
+            $hiveLoaded = $false
+    
+            try {
+                $loadResult = & reg.exe load $defaultHiveName $defaultUserNtUserDat
+                if ($LASTEXITCODE -ne 0) {
+                    throw "Failed to load Default User hive: $($loadResult -join ' ')"
+                }
+    
+                $hiveLoaded = $true
+                Start-Sleep -Milliseconds 750
+    
+                Set-ClassicContextMenuForHive -RootKey $defaultHivePsPath
+    
+                Start-Sleep -Milliseconds 750
+                [System.GC]::Collect()
+                [System.GC]::WaitForPendingFinalizers()
+                Start-Sleep -Milliseconds 750
+            }
+            catch {
+                Write-Log "Failed to update Default User profile: $($_.Exception.Message)" 'ERROR'
+                Add-DetailedResult -Step 'ClassicContextMenuDefaultUser' -Status 'Failed' -Message $_.Exception.Message
+            }
+            finally {
+                if ($hiveLoaded) {
+                    $unloaded = $false
+    
+                    foreach ($attempt in 1..5) {
+                        $unloadResult = & reg.exe unload $defaultHiveName
+                        if ($LASTEXITCODE -eq 0) {
+                            $unloaded = $true
+                            Write-Log 'Applied classic context menu to Default User profile.' 'OK'
+                            Add-DetailedResult -Step 'ClassicContextMenuDefaultUser' -Status 'Succeeded' -Message 'Applied classic context menu to Default User profile.'
+                            break
+                        }
+    
+                        Start-Sleep -Seconds 1
+                        [System.GC]::Collect()
+                        [System.GC]::WaitForPendingFinalizers()
+                    }
+    
+                    if (-not $unloaded) {
+                        Write-Log 'Classic context menu was written to Default User profile, but unloading the hive failed. A reboot may be required before the hive is released.' 'WARN'
+                        Add-DetailedResult -Step 'ClassicContextMenuDefaultUser' -Status 'Warning' -Message 'Classic context menu was written to Default User profile, but unloading the hive failed. A reboot may be required before the hive is released.'
+                    }
+                }
             }
         }
-        
-        $healthResult = Wait-Job $healthCheck | Receive-Job
-        Remove-Job $healthCheck
-        $healthResult | ForEach-Object { Write-Host "  $_" -ForegroundColor Gray }
-
-    } catch {
-        Write-Error "Critical maintenance failure: $_"
-        throw
-    } finally {
-        $stopwatch.Stop()
-        Write-Host "`n[FAST] Maintenance completed in $($stopwatch.Elapsed.TotalMinutes.ToString('F1')) minutes" -ForegroundColor Green
-        
-        if (-not $SkipReboot) {
-            Write-Host "`n[RESTART] System restart recommended for optimal performance." -ForegroundColor Yellow
-            $restart = Read-Host "Restart now? (y/N)"
-            if ($restart -eq 'y' -or $restart -eq 'Y') {
-                Restart-Computer -Force
+        else {
+            Write-Log 'Default User NTUSER.DAT not found; future new users were not updated.' 'WARN'
+            Add-DetailedResult -Step 'ClassicContextMenuDefaultUser' -Status 'Warning' -Message 'Default User NTUSER.DAT not found; future new users were not updated.'
+        }
+    
+        Write-Log 'Classic context menu registry changes applied. Users may need to sign out and back in.' 'INFO'
+        Add-DetailedResult -Step 'ClassicContextMenuAllUsers' -Status 'Info' -Message 'Classic context menu registry changes applied for current, loaded, and default user profiles.'
+    }
+    
+    function Invoke-Safely {
+        param(
+            [Parameter(Mandatory)][string]$Name,
+            [Parameter(Mandatory)][scriptblock]$ScriptBlock,
+            [switch]$WarnOnly
+        )
+    
+        try {
+            & $ScriptBlock
+            Complete-Step -Name $Name
+            return $true
+        }
+        catch {
+            if ($WarnOnly) {
+                Warn-Step -Name $Name -Reason $_.Exception.Message
+            }
+            else {
+                Fail-Step -Name $Name -Reason $_.Exception.Message
+            }
+            return $false
+        }
+    }
+    
+    function Get-PendingRebootState {
+        $result = [ordered]@{
+            CBServicing_RebootPending         = $false
+            WindowsUpdate_RebootRequired      = $false
+            SessionManager_PendingFileRename  = $false
+            SessionManager_PendingFileRename2 = $false
+            UpdateExeVolatile                 = $false
+            PackagesPending                   = $false
+            WUAU_RebootRequired_COM           = $false
+            AnyPendingReboot                  = $false
+        }
+    
+        $cbsRebootPending = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
+        $wuRebootRequired = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
+        $packagesPending  = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\PackagesPending'
+        $sessionMgr       = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'
+        $updateExe        = 'HKLM:\SOFTWARE\Microsoft\Updates'
+    
+        try { $result.CBServicing_RebootPending = Test-Path -LiteralPath $cbsRebootPending } catch {}
+        try { $result.WindowsUpdate_RebootRequired = Test-Path -LiteralPath $wuRebootRequired } catch {}
+        try { $result.PackagesPending = Test-Path -LiteralPath $packagesPending } catch {}
+    
+        try {
+            $pendingRename = (Get-ItemProperty -Path $sessionMgr -Name 'PendingFileRenameOperations' -ErrorAction Stop).PendingFileRenameOperations
+            if ($null -ne $pendingRename -and $pendingRename.Count -gt 0) {
+                $result.SessionManager_PendingFileRename = $true
             }
         }
+        catch {}
+    
+        try {
+            $pendingRename2 = (Get-ItemProperty -Path $sessionMgr -Name 'PendingFileRenameOperations2' -ErrorAction Stop).PendingFileRenameOperations2
+            if ($null -ne $pendingRename2 -and $pendingRename2.Count -gt 0) {
+                $result.SessionManager_PendingFileRename2 = $true
+            }
+        }
+        catch {}
+    
+        try {
+            $uev = (Get-ItemProperty -Path $updateExe -Name 'UpdateExeVolatile' -ErrorAction Stop).UpdateExeVolatile
+            if ($null -ne $uev -and [int]$uev -ne 0) {
+                $result.UpdateExeVolatile = $true
+            }
+        }
+        catch {}
+    
+        try {
+            $sysInfo = New-Object -ComObject Microsoft.Update.SystemInfo
+            if ($sysInfo.RebootRequired) {
+                $result.WUAU_RebootRequired_COM = $true
+            }
+        }
+        catch {}
+    
+        if ($result.Values -contains $true) {
+            $result.AnyPendingReboot = $true
+        }
+    
+        Add-DetailedResult -Step 'PendingRebootCheckData' -Status 'Info' -Message 'Collected pending reboot state.' -Data $result
+        [PSCustomObject]$result
+    }
+    
+    function Test-SystemDiskIsSSD {
+        try {
+            $systemDriveLetter = $env:SystemDrive.TrimEnd(':')
+            $partition = Get-Partition -DriveLetter $systemDriveLetter -ErrorAction Stop
+            $disk = Get-Disk -Number $partition.DiskNumber -ErrorAction Stop
+            return ($disk.MediaType -eq 'SSD')
+        }
+        catch {
+            return $false
+        }
+    }
+    
+    function Invoke-DismCommand {
+        param([string[]]$Arguments)
+    
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = "$env:SystemRoot\System32\dism.exe"
+        $psi.Arguments = $Arguments -join ' '
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+    
+        $proc = New-Object System.Diagnostics.Process
+        $proc.StartInfo = $psi
+        [void]$proc.Start()
+    
+        $stdout = $proc.StandardOutput.ReadToEnd()
+        $stderr = $proc.StandardError.ReadToEnd()
+        $proc.WaitForExit()
+    
+        if (-not [string]::IsNullOrWhiteSpace($stdout)) {
+            $stdout -split "`r?`n" | Where-Object { $_.Trim() } | ForEach-Object { Write-Log $_ 'INFO' }
+        }
+    
+        if (-not [string]::IsNullOrWhiteSpace($stderr)) {
+            $stderr -split "`r?`n" | Where-Object { $_.Trim() } | ForEach-Object { Write-Log $_ 'WARN' }
+        }
+    
+        Add-DetailedResult -Step 'DISM' -Status 'Info' -Message ("Executed DISM: " + ($Arguments -join ' ')) -Data @{
+            ExitCode = $proc.ExitCode
+        }
+    
+        return [PSCustomObject]@{
+            ExitCode = $proc.ExitCode
+            StdOut   = $stdout
+            StdErr   = $stderr
+        }
+    }
+    
+    function Invoke-SfcCommand {
+        param([string]$Arguments)
+    
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = "$env:SystemRoot\System32\sfc.exe"
+        $psi.Arguments = $Arguments
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+    
+        $proc = New-Object System.Diagnostics.Process
+        $proc.StartInfo = $psi
+        [void]$proc.Start()
+    
+        $stdout = $proc.StandardOutput.ReadToEnd()
+        $stderr = $proc.StandardError.ReadToEnd()
+        $proc.WaitForExit()
+    
+        if (-not [string]::IsNullOrWhiteSpace($stdout)) {
+            $stdout -split "`r?`n" | Where-Object { $_.Trim() } | ForEach-Object { Write-Log $_ 'INFO' }
+        }
+    
+        if (-not [string]::IsNullOrWhiteSpace($stderr)) {
+            $stderr -split "`r?`n" | Where-Object { $_.Trim() } | ForEach-Object { Write-Log $_ 'WARN' }
+        }
+    
+        Add-DetailedResult -Step 'SFC' -Status 'Info' -Message ("Executed SFC: " + $Arguments) -Data @{
+            ExitCode = $proc.ExitCode
+        }
+    
+        return [PSCustomObject]@{
+            ExitCode = $proc.ExitCode
+            StdOut   = $stdout
+            StdErr   = $stderr
+        }
+    }
+    
+    
+    function Get-DiskSpaceInfo {
+        param([string]$Path)
+    
+        try {
+            $driveRoot = Split-Path -Path $Path -Qualifier
+            if ([string]::IsNullOrWhiteSpace($driveRoot)) {
+                $driveRoot = $env:SystemDrive + '\'
+            }
+    
+            $drive = [System.IO.DriveInfo]::new($driveRoot)
+            return @{
+                FreeSpace  = [int64]$drive.AvailableFreeSpace
+                TotalSize  = [int64]$drive.TotalSize
+                UsedSpace  = [int64]($drive.TotalSize - $drive.AvailableFreeSpace)
+            }
+        }
+        catch {
+            return $null
+        }
+    }
+    
+    function Test-SafeCleanupPath {
+        param([string]$Path)
+    
+        if ([string]::IsNullOrWhiteSpace($Path)) {
+            return $false
+        }
+    
+        $normalized = $Path.TrimEnd('\')
+    
+        $blockedPaths = @(
+            'C:\Windows\System32',
+            'C:\Windows\SysWOW64',
+            'C:\Program Files',
+            'C:\Program Files (x86)',
+            'C:\Windows\explorer.exe',
+            'C:\Windows\System32\drivers'
+        )
+    
+        foreach ($blocked in $blockedPaths) {
+            if ($normalized -ieq $blocked -or $normalized -like ($blocked + '\*')) {
+                return $false
+            }
+        }
+    
+        $allowedPatterns = @(
+            'C:\Windows\Temp*',
+            'C:\Temp*',
+            'C:\SWSetup*',
+            'C:\Lab Update Scripts*',
+            'C:\ProgramData\Win11UpgradeStage*',
+            'C:\windows.old*',
+            'C:\system.sav*',
+            'C:\Windows\SoftwareDistribution.bak*',
+            'C:\SoftwareDistribution.bak*',
+            'C:\Windows\SoftwareDistribution\Download*',
+            'C:\Windows\Prefetch*',
+            'C:\Windows\Logs\CBS*',
+            'C:\ProgramData\Microsoft\Windows\WER\ReportQueue*',
+            "$env:TEMP*",
+            "$env:LOCALAPPDATA\Temp*",
+            "$env:LOCALAPPDATA\Microsoft\Windows\INetCache*",
+            "$env:LOCALAPPDATA\Microsoft\Windows\WebCache*",
+            "$env:LOCALAPPDATA\CrashDumps*",
+            "$env:LOCALAPPDATA\Microsoft\Windows\DeliveryOptimization\Cache*",
+            "$env:LOCALAPPDATA\D3DSCache*",
+            "$env:LOCALAPPDATA\NVIDIA\DXCache*",
+            "$env:LOCALAPPDATA\NVIDIA\GLCache*"
+        ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    
+        foreach ($pattern in $allowedPatterns) {
+            if ($normalized -like $pattern) {
+                return $true
+            }
+        }
+    
+        return $false
+    }
+    
+    function Remove-FolderContents {
+        param(
+            [Parameter(Mandatory)][string]$Path,
+            [Parameter(Mandatory)][string]$Description,
+            [switch]$ContentsOnly
+        )
+    
+        if (-not (Test-Path -LiteralPath $Path)) {
+            return @{
+                Success    = $true
+                SpaceFreed = [int64]0
+                ItemCount  = 0
+                Message    = 'Path does not exist'
+            }
+        }
+    
+        if (-not (Test-SafeCleanupPath -Path $Path)) {
+            return @{
+                Success    = $false
+                SpaceFreed = [int64]0
+                ItemCount  = 0
+                Message    = 'Path blocked for security'
+            }
+        }
+    
+        try {
+            $items = if ($ContentsOnly) {
+                @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue)
+            }
+            else {
+                @(Get-ChildItem -LiteralPath $Path -Recurse -Force -File -ErrorAction SilentlyContinue)
+            }
+    
+            $itemCount = $items.Count
+            [int64]$sizeBefore = 0
+    
+            if ($itemCount -gt 0) {
+                $files = if ($ContentsOnly) {
+                    $items | Where-Object { -not $_.PSIsContainer }
+                }
+                else {
+                    $items
+                }
+    
+                if ($files.Count -gt 0) {
+                    $sizeSum = ($files | Measure-Object -Property Length -Sum -ErrorAction SilentlyContinue).Sum
+                    if ($null -ne $sizeSum) {
+                        $sizeBefore = [int64]$sizeSum
+                    }
+                }
+            }
+    
+            if ($itemCount -eq 0) {
+                return @{
+                    Success    = $true
+                    SpaceFreed = [int64]0
+                    ItemCount  = 0
+                    Message    = 'Folder is empty'
+                }
+            }
+    
+            if ($ContentsOnly) {
+                Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop | ForEach-Object {
+                    try {
+                        Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction Stop
+                    }
+                    catch {
+                        Write-Log "Could not remove $($_.FullName): $($_.Exception.Message)" 'WARN'
+                    }
+                }
+            }
+            else {
+                Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+            }
+    
+            return @{
+                Success    = $true
+                SpaceFreed = $sizeBefore
+                ItemCount  = $itemCount
+                Message    = 'Successfully cleaned'
+            }
+        }
+        catch {
+            return @{
+                Success    = $false
+                SpaceFreed = [int64]0
+                ItemCount  = 0
+                Message    = $_.Exception.Message
+            }
+        }
+    }
+    
+    
+    
+    
+    function Get-FolderSizeInfo {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory)][string]$Path
+        )
+    
+        $info = [ordered]@{
+            Path       = $Path
+            Exists     = $false
+            ItemCount  = 0
+            FileCount  = 0
+            FolderCount = 0
+            SizeBytes  = [int64]0
+            SizeMB     = [double]0
+            SizeGB     = [double]0
+            Message    = $null
+        }
+    
+        if (-not (Test-Path -LiteralPath $Path)) {
+            $info.Message = 'Path does not exist'
+            return [PSCustomObject]$info
+        }
+    
+        $info.Exists = $true
+    
+        try {
+            $items = @(Get-ChildItem -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue)
+            $files = @($items | Where-Object { -not $_.PSIsContainer })
+            $folders = @($items | Where-Object { $_.PSIsContainer })
+            $sizeBytes = ($files | Measure-Object -Property Length -Sum -ErrorAction SilentlyContinue).Sum
+            if ($null -eq $sizeBytes) { $sizeBytes = 0 }
+    
+            $info.ItemCount = $items.Count
+            $info.FileCount = $files.Count
+            $info.FolderCount = $folders.Count
+            $info.SizeBytes = [int64]$sizeBytes
+            $info.SizeMB = [math]::Round(([double]$info.SizeBytes / 1MB), 2)
+            $info.SizeGB = [math]::Round(([double]$info.SizeBytes / 1GB), 3)
+            $info.Message = 'Size calculated successfully'
+        }
+        catch {
+            $info.Message = $_.Exception.Message
+            Write-Log "Could not calculate folder size for $Path`: $($info.Message)" 'WARN'
+        }
+    
+        return [PSCustomObject]$info
+    }
+    
+    function Stop-WindowsUpdateLockingProcesses {
+        [CmdletBinding()]
+        param()
+    
+        Write-Log 'Checking for Windows Update processes that may lock SoftwareDistribution...' 'INFO'
+    
+        $processNames = @(
+            'MoUsoCoreWorker',
+            'TiWorker',
+            'TrustedInstaller',
+            'UsoClient',
+            'MusNotification',
+            'MusNotificationUx',
+            'SIHClient'
+        )
+    
+        $results = New-Object System.Collections.Generic.List[object]
+    
+        foreach ($name in $processNames) {
+            $processes = @(Get-Process -Name $name -ErrorAction SilentlyContinue)
+    
+            if ($processes.Count -eq 0) {
+                $results.Add([PSCustomObject]@{
+                    Name    = $name
+                    Action  = 'NotRunning'
+                    Success = $true
+                    Message = 'Process not running'
+                }) | Out-Null
+                continue
+            }
+    
+            foreach ($proc in $processes) {
+                try {
+                    Write-Log "Stopping possible Windows Update lock process: $($proc.ProcessName) PID $($proc.Id)" 'WARN'
+                    Stop-Process -Id $proc.Id -Force -ErrorAction Stop
+                    Start-Sleep -Milliseconds 500
+    
+                    $stillRunning = Get-Process -Id $proc.Id -ErrorAction SilentlyContinue
+                    if ($null -eq $stillRunning) {
+                        Write-Log "Stopped process $($proc.ProcessName) PID $($proc.Id)." 'OK'
+                        $results.Add([PSCustomObject]@{
+                            Name    = $proc.ProcessName
+                            ProcessId = $proc.Id
+                            Action  = 'Stopped'
+                            Success = $true
+                            Message = 'Stopped successfully'
+                        }) | Out-Null
+                    }
+                    else {
+                        Write-Log "Process $($proc.ProcessName) PID $($proc.Id) is still running after stop attempt." 'WARN'
+                        $results.Add([PSCustomObject]@{
+                            Name    = $proc.ProcessName
+                            ProcessId = $proc.Id
+                            Action  = 'StopAttempted'
+                            Success = $false
+                            Message = 'Still running after Stop-Process'
+                        }) | Out-Null
+                    }
+                }
+                catch {
+                    Write-Log "Could not stop $($proc.ProcessName) PID $($proc.Id): $($_.Exception.Message)" 'WARN'
+                    $results.Add([PSCustomObject]@{
+                        Name    = $proc.ProcessName
+                        ProcessId = $proc.Id
+                        Action  = 'FailedToStop'
+                        Success = $false
+                        Message = $_.Exception.Message
+                    }) | Out-Null
+                }
+            }
+        }
+    
+        return @($results)
+    }
+    
+    function Get-FolderSizeBytesSafe {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory = $true)]
+            [string]$Path
+        )
+    
+        try {
+            if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) {
+                return [int64]0
+            }
+    
+            $sum = (Get-ChildItem -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue |
+                Where-Object { -not $_.PSIsContainer } |
+                Measure-Object -Property Length -Sum -ErrorAction SilentlyContinue).Sum
+    
+            if ($null -eq $sum) { return [int64]0 }
+            return [int64]$sum
+        }
+        catch {
+            Write-Log "Unable to calculate size for ${Path}: $($_.Exception.Message)" 'WARN'
+            return [int64]0
+        }
+    }
+    
+    function Stop-SoftwareDistributionBackupLockingServices {
+        [CmdletBinding()]
+        param()
+    
+        $services = @(
+            'wuauserv',
+            'bits',
+            'cryptsvc',
+            'dosvc',
+            'UsoSvc',
+            'WaaSMedicSvc',
+            'TrustedInstaller',
+            'msiserver'
+        )
+    
+        foreach ($svcName in $services) {
+            try {
+                $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+                if ($null -eq $svc) {
+                    Write-Log "Service not found while releasing SoftwareDistribution locks: $svcName" 'INFO'
+                    continue
+                }
+    
+                if ($svc.Status -ne 'Stopped') {
+                    Write-Log "Stopping service to release SoftwareDistribution locks: $svcName ($($svc.Status))" 'INFO'
+                    Stop-Service -Name $svcName -Force -ErrorAction SilentlyContinue
+                    Start-Sleep -Seconds 2
+                }
+    
+                $svc.Refresh()
+                Write-Log "Service state after stop attempt: $svcName = $($svc.Status)" 'INFO'
+            }
+            catch {
+                Write-Log "Could not stop service ${svcName}: $($_.Exception.Message)" 'WARN'
+            }
+        }
+    }
+    
+    function Stop-SoftwareDistributionBackupLockingProcesses {
+        [CmdletBinding()]
+        param()
+    
+        $processNames = @(
+            'TiWorker',
+            'TrustedInstaller',
+            'MoUsoCoreWorker',
+            'UsoClient',
+            'wuauclt',
+            'bitsadmin',
+            'msiexec',
+            'MusNotification',
+            'MusNotificationUx',
+            'SIHClient'
+        )
+    
+        foreach ($procName in $processNames) {
+            try {
+                $procs = @(Get-Process -Name $procName -ErrorAction SilentlyContinue)
+                foreach ($proc in $procs) {
+                    Write-Log "Stopping process to release SoftwareDistribution locks: $($proc.ProcessName) PID $($proc.Id)" 'WARN'
+                    Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+                }
+            }
+            catch {
+                Write-Log "Could not stop process ${procName}: $($_.Exception.Message)" 'WARN'
+            }
+        }
+    }
+    
+    function Start-SoftwareDistributionBackupUpdateServices {
+        [CmdletBinding()]
+        param()
+    
+        $services = @('cryptsvc', 'bits', 'wuauserv', 'dosvc', 'UsoSvc')
+    
+        foreach ($svcName in $services) {
+            try {
+                $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+                if ($null -eq $svc) { continue }
+    
+                if ($svc.Status -ne 'Running') {
+                    Write-Log "Restarting update-related service after SoftwareDistribution backup cleanup: $svcName" 'INFO'
+                    Start-Service -Name $svcName -ErrorAction SilentlyContinue
+                    Start-Sleep -Seconds 1
+                }
+    
+                $svc.Refresh()
+                Write-Log "Service state after restart attempt: $svcName = $($svc.Status)" 'INFO'
+            }
+            catch {
+                Write-Log "Could not restart service ${svcName}: $($_.Exception.Message)" 'WARN'
+            }
+        }
+    }
+    
+    function Remove-SoftwareDistributionBakFolders {
+        [CmdletBinding()]
+        param()
+    
+        Write-Log 'Starting forced SoftwareDistribution backup folder cleanup. This will delete .bak, .bak1, .bak2, .old_*, and backup variants without creating new backups.' 'INFO'
+    
+        $basePath = 'C:\Windows'
+        $targets = @()
+    
+        try {
+            if (-not (Test-Path -LiteralPath $basePath)) {
+                Write-Log "SoftwareDistribution backup cleanup skipped because $basePath does not exist." 'WARN'
+                return [PSCustomObject]@{
+                    Success         = $false
+                    SpaceFreed      = [int64]0
+                    SpaceFreedBytes = [int64]0
+                    SpaceFreedMB    = [double]0
+                    SpaceFreedGB    = [double]0
+                    ItemCount       = 0
+                    DeletedCount    = 0
+                    FailedCount     = 0
+                    Message         = "$basePath does not exist"
+                }
+            }
+    
+            # Direct Select-Object pipeline. No ArrayList/List .Add() calls are used here.
+            $targets = @(
+                Get-ChildItem -LiteralPath $basePath -Directory -Force -ErrorAction Stop |
+                    Where-Object {
+                        $_ -and
+                        -not [string]::IsNullOrWhiteSpace($_.FullName) -and
+                        $_.Name -ne 'SoftwareDistribution' -and
+                        (
+                            $_.Name -match '^SoftwareDistribution\.bak\d*$' -or
+                            $_.Name -match '^SoftwareDistribution\.(old|old_).*$' -or
+                            $_.Name -match '^SoftwareDistribution[_-](bak|backup|old).*$' -or
+                            $_.Name -match '^SoftwareDistribution\.backup\d*$'
+                        )
+                    } |
+                    Select-Object -ExpandProperty FullName
+            )
+        }
+        catch {
+            Write-Log "Could not scan $basePath for SoftwareDistribution backup folders: $($_.Exception.Message)" 'WARN'
+            $targets = @()
+        }
+    
+        # Explicit safety check for the common folders that are known to exist in the field.
+        foreach ($explicitTarget in @(
+            'C:\Windows\SoftwareDistribution.bak',
+            'C:\Windows\SoftwareDistribution.bak1',
+            'C:\Windows\SoftwareDistribution.bak2',
+            'C:\Windows\SoftwareDistribution.bak3',
+            'C:\Windows\SoftwareDistribution.bak4',
+            'C:\Windows\SoftwareDistribution.bak5'
+        )) {
+            if (Test-Path -LiteralPath $explicitTarget) {
+                $targets += $explicitTarget
+            }
+        }
+    
+        $targets = @(
+            $targets |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                Sort-Object -Unique
+        )
+    
+        if (-not $targets -or $targets.Count -eq 0) {
+            Write-Log 'No SoftwareDistribution backup folders were found.' 'INFO'
+            return [PSCustomObject]@{
+                Success         = $true
+                SpaceFreed      = [int64]0
+                SpaceFreedBytes = [int64]0
+                SpaceFreedMB    = [double]0
+                SpaceFreedGB    = [double]0
+                ItemCount       = 0
+                DeletedCount    = 0
+                FailedCount     = 0
+                Message         = 'No SoftwareDistribution backup folders found'
+            }
+        }
+    
+        Write-Log "Found $($targets.Count) SoftwareDistribution backup folder(s) to force delete." 'WARN'
+    
+        [int64]$totalFreedBytes = 0
+        [int]$deletedCount = 0
+        [int]$failedCount = 0
+        [int]$totalItems = 0
+        $failureMessages = @()
+    
+        Stop-SoftwareDistributionBackupLockingServices
+        Stop-SoftwareDistributionBackupLockingProcesses
+    
+        foreach ($target in $targets) {
+            if ([string]::IsNullOrWhiteSpace($target)) {
+                Write-Log 'Skipping blank SoftwareDistribution backup folder target.' 'WARN'
+                continue
+            }
+    
+            if (-not (Test-Path -LiteralPath $target)) {
+                Write-Log "SoftwareDistribution backup folder no longer exists: $target" 'INFO'
+                continue
+            }
+    
+            $sizeBytes = Get-FolderSizeBytesSafe -Path $target
+            $sizeGB = [math]::Round(([double]$sizeBytes / 1GB), 3)
+            $sizeMB = [math]::Round(([double]$sizeBytes / 1MB), 2)
+            $itemCount = @(Get-ChildItem -LiteralPath $target -Recurse -Force -ErrorAction SilentlyContinue).Count
+    
+            Write-Log "Attempting forced deletion of SoftwareDistribution backup folder: $target | Size before deletion: $sizeGB GB ($sizeMB MB) | Items: $itemCount" 'WARN'
+    
+            $deleted = $false
+    
+            for ($attempt = 1; $attempt -le 5; $attempt++) {
+                Write-Log "SoftwareDistribution backup delete attempt $attempt of 5: $target" 'INFO'
+    
+                try {
+                    cmd.exe /c "attrib -r -s -h `"$target`" /s /d" 2>$null | Out-Null
+                }
+                catch {
+                    Write-Log "Could not clear attributes on ${target}: $($_.Exception.Message)" 'WARN'
+                }
+    
+                try {
+                    Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction Stop
+                    if (-not (Test-Path -LiteralPath $target)) {
+                        Write-Log "Deleted SoftwareDistribution backup folder with Remove-Item: $target | Estimated freed: $sizeGB GB ($sizeMB MB)" 'OK'
+                        $totalFreedBytes += $sizeBytes
+                        $totalItems += $itemCount
+                        $deletedCount++
+                        $deleted = $true
+                        break
+                    }
+                }
+                catch {
+                    Write-Log "Remove-Item failed on attempt $attempt for ${target}: $($_.Exception.Message)" 'WARN'
+                }
+    
+                try {
+                    Write-Log "Trying cmd.exe rmdir fallback for SoftwareDistribution backup folder: $target" 'WARN'
+                    cmd.exe /c "rmdir /s /q `"$target`"" 2>$null | Out-Null
+                    if (-not (Test-Path -LiteralPath $target)) {
+                        Write-Log "Deleted SoftwareDistribution backup folder with cmd rmdir: $target | Estimated freed: $sizeGB GB ($sizeMB MB)" 'OK'
+                        $totalFreedBytes += $sizeBytes
+                        $totalItems += $itemCount
+                        $deletedCount++
+                        $deleted = $true
+                        break
+                    }
+                }
+                catch {
+                    Write-Log "cmd rmdir fallback failed on attempt $attempt for ${target}: $($_.Exception.Message)" 'WARN'
+                }
+    
+                Stop-SoftwareDistributionBackupLockingServices
+                Stop-SoftwareDistributionBackupLockingProcesses
+                Start-Sleep -Seconds 3
+            }
+    
+            if (-not $deleted) {
+                $failedCount++
+                $failureMessages += "Failed to delete $target after 5 attempts"
+                Write-Log "FAILED to delete SoftwareDistribution backup folder after all attempts: $target" 'ERROR'
+            }
+        }
+    
+        Start-SoftwareDistributionBackupUpdateServices
+    
+        $freedMB = [math]::Round(([double]$totalFreedBytes / 1MB), 2)
+        $freedGB = [math]::Round(([double]$totalFreedBytes / 1GB), 3)
+    
+        if ($failedCount -eq 0) {
+            Write-Log "Forced SoftwareDistribution backup cleanup completed. Deleted folders: $deletedCount. Estimated freed: $freedGB GB ($freedMB MB)." 'OK'
+        }
+        else {
+            Write-Log "Forced SoftwareDistribution backup cleanup completed with failures. Deleted folders: $deletedCount. Failed folders: $failedCount. Estimated freed: $freedGB GB ($freedMB MB)." 'WARN'
+        }
+    
+        return [PSCustomObject]@{
+            Success         = ($failedCount -eq 0)
+            SpaceFreed      = $totalFreedBytes
+            SpaceFreedBytes = $totalFreedBytes
+            SpaceFreedMB    = $freedMB
+            SpaceFreedGB    = $freedGB
+            ItemCount       = $totalItems
+            DeletedCount    = $deletedCount
+            FailedCount     = $failedCount
+            Message         = if ($failedCount -eq 0) { 'Forced SoftwareDistribution backup cleanup completed' } else { ($failureMessages -join '; ') }
+        }
+    }
+    
+    function Invoke-WindowsCleanup {
+        param([int]$TimeoutSec = 300)
+    
+        try {
+            $cleanmgrPath = Join-Path $env:SystemRoot 'System32\cleanmgr.exe'
+            if (-not (Test-Path -LiteralPath $cleanmgrPath)) {
+                throw 'Windows Disk Cleanup utility not found.'
+            }
+    
+            Write-Log "Starting Windows Disk Cleanup (timeout: ${TimeoutSec}s)..." 'INFO'
+    
+            $job = Start-Job -ScriptBlock {
+                Start-Process -FilePath "$env:SystemRoot\System32\cleanmgr.exe" -ArgumentList '/SAGERUN:1','/VERYLOWDISK' -NoNewWindow -Wait -PassThru
+            }
+    
+            $result = Wait-Job -Job $job -Timeout $TimeoutSec
+    
+            if ($null -eq $result -or $job.State -eq 'Running') {
+                Stop-Job -Job $job -Force | Out-Null
+                Remove-Job -Job $job -Force | Out-Null
+                throw "Disk Cleanup timed out after $TimeoutSec seconds."
+            }
+    
+            $proc = Receive-Job -Job $job
+            Remove-Job -Job $job -Force | Out-Null
+    
+            return @{
+                Success  = $true
+                ExitCode = $proc.ExitCode
+            }
+        }
+        catch {
+            return @{
+                Success = $false
+                Error   = $_.Exception.Message
+            }
+        }
+    }
+    
+    function Invoke-TempCleanup {
+        [int64]$totalSpaceFreed = 0
+        $cleanupResults = New-Object System.Collections.Generic.List[object]
+        $initialSpace = Get-DiskSpaceInfo -Path $env:SystemDrive
+    
+        Write-Log 'Cleaning temporary files and caches...' 'INFO'
+    
+        $windowsCleanup = Invoke-WindowsCleanup -TimeoutSec 300
+        if ($windowsCleanup.Success) {
+            Write-Log 'Windows Disk Cleanup completed successfully.' 'OK'
+            $cleanupResults.Add([PSCustomObject]@{
+                Path        = 'cleanmgr.exe'
+                Description = 'Windows Disk Cleanup'
+                ItemCount   = 0
+                SpaceFreed  = [int64]0
+                Status      = 'Success'
+                Message     = "Exit code $($windowsCleanup.ExitCode)"
+            }) | Out-Null
+        }
+        else {
+            Warn-Step -Name 'TempCleanup' -Reason "Windows Disk Cleanup failed: $($windowsCleanup.Error)"
+            $cleanupResults.Add([PSCustomObject]@{
+                Path        = 'cleanmgr.exe'
+                Description = 'Windows Disk Cleanup'
+                ItemCount   = 0
+                SpaceFreed  = [int64]0
+                Status      = 'Warning'
+                Message     = $windowsCleanup.Error
+            }) | Out-Null
+        }
+    
+        $cleanupTargets = New-Object System.Collections.Generic.List[object]
+    
+        [void]$cleanupTargets.Add([PSCustomObject]@{ Path = 'C:\Lab Update Scripts'; Description = 'Lab Update Scripts'; ContentsOnly = $false })
+        [void]$cleanupTargets.Add([PSCustomObject]@{ Path = 'C:\ProgramData\Win11UpgradeStage'; Description = 'Windows 11 Upgrade Staging'; ContentsOnly = $false })
+        [void]$cleanupTargets.Add([PSCustomObject]@{ Path = 'C:\SWSetup'; Description = 'HP Software Setup'; ContentsOnly = $false })
+        [void]$cleanupTargets.Add([PSCustomObject]@{ Path = 'C:\Temp'; Description = 'System Temp'; ContentsOnly = $false })
+        [void]$cleanupTargets.Add([PSCustomObject]@{ Path = 'C:\windows.old'; Description = 'Previous Windows Installation'; ContentsOnly = $false })
+        [void]$cleanupTargets.Add([PSCustomObject]@{ Path = 'C:\system.sav'; Description = 'System Save'; ContentsOnly = $false })
+        [void]$cleanupTargets.Add([PSCustomObject]@{ Path = 'C:\Windows\Temp'; Description = 'Windows Temp'; ContentsOnly = $true })
+        [void]$cleanupTargets.Add([PSCustomObject]@{ Path = $env:TEMP; Description = 'User Temp'; ContentsOnly = $true })
+        [void]$cleanupTargets.Add([PSCustomObject]@{ Path = "$env:LOCALAPPDATA\Temp"; Description = 'Local Temp'; ContentsOnly = $true })
+        [void]$cleanupTargets.Add([PSCustomObject]@{ Path = 'C:\Windows\SoftwareDistribution\Download'; Description = 'Windows Update Cache'; ContentsOnly = $true })
+        [void]$cleanupTargets.Add([PSCustomObject]@{ Path = 'C:\Windows\Prefetch'; Description = 'Windows Prefetch'; ContentsOnly = $true })
+        [void]$cleanupTargets.Add([PSCustomObject]@{ Path = 'C:\Windows\Logs\CBS'; Description = 'CBS Logs'; ContentsOnly = $true })
+        [void]$cleanupTargets.Add([PSCustomObject]@{ Path = "$env:LOCALAPPDATA\Microsoft\Windows\INetCache"; Description = 'Internet Cache'; ContentsOnly = $true })
+        [void]$cleanupTargets.Add([PSCustomObject]@{ Path = "$env:LOCALAPPDATA\Microsoft\Windows\WebCache"; Description = 'Web Cache'; ContentsOnly = $true })
+        [void]$cleanupTargets.Add([PSCustomObject]@{ Path = 'C:\ProgramData\Microsoft\Windows\WER\ReportQueue'; Description = 'Error Report Queue'; ContentsOnly = $true })
+        [void]$cleanupTargets.Add([PSCustomObject]@{ Path = "$env:LOCALAPPDATA\CrashDumps"; Description = 'Crash Dumps'; ContentsOnly = $true })
+        [void]$cleanupTargets.Add([PSCustomObject]@{ Path = "$env:LOCALAPPDATA\Microsoft\Windows\DeliveryOptimization\Cache"; Description = 'Delivery Optimization Cache'; ContentsOnly = $true })
+    
+        if ($AggressiveCleanup) {
+            [void]$cleanupTargets.Add([PSCustomObject]@{ Path = "$env:LOCALAPPDATA\D3DSCache"; Description = 'Direct3D Shader Cache'; ContentsOnly = $true })
+            [void]$cleanupTargets.Add([PSCustomObject]@{ Path = "$env:LOCALAPPDATA\NVIDIA\DXCache"; Description = 'NVIDIA DX Cache'; ContentsOnly = $true })
+            [void]$cleanupTargets.Add([PSCustomObject]@{ Path = "$env:LOCALAPPDATA\NVIDIA\GLCache"; Description = 'NVIDIA GL Cache'; ContentsOnly = $true })
+        }
+    
+        foreach ($target in $cleanupTargets) {
+            if ($null -eq $target -or [string]::IsNullOrWhiteSpace($target.Path)) {
+                Write-Log 'Skipping cleanup target because the path is blank.' 'WARN'
+                continue
+            }
+    
+            Write-Log "Cleaning $($target.Description) at $($target.Path)" 'INFO'
+            $result = Remove-FolderContents -Path $target.Path -Description $target.Description -ContentsOnly:([bool]$target.ContentsOnly)
+    
+            if ($result.Success) {
+                if ($result.SpaceFreed -gt 0) {
+                    $totalSpaceFreed += [int64]$result.SpaceFreed
+                    $sizeText = if ($result.SpaceFreed -ge 1GB) {
+                        '{0} GB' -f [math]::Round($result.SpaceFreed / 1GB, 2)
+                    }
+                    else {
+                        '{0} MB' -f [math]::Round($result.SpaceFreed / 1MB, 1)
+                    }
+                    Write-Log "Cleaned $($target.Description): $sizeText freed across $($result.ItemCount) item(s)." 'OK'
+                }
+                else {
+                    Write-Log "$($target.Description): $($result.Message)" 'INFO'
+                }
+    
+                $cleanupResults.Add([PSCustomObject]@{
+                    Path        = $target.Path
+                    Description = $target.Description
+                    ItemCount   = $result.ItemCount
+                    SpaceFreed  = [int64]$result.SpaceFreed
+                    Status      = 'Success'
+                    Message     = $result.Message
+                }) | Out-Null
+            }
+            else {
+                Warn-Step -Name 'TempCleanup' -Reason "$($target.Description) failed: $($result.Message)"
+                $cleanupResults.Add([PSCustomObject]@{
+                    Path        = $target.Path
+                    Description = $target.Description
+                    ItemCount   = 0
+                    SpaceFreed  = [int64]0
+                    Status      = 'Failed'
+                    Message     = $result.Message
+                }) | Out-Null
+            }
+        }
+    
+        Write-Log 'Cleaning SoftwareDistribution backup folders at C:\Windows and C:\ root backup variants' 'INFO'
+        $sdBackupResult = Remove-SoftwareDistributionBakFolders
+        if ($sdBackupResult.Success) {
+            if ($sdBackupResult.SpaceFreed -gt 0) {
+                $totalSpaceFreed += [int64]$sdBackupResult.SpaceFreed
+                Write-Log "Cleaned SoftwareDistribution Backup Folders: $($sdBackupResult.SpaceFreedGB) GB ($($sdBackupResult.SpaceFreedMB) MB) freed across $($sdBackupResult.ItemCount) item(s)." 'OK'
+            }
+            else {
+                Write-Log "SoftwareDistribution Backup Folders: $($sdBackupResult.Message)" 'INFO'
+            }
+    
+            $cleanupResults.Add([PSCustomObject]@{
+                Path        = 'C:\Windows and C:\ SoftwareDistribution backup variants'
+                Description = 'SoftwareDistribution Backup Folders'
+                ItemCount   = $sdBackupResult.ItemCount
+                SpaceFreed  = [int64]$sdBackupResult.SpaceFreed
+                Status      = 'Success'
+                Message     = $sdBackupResult.Message
+            }) | Out-Null
+        }
+        else {
+            Warn-Step -Name 'TempCleanup' -Reason "SoftwareDistribution Backup Folders failed: $($sdBackupResult.Message)"
+            $cleanupResults.Add([PSCustomObject]@{
+                Path        = 'C:\Windows and C:\ SoftwareDistribution backup variants'
+                Description = 'SoftwareDistribution Backup Folders'
+                ItemCount   = $sdBackupResult.ItemCount
+                SpaceFreed  = [int64]0
+                Status      = 'Warning'
+                Message     = $sdBackupResult.Message
+            }) | Out-Null
+        }
+    
+        $finalSpace = Get-DiskSpaceInfo -Path $env:SystemDrive
+        $actualFreed = [int64]0
+        if ($initialSpace -and $finalSpace) {
+            $actualFreed = [int64]($finalSpace.FreeSpace - $initialSpace.FreeSpace)
+        }
+    
+        Add-DetailedResult -Step 'TempCleanup' -Status 'Info' -Message 'Enhanced temporary file cleanup completed.' -Data @{
+            EstimatedSpaceFreedMB = [math]::Round($totalSpaceFreed / 1MB, 2)
+            ActualSpaceFreedMB    = [math]::Round($actualFreed / 1MB, 2)
+            TargetsProcessed      = $cleanupResults.Count
+            ResultsJson           = ($cleanupResults | ForEach-Object {
+                [ordered]@{
+                    Path         = $_.Path
+                    Description  = $_.Description
+                    ItemCount    = $_.ItemCount
+                    SpaceFreedMB = [math]::Round(([double]$_.SpaceFreed) / 1MB, 2)
+                    Status       = $_.Status
+                    Message      = $_.Message
+                }
+            } | ConvertTo-Json -Compress)
+        }
+    }
+    
+    function Invoke-RepairVolumeScan {
+    
+        $systemDrive = $env:SystemDrive.TrimEnd(':')
+        Write-Log "Running Repair-Volume scan on $($env:SystemDrive)" 'INFO'
+        $result = Repair-Volume -DriveLetter $systemDrive -Scan -ErrorAction Stop
+    
+        $resultText = $null
+        if ($null -ne $result) {
+            $resultText = $result | Out-String
+            if ($resultText -match 'corrupt|error|repair') {
+                $script:Summary.DiskCorruptionSuspected = $true
+                Warn-Step -Name 'RepairVolumeScan' -Reason 'Disk scan output suggests errors or corruption may exist.'
+            }
+        }
+    
+        Add-DetailedResult -Step 'RepairVolumeScan' -Status 'Info' -Message 'Repair-Volume scan completed.' -Data @{
+            Output = $resultText
+        }
+    }
+    
+    function Invoke-RepairVolumeOfflineFix {
+        $systemDrive = $env:SystemDrive.TrimEnd(':')
+        Write-Log "Running offline disk repair on $($env:SystemDrive)" 'WARN'
+        Repair-Volume -DriveLetter $systemDrive -OfflineScanAndFix -ErrorAction Stop | Out-Null
+        $script:Summary.RebootRequired = $true
+        Add-RepairAttempt 'Repair-Volume -OfflineScanAndFix'
+        Add-DetailedResult -Step 'OfflineDiskRepair' -Status 'Info' -Message 'Offline disk repair was started.'
+    }
+    
+    function Invoke-DismDetection {
+        Write-Log "Running DISM CheckHealth..." 'INFO'
+        $check = Invoke-DismCommand -Arguments @('/Online','/Cleanup-Image','/CheckHealth')
+    
+        Write-Log "Running DISM ScanHealth..." 'INFO'
+        $scan = Invoke-DismCommand -Arguments @('/Online','/Cleanup-Image','/ScanHealth')
+    
+        $combined = (($check.StdOut, $scan.StdOut, $check.StdErr, $scan.StdErr) -join "`n")
+    
+        if ($check.ExitCode -ne 0 -or $scan.ExitCode -ne 0) {
+            $script:Summary.DismCorruptionDetected = $true
+            Warn-Step -Name 'DISMDetection' -Reason 'DISM detection returned a non-zero exit code.'
+            return
+        }
+    
+        # Avoid false positives from phrases like "No component store corruption detected."
+        if ($combined -match '(?i)No component store corruption detected|No component store corruption was detected|The component store is repairable\s*:\s*No') {
+            $script:Summary.DismCorruptionDetected = $false
+            Write-Log 'DISM did not detect component store corruption.' 'OK'
+            return
+        }
+    
+        if ($combined -match '(?i)The component store is repairable|component store is repairable|repairable\s*:\s*Yes|corruption detected|component store corruption detected') {
+            $script:Summary.DismCorruptionDetected = $true
+            Warn-Step -Name 'DISMDetection' -Reason 'DISM detected component store corruption.'
+        }
+        else {
+            $script:Summary.DismCorruptionDetected = $false
+            Write-Log 'DISM detection completed without confirmed corruption.' 'OK'
+        }
+    }
+    
+    function Invoke-DismRepair {
+        Write-Log "Running DISM RestoreHealth..." 'WARN'
+        $repair = Invoke-DismCommand -Arguments @('/Online','/Cleanup-Image','/RestoreHealth')
+        if ($repair.ExitCode -ne 0) {
+            throw "DISM RestoreHealth exited with code $($repair.ExitCode)"
+        }
+    
+        Write-Log "Running DISM StartComponentCleanup..." 'INFO'
+        $cleanup = Invoke-DismCommand -Arguments @('/Online','/Cleanup-Image','/StartComponentCleanup')
+        if ($cleanup.ExitCode -ne 0) {
+            throw "DISM StartComponentCleanup exited with code $($cleanup.ExitCode)"
+        }
+    
+        Add-RepairAttempt 'DISM RestoreHealth + StartComponentCleanup'
+    }
+    
+    function Invoke-SfcDetection {
+        Write-Log "Running SFC verify-only scan..." 'INFO'
+        $result = Invoke-SfcCommand -Arguments '/verifyonly'
+    
+        $combined = (($result.StdOut, $result.StdErr) -join "`n")
+    
+        if ($combined -match '(?i)Windows Resource Protection found integrity violations|found integrity violations') {
+            $script:Summary.SfcIntegrityViolations = $true
+            Warn-Step -Name 'SFCDetection' -Reason 'SFC detected integrity violations.'
+            return
+        }
+    
+        if ($combined -match '(?i)Windows Resource Protection did not find any integrity violations|did not find any integrity violations') {
+            $script:Summary.SfcIntegrityViolations = $false
+            Write-Log 'SFC did not detect integrity violations.' 'OK'
+            return
+        }
+    
+        if ($combined -match '(?i)Windows Resource Protection found corrupt files and successfully repaired them|Windows Resource Protection found corrupt files but was unable to fix some of them') {
+            $script:Summary.SfcIntegrityViolations = $true
+            Warn-Step -Name 'SFCDetection' -Reason 'SFC reported corrupt files.'
+            return
+        }
+    
+        if ($result.ExitCode -notin 0,1) {
+            $script:Summary.SfcIntegrityViolations = $true
+            Warn-Step -Name 'SFCDetection' -Reason "SFC verify returned unusual exit code $($result.ExitCode)."
+        }
+        else {
+            Write-Log 'SFC detection completed without confirmed integrity violations.' 'OK'
+        }
+    }
+    
+    function Invoke-SfcRepair {
+        Write-Log "Running SFC /SCANNOW..." 'WARN'
+        $result = Invoke-SfcCommand -Arguments '/scannow'
+    
+        if ($result.ExitCode -notin 0,1) {
+            throw "SFC /SCANNOW exited with code $($result.ExitCode)"
+        }
+    
+        Add-RepairAttempt 'SFC /SCANNOW'
+    }
+    
+    function Invoke-WmiCheck {
+        Write-Log "Checking WMI repository consistency..." 'INFO'
+        $output = & "$env:SystemRoot\System32\wbem\winmgmt.exe" /verifyrepository 2>&1
+        $text = ($output | Out-String).Trim()
+    
+        if ($text) {
+            $text -split "`r?`n" | Where-Object { $_.Trim() } | ForEach-Object { Write-Log $_ 'INFO' }
+        }
+    
+        Add-DetailedResult -Step 'WmiRepositoryCheck' -Status 'Info' -Message 'WMI verify completed.' -Data @{
+            Output = $text
+        }
+    
+        if ($text -match 'inconsistent') {
+            $script:Summary.WmiRepositoryInconsistent = $true
+            Warn-Step -Name 'WmiRepositoryCheck' -Reason 'WMI repository reported as inconsistent.'
+        }
+    }
+    
+    function Invoke-WmiRepair {
+        Write-Log "Repairing WMI repository..." 'WARN'
+        $output = & "$env:SystemRoot\System32\wbem\winmgmt.exe" /salvagerepository 2>&1
+        $text = ($output | Out-String).Trim()
+    
+        if ($text) {
+            $text -split "`r?`n" | Where-Object { $_.Trim() } | ForEach-Object { Write-Log $_ 'INFO' }
+        }
+    
+        Add-RepairAttempt 'winmgmt /salvagerepository'
+        Add-DetailedResult -Step 'WmiRepair' -Status 'Info' -Message 'WMI salvage completed.' -Data @{
+            Output = $text
+        }
+    }
+    
+    function Invoke-NetworkReset {
+        Write-Log "Flushing DNS cache..." 'INFO'
+        ipconfig /flushdns | Out-Null
+    
+        Write-Log "Resetting Winsock..." 'WARN'
+        netsh winsock reset | Out-Null
+    
+        Write-Log "Resetting TCP/IP stack..." 'WARN'
+        netsh int ip reset | Out-Null
+    
+        $script:Summary.RebootRequired = $true
+        Add-RepairAttempt 'Winsock/TCPIP reset'
+        Add-DetailedResult -Step 'NetworkReset' -Status 'Info' -Message 'Network reset completed.'
+    }
+    
+    function Invoke-DnsFlushOnly {
+        Write-Log "Flushing DNS cache..." 'INFO'
+        ipconfig /flushdns | Out-Null
+        Add-DetailedResult -Step 'DnsFlush' -Status 'Info' -Message 'DNS cache flushed.'
+    }
+    
+    function Invoke-StorageOptimization {
+        $systemDrive = $env:SystemDrive.TrimEnd(':')
+        $isSsd = Test-SystemDiskIsSSD
+    
+        if ($isSsd) {
+            Write-Log "SSD detected. Running ReTrim on $($env:SystemDrive)" 'INFO'
+            Optimize-Volume -DriveLetter $systemDrive -ReTrim -ErrorAction Stop | Out-Null
+        }
+        else {
+            Write-Log "SSD not detected. Running standard optimization on $($env:SystemDrive)" 'INFO'
+            Optimize-Volume -DriveLetter $systemDrive -Analyze -ErrorAction Stop | Out-Null
+        }
+    
+        Add-DetailedResult -Step 'StorageOptimization' -Status 'Info' -Message 'Storage optimization completed.' -Data @{
+            IsSSD = $isSsd
+        }
+    }
+    
+    function Invoke-IconCacheRebuild {
+        Write-Log "Rebuilding icon and thumbnail caches..." 'WARN'
+    
+        Get-Process explorer -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 2
+    
+        $explorerCachePath = "$env:LOCALAPPDATA\Microsoft\Windows\Explorer"
+        $deletedFiles = New-Object System.Collections.Generic.List[string]
+    
+        $singleFileTargets = @(
+            "$env:LOCALAPPDATA\IconCache.db"
+        )
+    
+        foreach ($path in $singleFileTargets) {
+            if (Test-Path -LiteralPath $path) {
+                try {
+                    Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+                    $deletedFiles.Add((Split-Path -Leaf $path)) | Out-Null
+                }
+                catch {
+                    Write-Log "Failed to delete cache file $path : $($_.Exception.Message)" 'WARN'
+                }
+            }
+        }
+    
+        if (Test-Path -LiteralPath $explorerCachePath) {
+            $patterns = @(
+                'iconcache*',
+                'thumbcache_*.db',
+                'thumbcache_idx.db'
+            )
+    
+            foreach ($pattern in $patterns) {
+                Get-ChildItem -LiteralPath $explorerCachePath -Filter $pattern -Force -ErrorAction SilentlyContinue | ForEach-Object {
+                    try {
+                        Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop
+                        $deletedFiles.Add($_.Name) | Out-Null
+                    }
+                    catch {
+                        Write-Log "Failed to delete cache file $($_.FullName): $($_.Exception.Message)" 'WARN'
+                    }
+                }
+            }
+        }
+    
+        Start-Process explorer.exe
+        Add-RepairAttempt 'Icon and thumbnail cache rebuild'
+        Add-DetailedResult -Step 'IconCacheRebuild' -Status 'Info' -Message 'Icon and thumbnail cache rebuild completed.' -Data @{
+            DeletedFiles = ($deletedFiles -join '; ')
+        }
+    }
+    
+    
+    function Set-RegistryDWORDValue {
+        param(
+            [Parameter(Mandatory)][string]$Path,
+            [Parameter(Mandatory)][string]$Name,
+            [Parameter(Mandatory)][int]$Value
+        )
+    
+        if (-not (Test-Path -LiteralPath $Path)) {
+            New-Item -Path $Path -Force | Out-Null
+        }
+    
+        New-ItemProperty -Path $Path -Name $Name -Value $Value -PropertyType DWord -Force | Out-Null
+    }
+    
+    function Disable-CopilotForLoadedUsers {
+        $targetSids = New-Object System.Collections.Generic.List[string]
+        $targetSids.Add('HKEY_CURRENT_USER') | Out-Null
+    
+        Get-ChildItem Registry::HKEY_USERS -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.PSChildName -match '^S-1-5-21-' -and
+                $_.PSChildName -notmatch '_Classes$'
+            } |
+            ForEach-Object {
+                $targetSids.Add("HKEY_USERS\\$($_.PSChildName)") | Out-Null
+            }
+    
+        foreach ($root in $targetSids | Select-Object -Unique) {
+            $policyPath = "Registry::$root\Software\Policies\Microsoft\Windows\WindowsCopilot"
+            $explorerPath = "Registry::$root\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
+    
+            Set-RegistryDWORDValue -Path $policyPath -Name 'TurnOffWindowsCopilot' -Value 1
+            Set-RegistryDWORDValue -Path $explorerPath -Name 'ShowCopilotButton' -Value 0
+    
+            Add-DetailedResult -Step 'CopilotDisableRegistry' -Status 'Info' -Message 'Applied Copilot disable settings for loaded profile.' -Data @{
+                Root = $root
+                PolicyPath = $policyPath
+                ExplorerPath = $explorerPath
+            }
+        }
+    }
+    
+    function Disable-CopilotForDefaultUser {
+        $defaultHiveName = 'HKU\DefaultTempCopilot'
+        $defaultHivePsPath = 'Registry::HKEY_USERS\DefaultTempCopilot'
+        $defaultUserNtUserDat = 'C:\Users\Default\NTUSER.DAT'
+    
+        if (-not (Test-Path -LiteralPath $defaultUserNtUserDat)) {
+            Write-Log 'Default User NTUSER.DAT not found; future new users were not updated for Copilot disable.' 'WARN'
+            return
+        }
+    
+        $hiveLoaded = $false
+        try {
+            $loadResult = & reg.exe load $defaultHiveName $defaultUserNtUserDat
+            if ($LASTEXITCODE -ne 0) {
+                throw "Failed to load Default User hive: $($loadResult -join ' ')"
+            }
+    
+            $hiveLoaded = $true
+            Start-Sleep -Milliseconds 750
+    
+            $policyPath = "$defaultHivePsPath\Software\Policies\Microsoft\Windows\WindowsCopilot"
+            $explorerPath = "$defaultHivePsPath\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
+    
+            Set-RegistryDWORDValue -Path $policyPath -Name 'TurnOffWindowsCopilot' -Value 1
+            Set-RegistryDWORDValue -Path $explorerPath -Name 'ShowCopilotButton' -Value 0
+    
+            Add-DetailedResult -Step 'CopilotDisableDefaultUser' -Status 'Info' -Message 'Applied Copilot disable settings for Default User profile.' -Data @{
+                PolicyPath = $policyPath
+                ExplorerPath = $explorerPath
+            }
+        }
+        finally {
+            if ($hiveLoaded) {
+                Start-Sleep -Milliseconds 750
+                [System.GC]::Collect()
+                [System.GC]::WaitForPendingFinalizers()
+                Start-Sleep -Milliseconds 750
+                & reg.exe unload $defaultHiveName | Out-Null
+            }
+        }
+    }
+    
+    function Invoke-CopilotDisableAndRemoval {
+        Write-Log 'Disabling Microsoft Copilot for current, loaded, and future user profiles...' 'WARN'
+    
+        Set-RegistryDWORDValue -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot' -Name 'TurnOffWindowsCopilot' -Value 1
+        Set-RegistryDWORDValue -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer' -Name 'HideCopilotButton' -Value 1
+    
+        Disable-CopilotForLoadedUsers
+        Disable-CopilotForDefaultUser
+    
+        $removedPackages = New-Object System.Collections.Generic.List[string]
+        $packagePatterns = @(
+            'Microsoft.Windows.Copilot',
+            '*Copilot*'
+        )
+    
+        foreach ($pattern in $packagePatterns) {
+            $packages = @(Get-AppxPackage -AllUsers -Name $pattern -ErrorAction SilentlyContinue)
+            foreach ($pkg in $packages) {
+                if ($removedPackages -contains $pkg.PackageFullName) {
+                    continue
+                }
+    
+                try {
+                    Remove-AppxPackage -Package $pkg.PackageFullName -AllUsers -ErrorAction Stop
+                    $removedPackages.Add($pkg.PackageFullName) | Out-Null
+                    Write-Log "Removed Copilot Appx package: $($pkg.Name) [$($pkg.PackageFullName)]" 'OK'
+                }
+                catch {
+                    Write-Log "Failed to remove Copilot Appx package $($pkg.PackageFullName): $($_.Exception.Message)" 'WARN'
+                }
+            }
+    
+            $provisionedPackages = @(Get-AppxProvisionedPackage -Online | Where-Object {
+                $_.DisplayName -like $pattern -or $_.PackageName -like $pattern
+            })
+    
+            foreach ($prov in $provisionedPackages) {
+                try {
+                    Remove-AppxProvisionedPackage -Online -PackageName $prov.PackageName -ErrorAction Stop | Out-Null
+                    $removedPackages.Add($prov.PackageName) | Out-Null
+                    Write-Log "Removed provisioned Copilot package: $($prov.DisplayName) [$($prov.PackageName)]" 'OK'
+                }
+                catch {
+                    Write-Log "Failed to remove provisioned Copilot package $($prov.PackageName): $($_.Exception.Message)" 'WARN'
+                }
+            }
+        }
+    
+        Get-Process explorer -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 2
+        Start-Process explorer.exe
+    
+        $script:Summary.RebootRequired = $true
+        Add-RepairAttempt 'Microsoft Copilot disable and removal'
+        Add-DetailedResult -Step 'CopilotDisableAndRemoval' -Status 'Info' -Message 'Microsoft Copilot disable and removal routine completed.' -Data @{
+            RemovedPackages = ($removedPackages | Select-Object -Unique) -join '; '
+        }
+    }
+    
+    function Invoke-FirewallReset {
+        Write-Log "Resetting Windows Firewall to defaults..." 'WARN'
+        netsh advfirewall reset | Out-Null
+        Add-RepairAttempt 'Firewall reset'
+        Add-DetailedResult -Step 'FirewallReset' -Status 'Info' -Message 'Firewall reset completed.'
+    }
+    
+    function Get-ServiceStateSafe {
+        param(
+            [Parameter(Mandatory)][string]$Name
+        )
+    
+        try {
+            $svc = Get-Service -Name $Name -ErrorAction Stop
+            return [PSCustomObject]@{
+                Name        = $svc.Name
+                DisplayName = $svc.DisplayName
+                Status      = [string]$svc.Status
+                Exists      = $true
+                Error       = $null
+            }
+        }
+        catch {
+            return [PSCustomObject]@{
+                Name        = $Name
+                DisplayName = $null
+                Status      = 'NotFound'
+                Exists      = $false
+                Error       = $_.Exception.Message
+            }
+        }
+    }
+    
+    function Wait-ServiceStateSafe {
+        param(
+            [Parameter(Mandatory)][string]$Name,
+            [Parameter(Mandatory)][ValidateSet('Running','Stopped')][string]$DesiredStatus,
+            [int]$TimeoutSeconds = 30
+        )
+    
+        $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    
+        do {
+            $state = Get-ServiceStateSafe -Name $Name
+            if (-not $state.Exists) {
+                return $state
+            }
+    
+            if ($state.Status -eq $DesiredStatus) {
+                return $state
+            }
+    
+            Start-Sleep -Seconds 1
+        } while ((Get-Date) -lt $deadline)
+    
+        return Get-ServiceStateSafe -Name $Name
+    }
+    
+    function Stop-ServiceWithValidation {
+        param(
+            [Parameter(Mandatory)][string]$Name,
+            [int]$TimeoutSeconds = 30
+        )
+    
+        $before = Get-ServiceStateSafe -Name $Name
+    
+        if (-not $before.Exists) {
+            Write-Log "Service validation: $Name was not found. Skipping stop." 'WARN'
+            return [PSCustomObject]@{
+                Name         = $Name
+                BeforeStatus = $before.Status
+                AfterStatus  = $before.Status
+                Success      = $true
+                Message      = 'Service not found; skipped'
+            }
+        }
+    
+        Write-Log "Service validation: $Name current state is $($before.Status)." 'INFO'
+    
+        if ($before.Status -eq 'Stopped') {
+            Write-Log "Service validation: $Name is already stopped." 'OK'
+            return [PSCustomObject]@{
+                Name         = $Name
+                BeforeStatus = $before.Status
+                AfterStatus  = 'Stopped'
+                Success      = $true
+                Message      = 'Already stopped'
+            }
+        }
+    
+        try {
+            Write-Log "Stopping service $Name..." 'INFO'
+            Stop-Service -Name $Name -Force -ErrorAction Stop
+        }
+        catch {
+            Write-Log "Stop-Service reported an issue for $Name`: $($_.Exception.Message)" 'WARN'
+        }
+    
+        $after = Wait-ServiceStateSafe -Name $Name -DesiredStatus 'Stopped' -TimeoutSeconds $TimeoutSeconds
+        $success = ($after.Status -eq 'Stopped')
+    
+        if ($success) {
+            Write-Log "Service validation: $Name stopped successfully." 'OK'
+        }
+        else {
+            Write-Log "Service validation: $Name did not stop. Current state: $($after.Status)." 'WARN'
+        }
+    
+        return [PSCustomObject]@{
+            Name         = $Name
+            BeforeStatus = $before.Status
+            AfterStatus  = $after.Status
+            Success      = $success
+            Message      = if ($success) { 'Stopped successfully' } else { "Expected Stopped but found $($after.Status)" }
+        }
+    }
+    
+    function Start-ServiceWithValidation {
+        param(
+            [Parameter(Mandatory)][string]$Name,
+            [int]$TimeoutSeconds = 30
+        )
+    
+        $before = Get-ServiceStateSafe -Name $Name
+    
+        if (-not $before.Exists) {
+            Write-Log "Service validation: $Name was not found. Skipping start." 'WARN'
+            return [PSCustomObject]@{
+                Name         = $Name
+                BeforeStatus = $before.Status
+                AfterStatus  = $before.Status
+                Success      = $true
+                Message      = 'Service not found; skipped'
+            }
+        }
+    
+        if ($before.Status -eq 'Running') {
+            Write-Log "Service validation: $Name is already running." 'OK'
+            return [PSCustomObject]@{
+                Name         = $Name
+                BeforeStatus = $before.Status
+                AfterStatus  = 'Running'
+                Success      = $true
+                Message      = 'Already running'
+            }
+        }
+    
+        try {
+            Write-Log "Starting service $Name..." 'INFO'
+            Start-Service -Name $Name -ErrorAction Stop
+        }
+        catch {
+            Write-Log "Start-Service reported an issue for $Name`: $($_.Exception.Message)" 'WARN'
+        }
+    
+        $after = Wait-ServiceStateSafe -Name $Name -DesiredStatus 'Running' -TimeoutSeconds $TimeoutSeconds
+        $success = ($after.Status -eq 'Running')
+    
+        if ($success) {
+            Write-Log "Service validation: $Name started successfully." 'OK'
+        }
+        else {
+            Write-Log "Service validation: $Name did not start. Current state: $($after.Status)." 'WARN'
+        }
+    
+        return [PSCustomObject]@{
+            Name         = $Name
+            BeforeStatus = $before.Status
+            AfterStatus  = $after.Status
+            Success      = $success
+            Message      = if ($success) { 'Started successfully' } else { "Expected Running but found $($after.Status)" }
+        }
+    }
+    
+    
+    function Remove-PathWithRetry {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory)][string]$Path,
+            [Parameter(Mandatory)][string]$Description,
+            [int]$MaxAttempts = 5,
+            [int]$InitialDelaySeconds = 2,
+            [switch]$ReleaseWindowsUpdateLocks
+        )
+    
+        $result = [ordered]@{
+            Path            = $Path
+            Description     = $Description
+            ExistsBefore    = $false
+            Deleted         = $false
+            Attempts        = 0
+            ItemCount       = 0
+            FileCount       = 0
+            FolderCount     = 0
+            SizeBytesBefore = [int64]0
+            SizeMBBefore    = [double]0
+            SizeGBBefore    = [double]0
+            SizeBytesAfter  = [int64]0
+            SizeMBAfter     = [double]0
+            SizeGBAfter     = [double]0
+            SpaceFreed      = [int64]0
+            EstimatedFreedBytes = [int64]0
+            EstimatedFreedMB = [double]0
+            EstimatedFreedGB = [double]0
+            Message         = $null
+        }
+    
+        if (-not (Test-Path -LiteralPath $Path)) {
+            $result.Message = 'Path does not exist; nothing to delete'
+            Write-Log "$Description does not exist at $Path. Nothing to delete." 'INFO'
+            return [PSCustomObject]$result
+        }
+    
+        $result.ExistsBefore = $true
+    
+        $beforeInfo = Get-FolderSizeInfo -Path $Path
+        $result.ItemCount = $beforeInfo.ItemCount
+        $result.FileCount = $beforeInfo.FileCount
+        $result.FolderCount = $beforeInfo.FolderCount
+        $result.SizeBytesBefore = [int64]$beforeInfo.SizeBytes
+        $result.SizeMBBefore = [double]$beforeInfo.SizeMB
+        $result.SizeGBBefore = [double]$beforeInfo.SizeGB
+    
+        Write-Log "Preparing to delete $Description at $Path. No backup will be created." 'INFO'
+        Write-Log "Size before deletion for $Description`: $($result.SizeGBBefore) GB ($($result.SizeMBBefore) MB), items: $($result.ItemCount), files: $($result.FileCount), folders: $($result.FolderCount)." 'INFO'
+    
+        for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+            $result.Attempts = $attempt
+    
+            try {
+                if (-not (Test-Path -LiteralPath $Path)) {
+                    $result.Deleted = $true
+                    $result.Message = 'Path already gone during retry validation'
+                    Write-Log "$Description no longer exists at $Path." 'OK'
+                    break
+                }
+    
+                if ($ReleaseWindowsUpdateLocks -and $attempt -gt 1) {
+                    Write-Log "Attempt $attempt is releasing possible Windows Update locks before retrying $Description deletion." 'WARN'
+                    Stop-WindowsUpdateLockingProcesses | Out-Null
+                }
+    
+                Write-Log "Deletion attempt $attempt of $MaxAttempts for $Description..." 'INFO'
+                Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+    
+                Start-Sleep -Seconds 1
+                if (-not (Test-Path -LiteralPath $Path)) {
+                    $result.Deleted = $true
+                    $result.Message = 'Deleted successfully'
+                    Write-Log "Deleted $Description successfully on attempt $attempt." 'OK'
+                    break
+                }
+    
+                throw "$Description still exists after Remove-Item completed."
+            }
+            catch {
+                $result.Message = $_.Exception.Message
+                Write-Log "Deletion attempt $attempt failed for $Description`: $($result.Message)" 'WARN'
+    
+                if ($ReleaseWindowsUpdateLocks) {
+                    Stop-WindowsUpdateLockingProcesses | Out-Null
+                }
+    
+                if ($attempt -lt $MaxAttempts) {
+                    $delay = $InitialDelaySeconds * $attempt
+                    Write-Log "Waiting $delay second(s), then retrying $Description deletion. Files may still be locked by services or Windows Update processes." 'INFO'
+                    [System.GC]::Collect()
+                    [System.GC]::WaitForPendingFinalizers()
+                    Start-Sleep -Seconds $delay
+                }
+            }
+        }
+    
+        if (Test-Path -LiteralPath $Path) {
+            $afterInfo = Get-FolderSizeInfo -Path $Path
+            $result.SizeBytesAfter = [int64]$afterInfo.SizeBytes
+            $result.SizeMBAfter = [double]$afterInfo.SizeMB
+            $result.SizeGBAfter = [double]$afterInfo.SizeGB
+        }
+    
+        $freedBytes = [int64]([math]::Max(0, ([int64]$result.SizeBytesBefore - [int64]$result.SizeBytesAfter)))
+        $result.SpaceFreed = $freedBytes
+        $result.EstimatedFreedBytes = $freedBytes
+        $result.EstimatedFreedMB = [math]::Round(([double]$freedBytes / 1MB), 2)
+        $result.EstimatedFreedGB = [math]::Round(([double]$freedBytes / 1GB), 3)
+    
+        if ($result.Deleted) {
+            Write-Log "Estimated space freed by deleting $Description`: $($result.EstimatedFreedGB) GB ($($result.EstimatedFreedMB) MB)." 'OK'
+        }
+        else {
+            Write-Log "Failed to delete $Description after $MaxAttempts attempt(s). Last error: $($result.Message). Estimated remaining size: $($result.SizeGBAfter) GB." 'ERROR'
+        }
+    
+        return [PSCustomObject]$result
+    }
+    
+    function Invoke-WindowsUpdateComponentReset {
+        Write-Log "Resetting Windows Update components..." 'WARN'
+        Write-Log "SoftwareDistribution will be deleted directly. No .bak, .bak1, or timestamped backup folder will be created." 'INFO'
+    
+        $services = @('wuauserv','bits','cryptsvc','msiserver','usosvc','DoSvc','WaaSMedicSvc')
+        $stopResults = New-Object System.Collections.Generic.List[object]
+        $startResults = New-Object System.Collections.Generic.List[object]
+        $deleteResults = New-Object System.Collections.Generic.List[object]
+        $lockProcessResults = New-Object System.Collections.Generic.List[object]
+        $backupCleanupResult = $null
+    
+        foreach ($svc in $services) {
+            $stopResults.Add((Stop-ServiceWithValidation -Name $svc -TimeoutSeconds 45)) | Out-Null
+        }
+    
+        $criticalServicesStillRunning = @($stopResults | Where-Object {
+            $_.Name -in @('wuauserv','bits','cryptsvc') -and $_.Success -eq $false
+        })
+    
+        if ($criticalServicesStillRunning.Count -gt 0) {
+            Warn-Step -Name 'WindowsUpdateComponentReset' -Reason "One or more Windows Update services did not stop cleanly: $($criticalServicesStillRunning.Name -join ', ')"
+        }
+    
+        Start-Sleep -Seconds 2
+    
+        foreach ($lockResult in @(Stop-WindowsUpdateLockingProcesses)) { $lockProcessResults.Add($lockResult) | Out-Null }
+        $backupCleanupResult = Remove-SoftwareDistributionBakFolders
+    
+        $paths = @(
+            @{ Path = "$env:WINDIR\SoftwareDistribution"; Description = 'Windows Update SoftwareDistribution folder' },
+            @{ Path = "$env:WINDIR\System32\catroot2"; Description = 'Windows Update Catroot2 folder' }
+        )
+    
+        foreach ($target in $paths) {
+            $deleteResults.Add((Remove-PathWithRetry -Path $target.Path -Description $target.Description -MaxAttempts 5 -InitialDelaySeconds 2 -ReleaseWindowsUpdateLocks)) | Out-Null
+        }
+    
+        foreach ($svc in $services) {
+            $startResults.Add((Start-ServiceWithValidation -Name $svc -TimeoutSeconds 45)) | Out-Null
+        }
+    
+        $failedDeletes = @($deleteResults | Where-Object { $_.ExistsBefore -eq $true -and $_.Deleted -eq $false })
+        $failedStarts = @($startResults | Where-Object { $_.Success -eq $false })
+    
+        if ($failedDeletes.Count -gt 0) {
+            Warn-Step -Name 'WindowsUpdateComponentReset' -Reason "One or more update folders could not be deleted: $($failedDeletes.Description -join ', ')"
+        }
+    
+        if ($failedStarts.Count -gt 0) {
+            Warn-Step -Name 'WindowsUpdateComponentReset' -Reason "One or more update services did not restart cleanly: $($failedStarts.Name -join ', ')"
+        }
+    
+        $script:Summary.RebootRequired = $true
+        Add-RepairAttempt 'Windows Update component reset with direct SoftwareDistribution deletion, backup cleanup, folder size logging, lock release, and service validation'
+        Add-DetailedResult -Step 'WindowsUpdateComponentReset' -Status 'Info' -Message 'Windows Update components reset. SoftwareDistribution was deleted directly with no backup folder creation; old backup folders were removed and estimated GB freed was logged.' -Data @{
+            StoppedServicesJson = ($stopResults | ConvertTo-Json -Compress)
+            LockProcessesJson  = ($lockProcessResults | ConvertTo-Json -Compress)
+            BackupCleanupJson  = ($backupCleanupResult | ConvertTo-Json -Compress)
+            DeletedPathsJson   = ($deleteResults | ConvertTo-Json -Compress)
+            StartedServicesJson = ($startResults | ConvertTo-Json -Compress)
+        }
+    }
+    
+    function Invoke-ScheduledTaskHealthCheck {
+        Write-Log "Checking scheduled task health..." 'INFO'
+    
+        $badTasks = Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object {
+            $_.State -eq 'Unknown' -or $_.TaskPath -eq $null
+        }
+    
+        $taskNames = @()
+    
+        if ($badTasks) {
+            foreach ($task in $badTasks) {
+                $name = "$($task.TaskPath)$($task.TaskName)"
+                $taskNames += $name
+                Warn-Step -Name 'ScheduledTaskCheck' -Reason "Task may need review: $name"
+            }
+        }
+    
+        Add-DetailedResult -Step 'ScheduledTaskHealthCheck' -Status 'Info' -Message 'Scheduled task health check completed.' -Data @{
+            SuspectTaskCount = $taskNames.Count
+            SuspectTasks     = ($taskNames -join '; ')
+        }
+    }
+    
+    function Invoke-EventLogSummary {
+        Write-Log "Collecting recent system health events..." 'INFO'
+    
+        try {
+            $recentUnexpected = Get-WinEvent -FilterHashtable @{
+                LogName = 'System'
+                Id      = 41, 6008
+                StartTime = (Get-Date).AddDays(-7)
+            } -ErrorAction Stop
+    
+            $count = @($recentUnexpected).Count
+    
+            Add-DetailedResult -Step 'EventLogSummary' -Status 'Info' -Message 'Collected recent unexpected shutdown events.' -Data @{
+                UnexpectedShutdownCount = $count
+            }
+    
+            if ($recentUnexpected) {
+                Warn-Step -Name 'EventLogSummary' -Reason "Recent unexpected shutdown events found: $count"
+            }
+        }
+        catch {
+            Warn-Step -Name 'EventLogSummary' -Reason $_.Exception.Message
+        }
+    }
+    
+    function Invoke-EventLogClear {
+        Write-Log "Clearing classic event logs..." 'WARN'
+        wevtutil el | ForEach-Object {
+            try {
+                wevtutil cl $_ 2>$null
+            }
+            catch {
+            }
+        }
+        Add-RepairAttempt 'Event log clear'
+        Add-DetailedResult -Step 'EventLogClear' -Status 'Info' -Message 'Event log clear attempted.'
+    }
+    
+    function Invoke-DiskSpaceCheck {
+        $drive = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='$env:SystemDrive'"
+        if ($drive) {
+            $freeGB = [math]::Round($drive.FreeSpace / 1GB, 2)
+            $sizeGB = [math]::Round($drive.Size / 1GB, 2)
+            Write-Log "System drive free space: $freeGB GB of $sizeGB GB" 'INFO'
+    
+            Add-DetailedResult -Step 'DiskSpaceCheck' -Status 'Info' -Message 'Disk space checked.' -Data @{
+                FreeGB  = $freeGB
+                TotalGB = $sizeGB
+            }
+    
+            if ($freeGB -lt 10) {
+                Warn-Step -Name 'DiskSpaceCheck' -Reason "Low free space on system drive: $freeGB GB"
+            }
+        }
+    }
+    
+    function Invoke-DefenderStatusCheck {
+        try {
+            $status = Get-MpComputerStatus -ErrorAction Stop
+            Write-Log "Defender Antivirus Enabled: $($status.AntivirusEnabled)" 'INFO'
+            Write-Log "Defender RealTime Protection Enabled: $($status.RealTimeProtectionEnabled)" 'INFO'
+    
+            Add-DetailedResult -Step 'DefenderStatusCheck' -Status 'Info' -Message 'Defender status checked.' -Data @{
+                AntivirusEnabled          = $status.AntivirusEnabled
+                RealTimeProtectionEnabled = $status.RealTimeProtectionEnabled
+            }
+        }
+        catch {
+            Warn-Step -Name 'DefenderStatusCheck' -Reason $_.Exception.Message
+        }
+    }
+    
+    function Invoke-RebootIfNeeded {
+        param(
+            [int]$DelaySeconds = 60
+        )
+    
+        $comment = 'Restarting after automated system repair operations.'
+    
+        $args = @(
+            '/r'
+            '/t', $DelaySeconds.ToString()
+            '/d', 'p:2:17'
+            '/c', "`"$comment`""
+            '/f'
+        )
+    
+        Write-Log "Issuing reboot command: shutdown.exe $($args -join ' ')" 'WARN'
+        & "$env:SystemRoot\System32\shutdown.exe" @args
+    
+        if ($LASTEXITCODE -ne 0) {
+            throw "shutdown.exe returned exit code $LASTEXITCODE"
+        }
+    
+        Add-DetailedResult -Step 'AutoReboot' -Status 'Info' -Message 'Automatic reboot command issued.' -Data @{
+            DelaySeconds = $DelaySeconds
+        }
+    }
+    
+    function Show-Summary {
+        $script:Summary.EndTime = Get-Date
+    
+        Write-Log "---------------- Summary ----------------" 'INFO'
+        Write-Log "Computer Name: $($script:Summary.ComputerName)" 'INFO'
+        Write-Log "Start Time: $($script:Summary.StartTime)" 'INFO'
+        Write-Log "End Time:   $($script:Summary.EndTime)" 'INFO'
+        Write-Log "YAML Log:   $($script:YamlLogPath)" 'INFO'
+        Write-Log "Succeeded:  $($script:Summary.StepsSucceeded)" 'INFO'
+        Write-Log "Failed:     $($script:Summary.StepsFailed)" 'INFO'
+        Write-Log "Warnings:   $($script:Summary.Warnings)" 'INFO'
+        Write-Log "Pending Reboot Detected: $($script:Summary.PendingRebootDetected)" 'INFO'
+        Write-Log "Reboot Required: $($script:Summary.RebootRequired)" 'INFO'
+        Write-Log "Disk Corruption Suspected: $($script:Summary.DiskCorruptionSuspected)" 'INFO'
+        Write-Log "DISM Corruption Detected: $($script:Summary.DismCorruptionDetected)" 'INFO'
+        Write-Log "SFC Integrity Violations: $($script:Summary.SfcIntegrityViolations)" 'INFO'
+        Write-Log "WMI Repository Inconsistent: $($script:Summary.WmiRepositoryInconsistent)" 'INFO'
+    
+        if ($script:Summary.RepairsAttempted.Count -gt 0) {
+            Write-Log "Repairs Attempted:" 'INFO'
+            foreach ($repair in $script:Summary.RepairsAttempted) {
+                Write-Log " - $repair" 'INFO'
+            }
+        }
+    
+        if ($script:Summary.Notes.Count -gt 0) {
+            Write-Log "Notes:" 'INFO'
+            foreach ($note in $script:Summary.Notes) {
+                Write-Log " - $note" 'INFO'
+            }
+        }
+    }
+    
+    
+    function Invoke-LogArchiveRetention {
+        [CmdletBinding()]
+        param(
+            [string]$LogDirectory = 'C:\Logs',
+            [string]$ComputerName = $env:COMPUTERNAME
+        )
+    
+        Write-Log "Starting Sunday-based log archive and retention processing in $LogDirectory" 'INFO'
+    
+        if (-not (Test-Path -LiteralPath $LogDirectory)) {
+            Write-Log "Log directory does not exist: $LogDirectory" 'WARN'
+            Add-DetailedResult -Step 'LogArchiveRetention' -Status 'Warning' -Message "Log directory not found: $LogDirectory"
+            return
+        }
+    
+        $now = Get-Date
+        $thisSunday = $now.Date.AddDays(-[int]$now.DayOfWeek)
+        $previousSunday = $thisSunday.AddDays(-7)
+        $twoSundaysAgo = $thisSunday.AddDays(-14)
+    
+        Write-Log "This Sunday: $thisSunday" 'INFO'
+        Write-Log "Previous Sunday: $previousSunday" 'INFO'
+        Write-Log "Two Sundays Ago: $twoSundaysAgo" 'INFO'
+    
+        $extensions = @('.yaml', '.yml', '.txt')
+    
+        $allLooseLogs = Get-ChildItem -LiteralPath $LogDirectory -File -Force -ErrorAction SilentlyContinue |
+            Where-Object {
+                $extensions -contains $_.Extension.ToLowerInvariant() -and
+                $_.FullName -ne $script:YamlLogPath
+            }
+    
+        $logsToArchive = $allLooseLogs | Where-Object {
+            $_.CreationTime -ge $previousSunday -and $_.CreationTime -lt $thisSunday
+        } | Sort-Object CreationTime, Name
+    
+        $archiveDateText = $previousSunday.ToString('yyyy-MM-dd')
+        $zipPath = Join-Path $LogDirectory ("{0}-logs-{1}.zip" -f $ComputerName, $archiveDateText)
+    
+        $archiveSummary = [ordered]@{
+            ThisSunday                 = $thisSunday
+            PreviousSunday             = $previousSunday
+            TwoSundaysAgo              = $twoSundaysAgo
+            LooseLogsFound             = @($allLooseLogs).Count
+            LogsSelectedForArchive     = @($logsToArchive).Count
+            ArchiveCreated             = $false
+            ArchivePath                = $null
+            DeletedOriginalFiles       = @()
+            DeletedOldLooseLogs        = @()
+            DeletedExpiredZipFiles     = @()
+            Errors                     = @()
+        }
+    
+        if (@($logsToArchive).Count -gt 0) {
+            Write-Log "Preparing archive for previous Sunday week: $zipPath" 'INFO'
+    
+            try {
+                if (Test-Path -LiteralPath $zipPath) {
+                    Write-Log "Existing archive found for that Sunday. Removing and recreating: $zipPath" 'WARN'
+                    Remove-Item -LiteralPath $zipPath -Force -ErrorAction Stop
+                }
+    
+                Compress-Archive -Path ($logsToArchive.FullName) -DestinationPath $zipPath -CompressionLevel Optimal -Force -ErrorAction Stop
+    
+                if (-not (Test-Path -LiteralPath $zipPath)) {
+                    throw 'ZIP file was not created.'
+                }
+    
+                Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+                $zip = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
+    
+                try {
+                    $zipEntries = @($zip.Entries)
+                    if ($zipEntries.Count -lt 1) {
+                        throw 'ZIP file was created but contains no entries.'
+                    }
+    
+                    if ($zipEntries.Count -lt @($logsToArchive).Count) {
+                        throw "ZIP file entry count ($($zipEntries.Count)) is less than expected source file count ($(@($logsToArchive).Count))."
+                    }
+                }
+                finally {
+                    $zip.Dispose()
+                }
+    
+                $archiveSummary.ArchiveCreated = $true
+                $archiveSummary.ArchivePath = $zipPath
+                Write-Log "Archive created successfully: $zipPath" 'OK'
+    
+                foreach ($file in $logsToArchive) {
+                    try {
+                        Remove-Item -LiteralPath $file.FullName -Force -ErrorAction Stop
+                        $archiveSummary.DeletedOriginalFiles += $file.FullName
+                        Write-Log "Deleted archived source log: $($file.FullName)" 'OK'
+                    }
+                    catch {
+                        $msg = "Failed to delete archived source file $($file.FullName): $($_.Exception.Message)"
+                        $archiveSummary.Errors += $msg
+                        Write-Log $msg 'WARN'
+                    }
+                }
+            }
+            catch {
+                $msg = "Archive creation/validation failed: $($_.Exception.Message)"
+                $archiveSummary.Errors += $msg
+                Write-Log $msg 'ERROR'
+            }
+        }
+        else {
+            Write-Log 'No loose log files were found for the previous Sunday-to-Saturday period.' 'INFO'
+        }
+    
+        $remainingLooseLogs = Get-ChildItem -LiteralPath $LogDirectory -File -Force -ErrorAction SilentlyContinue |
+            Where-Object {
+                $extensions -contains $_.Extension.ToLowerInvariant() -and
+                $_.FullName -ne $script:YamlLogPath
+            }
+    
+        $oldLooseLogsToDelete = $remainingLooseLogs | Where-Object {
+            $_.CreationTime -lt $twoSundaysAgo
+        }
+    
+        foreach ($file in $oldLooseLogsToDelete) {
+            try {
+                Remove-Item -LiteralPath $file.FullName -Force -ErrorAction Stop
+                $archiveSummary.DeletedOldLooseLogs += $file.FullName
+                Write-Log "Deleted loose log older than two Sundays: $($file.FullName)" 'OK'
+            }
+            catch {
+                $msg = "Failed to delete old loose log $($file.FullName): $($_.Exception.Message)"
+                $archiveSummary.Errors += $msg
+                Write-Log $msg 'WARN'
+            }
+        }
+    
+        $zipFilesToDelete = Get-ChildItem -LiteralPath $LogDirectory -File -Filter '*.zip' -Force -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.Name -like "$ComputerName-logs-*.zip" -and
+                $_.CreationTime -lt $twoSundaysAgo
+            }
+    
+        foreach ($zipFile in $zipFilesToDelete) {
+            try {
+                Remove-Item -LiteralPath $zipFile.FullName -Force -ErrorAction Stop
+                $archiveSummary.DeletedExpiredZipFiles += $zipFile.FullName
+                Write-Log "Deleted ZIP archive older than two Sundays: $($zipFile.FullName)" 'OK'
+            }
+            catch {
+                $msg = "Failed to delete expired ZIP $($zipFile.FullName): $($_.Exception.Message)"
+                $archiveSummary.Errors += $msg
+                Write-Log $msg 'WARN'
+            }
+        }
+    
+        Add-DetailedResult -Step 'LogArchiveRetention' -Status 'Info' -Message 'Sunday-based log archive and retention processing completed.' -Data @{
+            ThisSunday                  = $archiveSummary.ThisSunday
+            PreviousSunday              = $archiveSummary.PreviousSunday
+            TwoSundaysAgo               = $archiveSummary.TwoSundaysAgo
+            LooseLogsFound              = $archiveSummary.LooseLogsFound
+            LogsSelectedForArchive      = $archiveSummary.LogsSelectedForArchive
+            ArchiveCreated              = $archiveSummary.ArchiveCreated
+            ArchivePath                 = $archiveSummary.ArchivePath
+            DeletedOriginalFilesCount   = @($archiveSummary.DeletedOriginalFiles).Count
+            DeletedOldLooseLogsCount    = @($archiveSummary.DeletedOldLooseLogs).Count
+            DeletedExpiredZipFilesCount = @($archiveSummary.DeletedExpiredZipFiles).Count
+            ErrorsCount                 = @($archiveSummary.Errors).Count
+            DeletedOriginalFiles        = ($archiveSummary.DeletedOriginalFiles -join '; ')
+            DeletedOldLooseLogs         = ($archiveSummary.DeletedOldLooseLogs -join '; ')
+            DeletedExpiredZipFiles      = ($archiveSummary.DeletedExpiredZipFiles -join '; ')
+            Errors                      = ($archiveSummary.Errors -join '; ')
+        }
+    
+        if (@($archiveSummary.Errors).Count -gt 0) {
+            Warn-Step -Name 'LogArchiveRetention' -Reason ("Completed with errors: " + ($archiveSummary.Errors -join ' | '))
+        }
+        else {
+            Write-Log 'Sunday-based log archive and retention processing completed successfully.' 'OK'
+        }
+    }
+    
+    if (-not (Test-IsAdministrator)) {
+        Write-Error "This script must be run as Administrator."
+        $global:LastStatus = "[ERROR] System Repair must be run as Administrator."
+        return
+    }
+    
+    Ensure-LogDirectory
+    Write-Log "Initializing automated system health and repair script..." 'INFO'
+    Write-Log "Detection-first mode is enabled. Repairs run automatically only when needed." 'INFO'
+    Write-Log "Detailed YAML log will be written to $($script:YamlLogPath)" 'INFO'
+    
+    Invoke-Safely -Name 'DiskSpaceCheck' -ScriptBlock {
+        Invoke-DiskSpaceCheck
+    } -WarnOnly | Out-Null
+    
+    Invoke-Safely -Name 'PendingRebootCheck' -ScriptBlock {
+        $pending = Get-PendingRebootState
+        $script:Summary.PendingRebootDetected = [bool]$pending.AnyPendingReboot
+    
+        $pending | Format-List | Out-String | ForEach-Object {
+            $_.TrimEnd() -split "`r?`n" | Where-Object { $_.Trim() } | ForEach-Object {
+                Write-Log $_ 'INFO'
+            }
+        }
+    
+        if ($pending.AnyPendingReboot) {
+            Warn-Step -Name 'PendingRebootCheck' -Reason 'A pending reboot was detected before maintenance began.'
+        }
+    } -WarnOnly | Out-Null
+    
+    Invoke-Safely -Name 'RepairVolumeScan' -ScriptBlock {
+        Invoke-RepairVolumeScan
+    } -WarnOnly | Out-Null
+    
+    Invoke-Safely -Name 'DISMDetection' -ScriptBlock {
+        Invoke-DismDetection
+    } -WarnOnly | Out-Null
+    
+    Invoke-Safely -Name 'SFCDetection' -ScriptBlock {
+        Invoke-SfcDetection
+    } -WarnOnly | Out-Null
+    
+    Invoke-Safely -Name 'WmiRepositoryCheck' -ScriptBlock {
+        Invoke-WmiCheck
+    } -WarnOnly | Out-Null
+    
+    Invoke-Safely -Name 'DnsFlush' -ScriptBlock {
+        Invoke-DnsFlushOnly
+    } -WarnOnly | Out-Null
+    
+    Invoke-Safely -Name 'TempCleanup' -ScriptBlock {
+        Invoke-TempCleanup
+    } -WarnOnly | Out-Null
+    
+    Invoke-Safely -Name 'StorageOptimization' -ScriptBlock {
+        Invoke-StorageOptimization
+    } -WarnOnly | Out-Null
+    
+    Invoke-Safely -Name 'ScheduledTaskHealthCheck' -ScriptBlock {
+        Invoke-ScheduledTaskHealthCheck
+    } -WarnOnly | Out-Null
+    
+    Invoke-Safely -Name 'EventLogSummary' -ScriptBlock {
+        Invoke-EventLogSummary
+    } -WarnOnly | Out-Null
+    
+    Invoke-Safely -Name 'DefenderStatusCheck' -ScriptBlock {
+        Invoke-DefenderStatusCheck
+    } -WarnOnly | Out-Null
+    
+    if ($AutoRepairOnDetection) {
+        if ($script:Summary.DismCorruptionDetected) {
+            Invoke-Safely -Name 'DISMRepair' -ScriptBlock {
+                Invoke-DismRepair
+            } | Out-Null
+        }
+    
+        if ($script:Summary.SfcIntegrityViolations) {
+            Invoke-Safely -Name 'SFCRepair' -ScriptBlock {
+                Invoke-SfcRepair
+            } | Out-Null
+        }
+    
+        if ($script:Summary.WmiRepositoryInconsistent -and $AllowWmiRepair) {
+            Invoke-Safely -Name 'WMIRepair' -ScriptBlock {
+                Invoke-WmiRepair
+            } -WarnOnly | Out-Null
+        }
+    
+        if ($script:Summary.DiskCorruptionSuspected -and $AllowOfflineDiskRepair) {
+            Invoke-Safely -Name 'OfflineDiskRepair' -ScriptBlock {
+                Invoke-RepairVolumeOfflineFix
+            } -WarnOnly | Out-Null
+        }
+    }
+    
+    if ($AllowNetworkReset) {
+        Invoke-Safely -Name 'NetworkReset' -ScriptBlock {
+            Invoke-NetworkReset
+        } -WarnOnly | Out-Null
+    }
+    
+    if ($AllowIconCacheRebuild) {
+        Invoke-Safely -Name 'IconCacheRebuild' -ScriptBlock {
+            Invoke-IconCacheRebuild
+        } -WarnOnly | Out-Null
+    }
+    
+    if ($AllowCopilotRemoval) {
+        Invoke-Safely -Name 'CopilotDisableAndRemoval' -ScriptBlock {
+            Invoke-CopilotDisableAndRemoval
+        } -WarnOnly | Out-Null
+    }
+    
+    if ($AllowFirewallReset) {
+        Invoke-Safely -Name 'FirewallReset' -ScriptBlock {
+            Invoke-FirewallReset
+        } -WarnOnly | Out-Null
+    }
+    
+    if ($AllowWindowsUpdateReset) {
+        Invoke-Safely -Name 'WindowsUpdateComponentReset' -ScriptBlock {
+            Invoke-WindowsUpdateComponentReset
+        } -WarnOnly | Out-Null
+    }
+    
+    if ($ClearEventLogs) {
+        Invoke-Safely -Name 'EventLogClear' -ScriptBlock {
+            Invoke-EventLogClear
+        } -WarnOnly | Out-Null
+    }
+    
+    Invoke-Safely -Name 'LogArchiveRetention' -ScriptBlock {
+        Invoke-LogArchiveRetention -LogDirectory $LogDirectory
+    } -WarnOnly | Out-Null
+    
+    Show-Summary
+    Write-YamlLog
+    
+    if ($AutoRebootIfNeeded -and ($script:Summary.RebootRequired -or $script:Summary.PendingRebootDetected)) {
+        try {
+            Invoke-RebootIfNeeded -DelaySeconds $AutoRebootDelaySeconds
+            Write-YamlLog
+        }
+        catch {
+            Fail-Step -Name 'AutoReboot' -Reason $_.Exception.Message
+            Show-Summary
+            Write-YamlLog
+            $global:LastStatus = "[ERROR] System Repair auto reboot step failed. See YAML log for details."
+            return
+        }
+    }
+    
+    if ($script:Summary.StepsFailed -gt 0) {
+        Write-YamlLog
+        $global:LastStatus = "[ERROR] System Repair completed with failures. See YAML log for details."
+        return
+    }
+    elseif ($script:Summary.RebootRequired -or $script:Summary.PendingRebootDetected) {
+        Write-YamlLog
+        $global:LastStatus = "[OK] System Repair completed; reboot is recommended or required. See YAML log for details."
+        return
+    }
+    else {
+        Write-YamlLog
+        $global:LastStatus = "[OK] System Repair completed successfully. See YAML log for details."
+        return
+    }
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
     }
 }
 
@@ -9816,842 +12256,492 @@ function Get-AutoLoginStatus {
 }
 
 # -----------------------------------------------------------------------------
-# Option 7 - Set Desktop Power Settings - Only run on Desktop computers, no laptops!
+# Option 7 - Set Desktop/Laptop Power Settings with Local Policy Enforcement
 # -----------------------------------------------------------------------------
 function Set-DesktopPowerSettings {
     [CmdletBinding(SupportsShouldProcess)]
     param(
-        [ValidateSet('High Performance', 'Balanced', 'Power Saver', 'Ultimate Performance')]
-        [string]$PowerPlan = 'High Performance',
-        
-        [ValidateRange(1, 600)]
-        [int]$MonitorTimeoutMinutes = 60,
-        
-        [ValidateRange(0, 600)]
-        [int]$DiskTimeoutMinutes = 0,  # 0 = Never
-
-        [ValidateRange(0, 600)]
-        [int]$SleepTimeoutMinutes = 0, # 0 = Never
-        
         [switch]$Force,
-        [switch]$AllowLaptops,
-        [string]$LogPath = "$env:TEMP\PowerSettings_$(Get-Date -Format 'yyyyMMdd_HHmmss').log",
-        [switch]$SkipHardwareDetection
+        [string]$LogPath = "C:\Logs\PowerSettings_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
     )
 
-    # Security: Require elevation for power configuration
-    if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
-        throw "This function must be run as Administrator"
+    if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        throw 'This function must be run as Administrator.'
     }
 
     $ErrorActionPreference = 'Continue'
     $ProgressPreference = 'SilentlyContinue'
-    
-    # Initialize tracking
-    $logEntries = @()
-    $appliedSettings = @()
-    $failedSettings = @()
-    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-    
-    function Write-LogEntry {
-        param([string]$Message, [string]$Level = 'INFO')
-        $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-        $logEntry = "[$timestamp] [$Level] $Message"
-        $script:logEntries += $logEntry
-        
-        switch ($Level) {
-            'ERROR' { Write-Host $Message -ForegroundColor Red }
-            'WARNING' { Write-Host $Message -ForegroundColor Yellow }
-            'SUCCESS' { Write-Host $Message -ForegroundColor Green }
-            'INFO' { Write-Host $Message -ForegroundColor Cyan }
-            'HARDWARE' { Write-Host $Message -ForegroundColor Magenta }
-        }
+
+    if (-not (Test-Path -LiteralPath (Split-Path -Path $LogPath -Parent))) {
+        New-Item -Path (Split-Path -Path $LogPath -Parent) -ItemType Directory -Force | Out-Null
     }
 
-    function Invoke-PowerCfg {
+    $script:Option7LogEntries = New-Object System.Collections.Generic.List[string]
+    $script:Option7Results = New-Object System.Collections.Generic.List[object]
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+    function Write-PowerLog {
+        param(
+            [Parameter(Mandatory)][string]$Message,
+            [ValidateSet('INFO','OK','WARN','ERROR','HARDWARE')][string]$Level = 'INFO'
+        )
+        $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+        $line = "[$timestamp] [$Level] $Message"
+        $script:Option7LogEntries.Add($line) | Out-Null
+        $color = switch ($Level) {
+            'OK' { 'Green' }
+            'WARN' { 'Yellow' }
+            'ERROR' { 'Red' }
+            'HARDWARE' { 'Magenta' }
+            default { 'Cyan' }
+        }
+        Write-Host $line -ForegroundColor $color
+    }
+
+    function Add-PowerResult {
+        param(
+            [string]$Setting,
+            [string]$Value,
+            [bool]$Success = $true,
+            [string]$ErrorMessage = $null
+        )
+        $script:Option7Results.Add([pscustomobject]@{
+            Setting = $Setting
+            Value = $Value
+            Success = $Success
+            Error = $ErrorMessage
+        }) | Out-Null
+    }
+
+    function Invoke-PowerCfgSafe {
         param(
             [Parameter(Mandatory)][string[]]$Arguments,
+            [Parameter(Mandatory)][string]$Description,
+            [switch]$ContinueOnError
+        )
+        try {
+            $output = & powercfg.exe @Arguments 2>&1
+            $exitCode = $LASTEXITCODE
+            if ($exitCode -ne 0) {
+                $text = if ($output) { ($output | Out-String).Trim() } else { 'No output returned.' }
+                throw "$Description failed. ExitCode=$exitCode. $text"
+            }
+            Write-PowerLog "[OK] $Description" 'OK'
+            Add-PowerResult -Setting $Description -Value ($Arguments -join ' ')
+            return $output
+        }
+        catch {
+            Write-PowerLog "[X] $($_.Exception.Message)" 'ERROR'
+            Add-PowerResult -Setting $Description -Value ($Arguments -join ' ') -Success $false -ErrorMessage $_.Exception.Message
+            if (-not $ContinueOnError) { throw }
+        }
+    }
+
+    function Set-RegistryDwordSafe {
+        param(
+            [Parameter(Mandatory)][string]$Path,
+            [Parameter(Mandatory)][string]$Name,
+            [Parameter(Mandatory)][int]$Value,
             [Parameter(Mandatory)][string]$Description
         )
-
-        $result = & powercfg.exe @Arguments 2>&1
-        $exitCode = $LASTEXITCODE
-        if ($exitCode -ne 0) {
-            $resultText = if ($result) { ($result | Out-String).Trim() } else { 'No output returned.' }
-            throw "$Description failed (ExitCode=$exitCode): $resultText"
+        try {
+            if (-not (Test-Path -LiteralPath $Path)) {
+                New-Item -Path $Path -Force | Out-Null
+            }
+            New-ItemProperty -Path $Path -Name $Name -Value $Value -PropertyType DWord -Force | Out-Null
+            Write-PowerLog "[OK] Policy registry set: $Description = $Value" 'OK'
+            Add-PowerResult -Setting "Policy: $Description" -Value ([string]$Value)
         }
-
-        return $result
+        catch {
+            Write-PowerLog "[X] Failed policy registry set: $Description - $($_.Exception.Message)" 'ERROR'
+            Add-PowerResult -Setting "Policy: $Description" -Value ([string]$Value) -Success $false -ErrorMessage $_.Exception.Message
+        }
     }
 
-    function Add-Result {
-        param(
-            [Parameter(Mandatory)][string]$Setting,
-            [Parameter(Mandatory)][string]$Value,
-            [bool]$Success = $true,
-            [string]$Error = $null
-        )
-
-        $entry = [ordered]@{
-            Setting = $Setting
-            Value   = $Value
-            Success = $Success
-        }
-
-        if (-not $Success -and $Error) {
-            $entry.Error = $Error
-        }
-
-        return [pscustomobject]$entry
-    }
-
-    # Speed: Hardware detection with caching
     function Get-SystemHardwareType {
         try {
             $computerSystem = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
             $battery = Get-CimInstance -ClassName Win32_Battery -ErrorAction SilentlyContinue
-            $systemEnclosure = Get-CimInstance -ClassName Win32_SystemEnclosure -ErrorAction SilentlyContinue
-            
-            $hardwareInfo = @{
-                IsLaptop = $false
-                IsDesktop = $false
-                IsWorkstation = $false
-                IsServer = $false
-                HasBattery = ($battery -ne $null)
-                ChassisTypes = @()
-                PCSystemType = $computerSystem.PCSystemType
-                TotalPhysicalMemory = [math]::Round($computerSystem.TotalPhysicalMemory / 1GB, 2)
+            $enclosure = Get-CimInstance -ClassName Win32_SystemEnclosure -ErrorAction SilentlyContinue
+
+            $chassisTypes = @()
+            if ($enclosure -and $enclosure.ChassisTypes) { $chassisTypes = @($enclosure.ChassisTypes) }
+
+            $laptopChassis = @(8,9,10,11,12,14,18,21,30,31,32)
+            $desktopChassis = @(3,4,5,6,7,15,16)
+            $serverChassis = @(17,23)
+
+            $isLaptop = (($chassisTypes | Where-Object { $_ -in $laptopChassis }).Count -gt 0) -or ($null -ne $battery) -or ($computerSystem.PCSystemType -eq 2)
+            $isServer = (($chassisTypes | Where-Object { $_ -in $serverChassis }).Count -gt 0) -or ($computerSystem.PCSystemType -eq 4)
+            $isDesktop = (-not $isLaptop -and ((($chassisTypes | Where-Object { $_ -in $desktopChassis }).Count -gt 0) -or $computerSystem.PCSystemType -in @(1,3)))
+
+            [pscustomobject]@{
+                IsLaptop = [bool]$isLaptop
+                IsDesktop = [bool]$isDesktop
+                IsServer = [bool]$isServer
+                HasBattery = [bool]($null -ne $battery)
                 Manufacturer = $computerSystem.Manufacturer
                 Model = $computerSystem.Model
+                PCSystemType = $computerSystem.PCSystemType
+                ChassisTypes = ($chassisTypes -join ',')
             }
-            
-            if ($systemEnclosure) {
-                $hardwareInfo.ChassisTypes = $systemEnclosure.ChassisTypes
-                
-                $laptopChassisTypes = @(8, 9, 10, 11, 12, 14, 18, 21, 30, 31, 32)
-                $desktopChassisTypes = @(3, 4, 5, 6, 7, 15, 16)
-                $serverChassisTypes = @(17, 23)
-                
-                if ($systemEnclosure.ChassisTypes | Where-Object { $_ -in $laptopChassisTypes }) {
-                    $hardwareInfo.IsLaptop = $true
-                } elseif ($systemEnclosure.ChassisTypes | Where-Object { $_ -in $desktopChassisTypes }) {
-                    $hardwareInfo.IsDesktop = $true
-                } elseif ($systemEnclosure.ChassisTypes | Where-Object { $_ -in $serverChassisTypes }) {
-                    $hardwareInfo.IsServer = $true
-                } else {
-                    $hardwareInfo.IsWorkstation = $true
-                }
-            }
-            
-            if (-not ($hardwareInfo.IsLaptop -or $hardwareInfo.IsDesktop -or $hardwareInfo.IsServer)) {
-                switch ($computerSystem.PCSystemType) {
-                    1 { $hardwareInfo.IsDesktop = $true }
-                    2 { $hardwareInfo.IsLaptop = $true }
-                    3 { $hardwareInfo.IsWorkstation = $true }
-                    4 { $hardwareInfo.IsServer = $true }
-                    default { $hardwareInfo.IsDesktop = $true }
-                }
-            }
-            
-            if ($hardwareInfo.HasBattery -and -not $hardwareInfo.IsServer) {
-                $hardwareInfo.IsLaptop = $true
-                $hardwareInfo.IsDesktop = $false
-            }
-            
-            return $hardwareInfo
-            
-        } catch {
-            Write-LogEntry "Hardware detection failed: $_" 'WARNING'
-            return @{
-                IsLaptop = $false
-                IsDesktop = $true
-                Error = $_.Exception.Message
-            }
+        }
+        catch {
+            Write-PowerLog "Hardware detection failed, defaulting to desktop profile. Error: $($_.Exception.Message)" 'WARN'
+            [pscustomobject]@{ IsLaptop = $false; IsDesktop = $true; IsServer = $false; HasBattery = $false; Manufacturer = 'Unknown'; Model = 'Unknown'; PCSystemType = 'Unknown'; ChassisTypes = 'Unknown' }
         }
     }
 
-    function Get-PowerSchemes {
-        try {
-            $schemes = @{}
-            $output = powercfg.exe /list 2>$null
-            if ($LASTEXITCODE -eq 0 -and $output) {
-                foreach ($line in $output) {
-                    if ($line -match 'Power Scheme GUID: ([a-f0-9-]+)\s+\((.+?)\)(\s+\*)?') {
-                        $guid = $matches[1]
-                        $name = $matches[2].Trim()
-                        $isActive = $matches[3] -eq ' *'
-                        
-                        $schemes[$name] = @{
-                            GUID = $guid
-                            Name = $name
-                            IsActive = $isActive
-                        }
-                    }
-                }
-            }
-            
-            $commonSchemes = @{
-                'High Performance' = 'SCHEME_MIN'
-                'Balanced' = 'SCHEME_BALANCED'
-                'Power Saver' = 'SCHEME_MAX'
-                'Ultimate Performance' = '8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c'
-            }
-            
-            foreach ($scheme in $commonSchemes.GetEnumerator()) {
-                if (-not $schemes.ContainsKey($scheme.Key)) {
-                    $schemes[$scheme.Key] = @{
-                        GUID = $scheme.Value
-                        Name = $scheme.Key
-                        IsActive = $false
-                    }
-                }
-            }
-            
-            return $schemes
-            
-        } catch {
-            Write-LogEntry "Failed to get power schemes: $_" 'WARNING'
-            return @{}
-        }
-    }
-
-    function Backup-PowerSettings {
-        try {
-            $backupData = @{
-                CurrentScheme = (powercfg.exe /getactivescheme 2>$null)
-                HibernationStatus = (powercfg.exe /query SCHEME_CURRENT SUB_SLEEP HIBERNATEIDLE 2>$null)
-                MonitorTimeoutAC = (powercfg.exe /query SCHEME_CURRENT SUB_VIDEO VIDEOIDLE /AC 2>$null)
-                MonitorTimeoutDC = (powercfg.exe /query SCHEME_CURRENT SUB_VIDEO VIDEOIDLE /DC 2>$null)
-                SleepTimeoutAC = (powercfg.exe /query SCHEME_CURRENT SUB_SLEEP STANDBYIDLE /AC 2>$null)
-                SleepTimeoutDC = (powercfg.exe /query SCHEME_CURRENT SUB_SLEEP STANDBYIDLE /DC 2>$null)
-                DiskTimeoutAC = (powercfg.exe /query SCHEME_CURRENT SUB_DISK DISKIDLE /AC 2>$null)
-                DiskTimeoutDC = (powercfg.exe /query SCHEME_CURRENT SUB_DISK DISKIDLE /DC 2>$null)
-                Timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-            }
-            
-            $backupFile = "$env:TEMP\PowerSettingsBackup_$(Get-Date -Format 'yyyyMMdd_HHmmss').json"
-            $backupData | ConvertTo-Json -Depth 3 | Out-File -FilePath $backupFile -Encoding UTF8
-            Write-LogEntry "[OK] Power settings backup saved to: $backupFile" 'INFO'
-            return $backupFile
-            
-        } catch {
-            Write-LogEntry "[WARN] Failed to backup power settings: $_" 'WARNING'
-            return $null
-        }
-    }
-
-    function Set-PowerConfiguration {
+    function Get-PowerSchemeGuid {
         param(
-            [string]$SchemeName,
-            [string]$SchemeGUID,
-            [int]$MonitorTimeout,
-            [int]$DiskTimeout,
-            [int]$SleepTimeout
+            [ValidateSet('Balanced','High performance','Power saver','Ultimate Performance')]
+            [string]$PreferredScheme
         )
-        
-        $configResults = @()
-        $monitorSeconds = $MonitorTimeout * 60
 
-        function Invoke-HardPowerEnforcement {
-            param(
-                [string]$ActiveSchemeGUID,
-                [int]$DisplayMinutes,
-                [int]$SleepMinutes
-            )
-
-            $displaySeconds = $DisplayMinutes * 60
-            Invoke-PowerCfg -Arguments @('/setactive', $ActiveSchemeGUID) -Description 'Ensure target power scheme is active before hard enforcement' | Out-Null
-            Invoke-PowerCfg -Arguments @('/change', 'monitor-timeout-ac', $DisplayMinutes) -Description 'Hard enforce AC monitor timeout' | Out-Null
-            Invoke-PowerCfg -Arguments @('/change', 'monitor-timeout-dc', $DisplayMinutes) -Description 'Hard enforce DC monitor timeout' | Out-Null
-            Invoke-PowerCfg -Arguments @('/change', 'standby-timeout-ac', $SleepMinutes) -Description 'Hard enforce AC sleep timeout' | Out-Null
-            Invoke-PowerCfg -Arguments @('/change', 'standby-timeout-dc', $SleepMinutes) -Description 'Hard enforce DC sleep timeout' | Out-Null
-            Invoke-PowerCfg -Arguments @('/setacvalueindex', $ActiveSchemeGUID, 'SUB_VIDEO', 'VIDEOIDLE', $displaySeconds) -Description 'Hard enforce AC display idle timeout index' | Out-Null
-            Invoke-PowerCfg -Arguments @('/setdcvalueindex', $ActiveSchemeGUID, 'SUB_VIDEO', 'VIDEOIDLE', $displaySeconds) -Description 'Hard enforce DC display idle timeout index' | Out-Null
-            Invoke-PowerCfg -Arguments @('/setacvalueindex', $ActiveSchemeGUID, 'SUB_SLEEP', 'STANDBYIDLE', $SleepMinutes) -Description 'Hard enforce AC sleep idle timeout index' | Out-Null
-            Invoke-PowerCfg -Arguments @('/setdcvalueindex', $ActiveSchemeGUID, 'SUB_SLEEP', 'STANDBYIDLE', $SleepMinutes) -Description 'Hard enforce DC sleep idle timeout index' | Out-Null
-            Invoke-PowerCfg -Arguments @('/hibernate', 'off') -Description 'Hard enforce hibernation off' | Out-Null
-            Invoke-PowerCfg -Arguments @('/S', $ActiveSchemeGUID) -Description 'Commit hard-enforced power settings' | Out-Null
+        $aliases = @{
+            'Balanced' = 'SCHEME_BALANCED'
+            'High performance' = 'SCHEME_MIN'
+            'Power saver' = 'SCHEME_MAX'
+            'Ultimate Performance' = 'e9a42b02-d5df-448d-aa00-03f14749eb61'
         }
 
+        if ($PreferredScheme -eq 'Ultimate Performance') {
+            Invoke-PowerCfgSafe -Arguments @('/duplicatescheme', $aliases[$PreferredScheme]) -Description 'Ensure Ultimate Performance scheme exists' -ContinueOnError | Out-Null
+        }
+
+        $list = powercfg.exe /list 2>$null
+        foreach ($line in $list) {
+            if ($line -match 'Power Scheme GUID:\s*([a-fA-F0-9-]+)\s*\((.+?)\)') {
+                $guid = $matches[1]
+                $name = $matches[2]
+                if ($name -ieq $PreferredScheme) { return $guid }
+            }
+        }
+
+        if ($aliases.ContainsKey($PreferredScheme)) { return $aliases[$PreferredScheme] }
+        return 'SCHEME_BALANCED'
+    }
+
+    function Backup-PowerConfiguration {
         try {
-            Write-LogEntry "Setting power scheme to: $SchemeName" 'INFO'
-            if ($PSCmdlet.ShouldProcess($SchemeName, "Set active power scheme")) {
-                Invoke-PowerCfg -Arguments @('/setactive', $SchemeGUID) -Description "Set power scheme to $SchemeName" | Out-Null
-                $configResults += Add-Result -Setting 'Power Scheme' -Value $SchemeName
-                Write-LogEntry "[OK] Power scheme set to: $SchemeName" 'SUCCESS'
+            $backup = [ordered]@{
+                Timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+                ActiveScheme = (powercfg.exe /getactivescheme 2>$null | Out-String).Trim()
+                AvailableSchemes = (powercfg.exe /list 2>$null | Out-String).Trim()
             }
-        } catch {
-            $configResults += Add-Result -Setting 'Power Scheme' -Value $SchemeName -Success $false -Error $_.Exception.Message
-            Write-LogEntry "[X] Failed to set power scheme: $_" 'ERROR'
+            $backupFile = "C:\Logs\PowerSettingsBackup_$(Get-Date -Format 'yyyyMMdd_HHmmss').json"
+            $backup | ConvertTo-Json -Depth 4 | Out-File -LiteralPath $backupFile -Encoding UTF8 -Force
+            Write-PowerLog "Power settings backup saved to: $backupFile" 'OK'
         }
+        catch {
+            Write-PowerLog "Failed to save power settings backup: $($_.Exception.Message)" 'WARN'
+        }
+    }
 
-        try {
-            Write-LogEntry "Setting monitor timeout to: $MonitorTimeout minutes" 'INFO'
-            if ($PSCmdlet.ShouldProcess('Monitor Timeout', "Set to $MonitorTimeout minutes")) {
-                Invoke-PowerCfg -Arguments @('/change', 'monitor-timeout-ac', $MonitorTimeout) -Description 'Set AC monitor timeout' | Out-Null
-                Invoke-PowerCfg -Arguments @('/change', 'monitor-timeout-dc', $MonitorTimeout) -Description 'Set DC monitor timeout' | Out-Null
-                Invoke-PowerCfg -Arguments @('/setacvalueindex', $SchemeGUID, 'SUB_VIDEO', 'VIDEOIDLE', $monitorSeconds) -Description 'Force AC display idle timeout' | Out-Null
-                Invoke-PowerCfg -Arguments @('/setdcvalueindex', $SchemeGUID, 'SUB_VIDEO', 'VIDEOIDLE', $monitorSeconds) -Description 'Force DC display idle timeout' | Out-Null
-                $configResults += Add-Result -Setting 'Monitor Timeout' -Value "$MonitorTimeout minutes"
-                Write-LogEntry "[OK] Monitor timeout set to: $MonitorTimeout minutes" 'SUCCESS'
-            }
-        } catch {
-            $configResults += Add-Result -Setting 'Monitor Timeout' -Value "$MonitorTimeout minutes" -Success $false -Error $_.Exception.Message
-            Write-LogEntry "[X] Failed to set monitor timeout: $_" 'ERROR'
-        }
+    function Set-PolicyPowerSetting {
+        param(
+            [Parameter(Mandatory)][string]$SubGroupGuid,
+            [Parameter(Mandatory)][string]$SettingGuid,
+            [Nullable[int]]$ACValue,
+            [Nullable[int]]$DCValue,
+            [Parameter(Mandatory)][string]$Description
+        )
+        $policyPath = "HKLM:\SOFTWARE\Policies\Microsoft\Power\PowerSettings\$SubGroupGuid\$SettingGuid"
+        if ($null -ne $ACValue) { Set-RegistryDwordSafe -Path $policyPath -Name 'ACSettingIndex' -Value $ACValue.Value -Description "$Description AC" }
+        if ($null -ne $DCValue) { Set-RegistryDwordSafe -Path $policyPath -Name 'DCSettingIndex' -Value $DCValue.Value -Description "$Description DC" }
+    }
 
-        try {
-            $sleepLabel = if ($SleepTimeout -eq 0) { 'Never' } else { "$SleepTimeout minutes" }
-            Write-LogEntry "Setting sleep timeout to: $sleepLabel" 'INFO'
-            if ($PSCmdlet.ShouldProcess('Sleep Timeout', "Set to $sleepLabel")) {
-                Invoke-PowerCfg -Arguments @('/change', 'standby-timeout-ac', $SleepTimeout) -Description 'Set AC sleep timeout' | Out-Null
-                Invoke-PowerCfg -Arguments @('/change', 'standby-timeout-dc', $SleepTimeout) -Description 'Set DC sleep timeout' | Out-Null
-                Invoke-PowerCfg -Arguments @('/setacvalueindex', $SchemeGUID, 'SUB_SLEEP', 'STANDBYIDLE', $SleepTimeout) -Description 'Force AC sleep idle timeout' | Out-Null
-                Invoke-PowerCfg -Arguments @('/setdcvalueindex', $SchemeGUID, 'SUB_SLEEP', 'STANDBYIDLE', $SleepTimeout) -Description 'Force DC sleep idle timeout' | Out-Null
-                $configResults += Add-Result -Setting 'Sleep Timeout' -Value $sleepLabel
-                Write-LogEntry "[OK] Sleep timeout set to: $sleepLabel" 'SUCCESS'
-            }
-        } catch {
-            $sleepValue = if ($SleepTimeout -eq 0) { 'Never' } else { "$SleepTimeout minutes" }
-            $configResults += Add-Result -Setting 'Sleep Timeout' -Value $sleepValue -Success $false -Error $_.Exception.Message
-            Write-LogEntry "[X] Failed to set sleep timeout: $_" 'ERROR'
-        }
-        
-        if ($DiskTimeout -eq 0) {
-            try {
-                Write-LogEntry "Disabling disk timeout (never turn off)" 'INFO'
-                if ($PSCmdlet.ShouldProcess('Disk Timeout', 'Disable')) {
-                    Invoke-PowerCfg -Arguments @('/change', 'disk-timeout-ac', 0) -Description 'Disable AC disk timeout' | Out-Null
-                    Invoke-PowerCfg -Arguments @('/change', 'disk-timeout-dc', 0) -Description 'Disable DC disk timeout' | Out-Null
-                    $configResults += Add-Result -Setting 'Disk Timeout' -Value 'Disabled'
-                    Write-LogEntry "[OK] Disk timeout disabled" 'SUCCESS'
-                }
-            } catch {
-                $configResults += Add-Result -Setting 'Disk Timeout' -Value 'Disabled' -Success $false -Error $_.Exception.Message
-                Write-LogEntry "[X] Failed to disable disk timeout: $_" 'ERROR'
-            }
-        } else {
-            try {
-                Write-LogEntry "Setting disk timeout to: $DiskTimeout minutes" 'INFO'
-                if ($PSCmdlet.ShouldProcess('Disk Timeout', "Set to $DiskTimeout minutes")) {
-                    Invoke-PowerCfg -Arguments @('/change', 'disk-timeout-ac', $DiskTimeout) -Description 'Set AC disk timeout' | Out-Null
-                    Invoke-PowerCfg -Arguments @('/change', 'disk-timeout-dc', $DiskTimeout) -Description 'Set DC disk timeout' | Out-Null
-                    $configResults += Add-Result -Setting 'Disk Timeout' -Value "$DiskTimeout minutes"
-                    Write-LogEntry "[OK] Disk timeout set to: $DiskTimeout minutes" 'SUCCESS'
-                }
-            } catch {
-                $configResults += Add-Result -Setting 'Disk Timeout' -Value "$DiskTimeout minutes" -Success $false -Error $_.Exception.Message
-                Write-LogEntry "[X] Failed to set disk timeout: $_" 'ERROR'
-            }
-        }
+    function Set-PowerProfileValues {
+        param(
+            [Parameter(Mandatory)][string]$SchemeGuid,
+            [Parameter(Mandatory)][hashtable]$Profile,
+            [Parameter(Mandatory)][string]$ProfileName
+        )
 
-        try {
-            Write-LogEntry 'Disabling hibernation' 'INFO'
-            if ($PSCmdlet.ShouldProcess('Hibernation', 'Disable')) {
-                Invoke-PowerCfg -Arguments @('/hibernate', 'off') -Description 'Disable hibernation' | Out-Null
-                $configResults += Add-Result -Setting 'Hibernation' -Value 'Disabled'
-                Write-LogEntry '[OK] Hibernation disabled' 'SUCCESS'
-            }
-        } catch {
-            $configResults += Add-Result -Setting 'Hibernation' -Value 'Disabled' -Success $false -Error $_.Exception.Message
-            Write-LogEntry "[X] Failed to disable hibernation: $_" 'ERROR'
-        }
+        $subVideo = '7516b95f-f776-4464-8c53-06167f40cc99'
+        $videoIdle = '3c0bc021-c8a8-4e07-a973-6b14cbcb2b7e'
+        $subSleep = '238c9fa8-0aad-41ed-83f4-97be242c8f20'
+        $standbyIdle = '29f6c1db-86da-48c5-9fdb-f2b67b1f44da'
+        $hibernateIdle = '9d7815a6-7ee4-497e-8888-515a05f02364'
+        $subDisk = '0012ee47-9041-4b5d-9b77-535fba8b1442'
+        $diskIdle = '6738e2c4-e8a5-4a42-b16a-e040e769756e'
+        $subProcessor = '54533251-82be-4824-96c1-47b60b740d00'
+        $procMin = '893dee8e-2bef-41e0-89c6-b55d0929964c'
+        $procMax = 'bc5038f7-23e0-4960-96da-33abaf5935ec'
 
-        try {
-            Write-LogEntry 'Applying final hard enforcement pass to prevent old timeout values from being restored' 'INFO'
-            if ($PSCmdlet.ShouldProcess($SchemeName, 'Hard enforce desktop power values')) {
-                Invoke-HardPowerEnforcement -ActiveSchemeGUID $SchemeGUID -DisplayMinutes $MonitorTimeout -SleepMinutes $SleepTimeout
-                $configResults += Add-Result -Setting 'Hard Enforcement Pass' -Value 'Completed'
-                Write-LogEntry '[OK] Final hard enforcement pass completed' 'SUCCESS'
-            }
-        } catch {
-            $configResults += Add-Result -Setting 'Hard Enforcement Pass' -Value 'Completed' -Success $false -Error $_.Exception.Message
-            Write-LogEntry "[X] Failed final hard enforcement pass: $_" 'ERROR'
-        }
+        Write-PowerLog "Applying $ProfileName profile values to scheme $SchemeGuid" 'INFO'
 
-        try {
-            Write-LogEntry 'Reapplying active power scheme to commit all values' 'INFO'
-            if ($PSCmdlet.ShouldProcess($SchemeName, 'Reapply active power scheme')) {
-                Invoke-PowerCfg -Arguments @('/S', $SchemeGUID) -Description 'Reapply active power scheme' | Out-Null
-                $configResults += Add-Result -Setting 'Scheme Reapply' -Value 'Completed'
-                Write-LogEntry '[OK] Active power scheme reapplied' 'SUCCESS'
-            }
-        } catch {
-            $configResults += Add-Result -Setting 'Scheme Reapply' -Value 'Completed' -Success $false -Error $_.Exception.Message
-            Write-LogEntry "[X] Failed to reapply active power scheme: $_" 'ERROR'
-        }
-        
-        return $configResults
+        Invoke-PowerCfgSafe -Arguments @('/setacvalueindex', $SchemeGuid, $subVideo, $videoIdle, [string]$Profile.DisplayACSeconds) -Description "$ProfileName display timeout on AC" -ContinueOnError | Out-Null
+        Invoke-PowerCfgSafe -Arguments @('/setdcvalueindex', $SchemeGuid, $subVideo, $videoIdle, [string]$Profile.DisplayDCSeconds) -Description "$ProfileName display timeout on battery" -ContinueOnError | Out-Null
+        Invoke-PowerCfgSafe -Arguments @('/setacvalueindex', $SchemeGuid, $subSleep, $standbyIdle, [string]$Profile.SleepACSeconds) -Description "$ProfileName sleep timeout on AC" -ContinueOnError | Out-Null
+        Invoke-PowerCfgSafe -Arguments @('/setdcvalueindex', $SchemeGuid, $subSleep, $standbyIdle, [string]$Profile.SleepDCSeconds) -Description "$ProfileName sleep timeout on battery" -ContinueOnError | Out-Null
+        Invoke-PowerCfgSafe -Arguments @('/setacvalueindex', $SchemeGuid, $subSleep, $hibernateIdle, [string]$Profile.HibernateACSeconds) -Description "$ProfileName hibernate timeout on AC" -ContinueOnError | Out-Null
+        Invoke-PowerCfgSafe -Arguments @('/setdcvalueindex', $SchemeGuid, $subSleep, $hibernateIdle, [string]$Profile.HibernateDCSeconds) -Description "$ProfileName hibernate timeout on battery" -ContinueOnError | Out-Null
+        Invoke-PowerCfgSafe -Arguments @('/setacvalueindex', $SchemeGuid, $subDisk, $diskIdle, [string]$Profile.DiskACSeconds) -Description "$ProfileName disk timeout on AC" -ContinueOnError | Out-Null
+        Invoke-PowerCfgSafe -Arguments @('/setdcvalueindex', $SchemeGuid, $subDisk, $diskIdle, [string]$Profile.DiskDCSeconds) -Description "$ProfileName disk timeout on battery" -ContinueOnError | Out-Null
+        Invoke-PowerCfgSafe -Arguments @('/setacvalueindex', $SchemeGuid, $subProcessor, $procMin, [string]$Profile.ProcessorMinAC) -Description "$ProfileName processor minimum on AC" -ContinueOnError | Out-Null
+        Invoke-PowerCfgSafe -Arguments @('/setdcvalueindex', $SchemeGuid, $subProcessor, $procMin, [string]$Profile.ProcessorMinDC) -Description "$ProfileName processor minimum on battery" -ContinueOnError | Out-Null
+        Invoke-PowerCfgSafe -Arguments @('/setacvalueindex', $SchemeGuid, $subProcessor, $procMax, [string]$Profile.ProcessorMaxAC) -Description "$ProfileName processor maximum on AC" -ContinueOnError | Out-Null
+        Invoke-PowerCfgSafe -Arguments @('/setdcvalueindex', $SchemeGuid, $subProcessor, $procMax, [string]$Profile.ProcessorMaxDC) -Description "$ProfileName processor maximum on battery" -ContinueOnError | Out-Null
+
+        Set-PolicyPowerSetting -SubGroupGuid $subVideo -SettingGuid $videoIdle -ACValue $Profile.DisplayACSeconds -DCValue $Profile.DisplayDCSeconds -Description "$ProfileName policy display timeout seconds"
+        Set-PolicyPowerSetting -SubGroupGuid $subSleep -SettingGuid $standbyIdle -ACValue $Profile.SleepACSeconds -DCValue $Profile.SleepDCSeconds -Description "$ProfileName policy sleep timeout seconds"
+        Set-PolicyPowerSetting -SubGroupGuid $subSleep -SettingGuid $hibernateIdle -ACValue $Profile.HibernateACSeconds -DCValue $Profile.HibernateDCSeconds -Description "$ProfileName policy hibernate timeout seconds"
+        Set-PolicyPowerSetting -SubGroupGuid $subDisk -SettingGuid $diskIdle -ACValue $Profile.DiskACSeconds -DCValue $Profile.DiskDCSeconds -Description "$ProfileName policy disk timeout seconds"
+        Set-PolicyPowerSetting -SubGroupGuid $subProcessor -SettingGuid $procMin -ACValue $Profile.ProcessorMinAC -DCValue $Profile.ProcessorMinDC -Description "$ProfileName policy processor minimum percent"
+        Set-PolicyPowerSetting -SubGroupGuid $subProcessor -SettingGuid $procMax -ACValue $Profile.ProcessorMaxAC -DCValue $Profile.ProcessorMaxDC -Description "$ProfileName policy processor maximum percent"
     }
 
     try {
-        Write-LogEntry '=== Desktop Power Settings Configuration Started ===' 'INFO'
-        Write-LogEntry "Power Plan: $PowerPlan" 'INFO'
-        Write-LogEntry "Monitor Timeout: $MonitorTimeoutMinutes minutes" 'INFO'
-        Write-LogEntry "Sleep Timeout: $(if($SleepTimeoutMinutes -eq 0){'Never'}else{"$SleepTimeoutMinutes minutes"})" 'INFO'
-        Write-LogEntry "Disk Timeout: $(if($DiskTimeoutMinutes -eq 0){'Disabled'}else{"$DiskTimeoutMinutes minutes"})" 'INFO'
-        
-        if ($WhatIfPreference) {
-            Write-LogEntry 'WhatIf mode - no power settings will be changed' 'INFO'
+        Write-PowerLog '=== Option 7 Power Settings Configuration Started ===' 'INFO'
+        Backup-PowerConfiguration
+
+        $hardware = Get-SystemHardwareType
+        Write-PowerLog "Detected Manufacturer: $($hardware.Manufacturer)" 'HARDWARE'
+        Write-PowerLog "Detected Model       : $($hardware.Model)" 'HARDWARE'
+        Write-PowerLog "Detected Chassis     : $($hardware.ChassisTypes)" 'HARDWARE'
+        Write-PowerLog "Battery Present      : $($hardware.HasBattery)" 'HARDWARE'
+
+        $desktopProfile = @{
+            DisplayACSeconds = 3600; DisplayDCSeconds = 3600
+            SleepACSeconds = 0; SleepDCSeconds = 0
+            HibernateACSeconds = 0; HibernateDCSeconds = 0
+            DiskACSeconds = 0; DiskDCSeconds = 0
+            ProcessorMinAC = 100; ProcessorMinDC = 100
+            ProcessorMaxAC = 100; ProcessorMaxDC = 100
         }
 
-        if (-not $SkipHardwareDetection) {
-            Write-LogEntry "`n[SCAN] Detecting system hardware type..." 'HARDWARE'
-            $hardwareInfo = Get-SystemHardwareType
-            
-            Write-LogEntry 'Hardware Analysis:' 'HARDWARE'
-            Write-LogEntry "  - System Type: $(if($hardwareInfo.IsLaptop){'Laptop'}elseif($hardwareInfo.IsDesktop){'Desktop'}elseif($hardwareInfo.IsServer){'Server'}else{'Workstation'})" 'HARDWARE'
-            Write-LogEntry "  - Has Battery: $($hardwareInfo.HasBattery)" 'HARDWARE'
-            Write-LogEntry "  - Manufacturer: $($hardwareInfo.Manufacturer)" 'HARDWARE'
-            Write-LogEntry "  - Model: $($hardwareInfo.Model)" 'HARDWARE'
-            Write-LogEntry "  - Memory: $($hardwareInfo.TotalPhysicalMemory) GB" 'HARDWARE'
-            
-            if ($hardwareInfo.IsLaptop -and -not $AllowLaptops -and -not $Force) {
-                Write-Host "`n" + "="*60 -ForegroundColor Red
-                Write-Host 'LAPTOP DETECTED - OPERATION BLOCKED' -ForegroundColor Red -BackgroundColor Black
-                Write-Host "="*60 -ForegroundColor Red
-                Write-Host 'This system appears to be a LAPTOP with battery power.' -ForegroundColor Yellow
-                Write-Host 'Desktop power settings may negatively impact battery life!' -ForegroundColor Yellow
-                Write-Host "`nTo proceed anyway, use one of these options:" -ForegroundColor Cyan
-                Write-Host '  - Use -AllowLaptops parameter' -ForegroundColor Cyan
-                Write-Host '  - Use -Force parameter' -ForegroundColor Cyan
-                Write-Host '  - Use -SkipHardwareDetection parameter' -ForegroundColor Cyan
-                Write-Host "="*60 -ForegroundColor Red
-                
-                $global:LastStatus = '[WARN] Operation blocked - laptop detected.'
-                return
-            }
-            
-            if ($hardwareInfo.IsLaptop -and ($AllowLaptops -or $Force)) {
-                Write-LogEntry '[WARN] Proceeding with laptop configuration (overridden)' 'WARNING'
-            }
+        $laptopProfile = @{
+            # Conservative battery behavior, higher performance while charging.
+            DisplayACSeconds = 3600; DisplayDCSeconds = 600
+            SleepACSeconds = 0; SleepDCSeconds = 1200
+            HibernateACSeconds = 0; HibernateDCSeconds = 3600
+            DiskACSeconds = 0; DiskDCSeconds = 600
+            ProcessorMinAC = 50; ProcessorMinDC = 5
+            ProcessorMaxAC = 100; ProcessorMaxDC = 70
+        }
+
+        if ($hardware.IsLaptop) {
+            $targetPlan = 'Balanced'
+            $profile = $laptopProfile
+            $profileName = 'Laptop AC-performance / DC-conservative'
+            Write-PowerLog 'Laptop detected. Applying battery-conservative DC settings and higher-performance AC settings.' 'INFO'
+        }
+        else {
+            $targetPlan = 'High performance'
+            $profile = $desktopProfile
+            $profileName = 'Desktop high-performance'
+            Write-PowerLog 'Desktop/workstation detected. Applying high-performance desktop settings.' 'INFO'
         }
 
         if (-not $Force -and -not $WhatIfPreference) {
-            Write-Host "`n" + "="*60 -ForegroundColor Yellow
-            Write-Host 'POWER SETTINGS CONFIGURATION' -ForegroundColor Yellow -BackgroundColor Black
-            Write-Host "="*60 -ForegroundColor Yellow
-            Write-Host 'This will configure the following settings:' -ForegroundColor White
-            Write-Host "  - Power Plan: $PowerPlan" -ForegroundColor Cyan
-            Write-Host "  - Monitor Timeout: $MonitorTimeoutMinutes minutes" -ForegroundColor Cyan
-            Write-Host "  - Sleep Timeout: $(if($SleepTimeoutMinutes -eq 0){'Never'}else{"$SleepTimeoutMinutes minutes"})" -ForegroundColor Cyan
-            Write-Host "  - Disk Timeout: $(if($DiskTimeoutMinutes -eq 0){'Disabled'}else{"$DiskTimeoutMinutes minutes"})" -ForegroundColor Cyan
-            Write-Host '  - Hibernation: Disabled' -ForegroundColor Cyan
-            Write-Host "`nNote: These settings optimize for desktop performance" -ForegroundColor Yellow
-            Write-Host "="*60 -ForegroundColor Yellow
-            
-            $confirmation = Read-Host "`n[?] Continue with power configuration? (Y/N)"
-            if ($confirmation -notin @('Y', 'y', 'Yes', 'yes')) {
-                Write-LogEntry 'Operation cancelled by user' 'WARNING'
-                $global:LastStatus = '[WARN] User cancelled power settings configuration.'
+            Write-Host "`nThis will apply and policy-enforce the following Option 7 profile:" -ForegroundColor Yellow
+            Write-Host "  Profile: $profileName" -ForegroundColor Cyan
+            Write-Host "  Power plan: $targetPlan" -ForegroundColor Cyan
+            Write-Host "  AC display timeout: $([int]($profile.DisplayACSeconds / 60)) minutes" -ForegroundColor Cyan
+            Write-Host "  Battery display timeout: $([int]($profile.DisplayDCSeconds / 60)) minutes" -ForegroundColor Cyan
+            Write-Host "  AC sleep timeout: $(if($profile.SleepACSeconds -eq 0){'Never'}else{"$([int]($profile.SleepACSeconds / 60)) minutes"})" -ForegroundColor Cyan
+            Write-Host "  Battery sleep timeout: $(if($profile.SleepDCSeconds -eq 0){'Never'}else{"$([int]($profile.SleepDCSeconds / 60)) minutes"})" -ForegroundColor Cyan
+            Write-Host "  Local policy registry enforcement: Enabled" -ForegroundColor Cyan
+            $confirm = Read-Host 'Continue? (Y/N)'
+            if ($confirm -notin @('Y','y','YES','Yes','yes')) {
+                Write-PowerLog 'Operation cancelled by user.' 'WARN'
+                $global:LastStatus = '[WARN] Option 7 power settings cancelled by user.'
                 return
             }
         }
 
-        Write-LogEntry "`n[SCAN] Scanning available power schemes..." 'INFO'
-        $powerSchemes = Get-PowerSchemes
-        
-        if ($powerSchemes.Count -eq 0) {
-            throw 'No power schemes detected on this system'
-        }
-        
-        Write-LogEntry 'Available power schemes:' 'INFO'
-        foreach ($scheme in $powerSchemes.GetEnumerator()) {
-            $activeIndicator = if ($scheme.Value.IsActive) { ' (ACTIVE)' } else { '' }
-            Write-LogEntry "  - $($scheme.Key)$activeIndicator" 'INFO'
-        }
-        
-        if (-not $powerSchemes.ContainsKey($PowerPlan)) {
-            Write-LogEntry "[WARN] Requested power plan '$PowerPlan' not found" 'WARNING'
-            Write-LogEntry "Falling back to 'High Performance' scheme" 'WARNING'
-            $PowerPlan = 'High Performance'
-            
-            if (-not $powerSchemes.ContainsKey($PowerPlan)) {
-                throw 'Neither requested scheme nor High Performance scheme available'
-            }
-        }
-        
-        $selectedScheme = $powerSchemes[$PowerPlan]
-        Write-LogEntry "Selected scheme: $PowerPlan (GUID: $($selectedScheme.GUID))" 'INFO'
+        $schemeGuid = Get-PowerSchemeGuid -PreferredScheme $targetPlan
+        Write-PowerLog "Using power scheme: $targetPlan ($schemeGuid)" 'INFO'
 
-        if (-not $WhatIfPreference) {
-            Write-LogEntry "`n[SAVE] Backing up current power settings..." 'INFO'
-            $backupFile = Backup-PowerSettings
+        if ($PSCmdlet.ShouldProcess($env:COMPUTERNAME, "Apply $profileName power profile")) {
+            Set-PowerProfileValues -SchemeGuid $schemeGuid -Profile $profile -ProfileName $profileName
+            Invoke-PowerCfgSafe -Arguments @('/setactive', $schemeGuid) -Description "Set active power plan to $targetPlan" -ContinueOnError | Out-Null
+            Invoke-PowerCfgSafe -Arguments @('/S', $schemeGuid) -Description 'Reapply active scheme to commit values' -ContinueOnError | Out-Null
+
+            # Local Group Policy-style power setting values were written under HKLM:\SOFTWARE\Policies\Microsoft\Power\PowerSettings.
+
+            # Refresh policy and power subsystem where available.
+            gpupdate.exe /target:computer /force | Out-Null
+            Write-PowerLog 'Computer policy refresh requested with gpupdate.' 'OK'
         }
 
-        if ($WhatIfPreference) {
-            Write-LogEntry "`nWhatIf Summary:" 'INFO'
-            Write-LogEntry "  - Would set power scheme to: $PowerPlan" 'INFO'
-            Write-LogEntry "  - Would set monitor timeout to: $MonitorTimeoutMinutes minutes" 'INFO'
-            Write-LogEntry "  - Would set sleep timeout to: $(if($SleepTimeoutMinutes -eq 0){'Never'}else{"$SleepTimeoutMinutes minutes"})" 'INFO'
-            Write-LogEntry "  - Would set disk timeout to: $(if($DiskTimeoutMinutes -eq 0){'Disabled'}else{"$DiskTimeoutMinutes minutes"})" 'INFO'
-            Write-LogEntry '  - Would disable hibernation' 'INFO'
-            $global:LastStatus = '[INFO] WhatIf completed - power settings would be configured.'
-            return
+        Write-PowerLog 'Verifying active power scheme...' 'INFO'
+        $activeScheme = (powercfg.exe /getactivescheme 2>$null | Out-String).Trim()
+        Write-PowerLog "Active scheme after configuration: $activeScheme" 'OK'
+
+        $successCount = ($script:Option7Results | Where-Object { $_.Success }).Count
+        $failureCount = ($script:Option7Results | Where-Object { -not $_.Success }).Count
+        if ($failureCount -eq 0) {
+            $global:LastStatus = "[OK] Option 7 power settings applied successfully using profile: $profileName."
         }
-
-        Write-LogEntry "`n[FAST] Applying power configuration..." 'INFO'
-        $configResults = Set-PowerConfiguration -SchemeName $PowerPlan -SchemeGUID $selectedScheme.GUID -MonitorTimeout $MonitorTimeoutMinutes -DiskTimeout $DiskTimeoutMinutes -SleepTimeout $SleepTimeoutMinutes
-        
-        $successCount = ($configResults | Where-Object { $_.Success }).Count
-        $failureCount = ($configResults | Where-Object { -not $_.Success }).Count
-        
-        $script:appliedSettings = $configResults | Where-Object { $_.Success }
-        $script:failedSettings = $configResults | Where-Object { -not $_.Success }
-
-        Write-LogEntry "`n[SCAN] Verifying power configuration..." 'INFO'
-        try {
-            $currentScheme = powercfg.exe /getactivescheme 2>$null
-            if ($currentScheme -and $currentScheme -match [regex]::Escape($selectedScheme.GUID)) {
-                Write-LogEntry '[OK] Power scheme verification passed' 'SUCCESS'
-            } else {
-                Write-LogEntry '[WARN] Power scheme verification failed' 'WARNING'
-            }
-
-            $verifyDisplayAC = powercfg.exe /query $selectedScheme.GUID SUB_VIDEO VIDEOIDLE /AC 2>$null
-            $verifySleepAC = powercfg.exe /query $selectedScheme.GUID SUB_SLEEP STANDBYIDLE /AC 2>$null
-
-            if ($verifyDisplayAC -match 'Current AC Power Setting Index:\s*0x([0-9a-fA-F]+)') {
-                $displaySeconds = [Convert]::ToInt32($matches[1], 16)
-                Write-LogEntry "[OK] Verified AC display timeout: $([int]($displaySeconds / 60)) minutes" 'SUCCESS'
-            }
-
-            if ($verifySleepAC -match 'Current AC Power Setting Index:\s*0x([0-9a-fA-F]+)') {
-                $sleepValue = [Convert]::ToInt32($matches[1], 16)
-                $sleepDisplay = if ($sleepValue -eq 0) { 'Never' } else { "$sleepValue minutes" }
-                Write-LogEntry "[OK] Verified AC sleep timeout: $sleepDisplay" 'SUCCESS'
-            }
-        } catch {
-            Write-LogEntry "[WARN] Could not fully verify power settings: $_" 'WARNING'
+        else {
+            $global:LastStatus = "[WARN] Option 7 completed with $failureCount failed setting(s). Review $LogPath."
         }
-
-    } catch {
-        Write-LogEntry "Critical error during power settings configuration: $_" 'ERROR'
-        $global:LastStatus = "[ERROR] Power settings configuration failed: $_"
-        throw
-    } finally {
+    }
+    catch {
+        Write-PowerLog "Critical error during Option 7 power configuration: $($_.Exception.Message)" 'ERROR'
+        $global:LastStatus = "[ERROR] Option 7 power settings failed: $($_.Exception.Message)"
+    }
+    finally {
         $stopwatch.Stop()
-        $duration = $stopwatch.Elapsed.TotalSeconds
-        
-        Write-LogEntry "`n[SUMMARY] Configuration Summary:" 'INFO'
-        Write-LogEntry "Duration: $([math]::Round($duration, 2)) seconds" 'INFO'
-        Write-LogEntry "Settings applied: $($appliedSettings.Count)" 'SUCCESS'
-        Write-LogEntry "Settings failed: $($failedSettings.Count)" 'ERROR'
-        
-        if ($appliedSettings.Count -gt 0) {
-            Write-LogEntry "`n[OK] Successfully Applied:" 'SUCCESS'
-            foreach ($setting in $appliedSettings) {
-                Write-LogEntry "  - $($setting.Setting): $($setting.Value)" 'SUCCESS'
-            }
-        }
-        
-        if ($failedSettings.Count -gt 0) {
-            Write-LogEntry "`n[ERROR] Failed Settings:" 'ERROR'
-            foreach ($setting in $failedSettings) {
-                Write-LogEntry "  - $($setting.Setting): $($setting.Error)" 'ERROR'
-            }
-        }
-        
+        Write-PowerLog "Duration: $([math]::Round($stopwatch.Elapsed.TotalSeconds,2)) seconds" 'INFO'
+        Write-PowerLog '=== Option 7 Power Settings Configuration Completed ===' 'INFO'
         try {
-            $logEntries | Out-File -FilePath $LogPath -Encoding UTF8 -Force
-            Write-LogEntry "[NOTE] Detailed log saved to: $LogPath" 'INFO'
-        } catch {
-            Write-LogEntry "[WARN] Failed to save log file: $_" 'WARNING'
+            $script:Option7LogEntries | Out-File -LiteralPath $LogPath -Encoding UTF8 -Force
+            Write-Host "`nDetailed Option 7 log saved to: $LogPath" -ForegroundColor Cyan
         }
-        
-        if ($appliedSettings.Count -gt 0) {
-            if ($failedSettings.Count -eq 0) {
-                $global:LastStatus = '[OK] All power settings applied successfully.'
-            } else {
-                $global:LastStatus = "[WARN] Power settings partially applied ($($appliedSettings.Count) success, $($failedSettings.Count) failed)."
-            }
-        } else {
-            $global:LastStatus = '[ERROR] No power settings were applied.'
+        catch {
+            Write-Host "Failed to write Option 7 log: $($_.Exception.Message)" -ForegroundColor Yellow
         }
-        
-        Write-LogEntry '=== Power Settings Configuration Completed ===' 'INFO'
     }
 }
 
-# Utility function to get current power configuration
 function Get-PowerConfiguration {
     [CmdletBinding()]
     param()
-    
+
     try {
-        $config = @{}
-        
-        # Get active scheme
-        $activeScheme = powercfg.exe /getactivescheme 2>$null
-        if ($activeScheme) {
-            $config.ActiveScheme = $activeScheme.Trim()
+        [pscustomobject]@{
+            ActiveScheme = (powercfg.exe /getactivescheme 2>$null | Out-String).Trim()
+            AvailableSchemes = (powercfg.exe /list 2>$null | Out-String).Trim()
+            PolicyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Power\PowerSettings'
         }
-        
-        # Get hibernation status
-        $hibernation = powercfg.exe /availablesleepstates 2>$null
-        $config.HibernationAvailable = ($hibernation -match "Hibernate")
-        
-        # Get monitor and disk timeouts (simplified parsing)
-        $config.MonitorTimeoutAC = "Unknown"
-        $config.MonitorTimeoutDC = "Unknown"
-        $config.DiskTimeoutAC = "Unknown"
-        $config.DiskTimeoutDC = "Unknown"
-        
-        return $config
-        
-    } catch {
-        return @{
-            Error = $_.Exception.Message
-        }
+    }
+    catch {
+        [pscustomobject]@{ Error = $_.Exception.Message }
     }
 }
 
 # -----------------------------------------------------------------------------
-# Option 17 - Install Computer Lab Scheduled Tasks
+# Option 17 - Stage Lab Scripts and Run Register-Tasks Scripts
 # -----------------------------------------------------------------------------
 function Register-LabScheduledTasks {
-    [CmdletBinding(SupportsShouldProcess)]
+    [CmdletBinding()]
     param(
         [Parameter(Mandatory = $false)]
-        [string]$SourcePath = "\\filesvr\install\Scripts\Lab Update Scripts",
-        
+        [string]$SourcePath = "\\filesvr\Labscripts",
+
         [Parameter(Mandatory = $false)]
-        [string]$DestinationPath = "C:\Windows\Scripts",
-        
-        [Parameter(Mandatory = $false)]
-        [string]$AdminAccount = "MISAdmin",
-        
-        [switch]$Force
+        [string]$DestinationPath = "C:\Scripts"
     )
 
-    # Security: Require elevation
-    if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
-        throw "This function must be run as Administrator"
-    }
-
-    $ErrorActionPreference = 'Continue'
-    
-    # Simple logging
-    function Write-LogEntry {
-        param([string]$Message, [string]$Level = 'INFO')
-        
-        $timestamp = Get-Date -Format 'HH:mm:ss'
-        switch ($Level) {
-            'ERROR' { Write-Host "[$timestamp] ERROR: $Message" -ForegroundColor Red }
-            'WARNING' { Write-Host "[$timestamp] WARNING: $Message" -ForegroundColor Yellow }
-            'SUCCESS' { Write-Host "[$timestamp] SUCCESS: $Message" -ForegroundColor Green }
-            'INFO' { Write-Host "[$timestamp] INFO: $Message" -ForegroundColor Cyan }
-            default { Write-Host "[$timestamp] $Message" -ForegroundColor White }
-        }
-    }
-
-    # Get credentials - simplified
-    function Get-AdminCredentials {
-        param([string]$AccountName)
-        
-        Write-LogEntry "Getting credentials for $AccountName" 'INFO'
-        
-        $user = Get-LocalUser -Name $AccountName -ErrorAction Stop
-        if (-not $user.Enabled) {
-            throw "Account $AccountName is disabled"
-        }
-        
-        Write-Host "`nEnter password for ${AccountName}:" -ForegroundColor Yellow
-        $securePassword = Read-Host -AsSecureString
-        
-        return @{
-            UserName = $AccountName
-            Password = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto([System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($securePassword))
-        }
-    }
-
-    # Create scheduled task using PROVEN method with custom Sunday scheduling
-    function Create-ScheduledTaskProven {
+    function Write-Option17Log {
         param(
-            [string]$TaskName,
-            [string]$FilePath,
-            [string]$UserName,
-            [string]$Password
+            [Parameter(Mandatory)][string]$Message,
+            [ValidateSet('INFO','OK','WARN','ERROR')]
+            [string]$Level = 'INFO'
         )
-        
-        Write-LogEntry "Creating task: $TaskName" 'INFO'
-        Write-LogEntry "File: $FilePath" 'INFO'
-        Write-LogEntry "User: $UserName" 'INFO'
-        
-        # Determine schedule time based on file prefix
-        $fileName = Split-Path $FilePath -Leaf
-        $scheduleTime = "01:30"  # Default time
-        
-        if ($fileName -match '^(\d+)_') {
-            $fileNumber = [int]$matches[1]
-            $scheduleTime = switch ($fileNumber) {
-                1 { "01:30" }  # 01_Remove-UserProfiles.ps1
-                2 { "02:00" }  # 02_Weekend_Apps_Updates.ps1
-                3 { "02:45" }  # 03_Weekend_HP_Drivers_Updates.ps1
-                4 { "04:00" }  # 04_Weekend_Windows_Updates.ps1
-                5 { "08:00" }  # 05_SystemRepair.ps1
-                default { "01:30" }
-            }
+
+        $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+        $color = switch ($Level) {
+            'OK'    { 'Green' }
+            'WARN'  { 'Yellow' }
+            'ERROR' { 'Red' }
+            default { 'Cyan' }
         }
-        
-        Write-LogEntry "Scheduled for Sundays at: $scheduleTime" 'INFO'
-        
-        # Use the PROVEN command format from our testing
-        $taskCommand = switch ([System.IO.Path]::GetExtension($FilePath).ToLower()) {
-            '.ps1' { 
-                "powershell.exe -ExecutionPolicy Bypass -File `"$FilePath`""
-            }
-            '.bat' { 
-                "`"$FilePath`""
-            }
-            '.cmd' { 
-                "`"$FilePath`""
-            }
-            default { 
-                "`"$FilePath`""
-            }
-        }
-        
-        Write-LogEntry "Task command: $taskCommand" 'INFO'
-        
-        # Use batch file method - PROVEN to work, scheduled for Sundays
-        $batchFile = "$env:TEMP\create_task_$TaskName.bat"
-        $batchContent = @"
-@echo off
-echo Creating scheduled task: $TaskName
-echo Command: $taskCommand
-echo User: $UserName
-echo File: $FilePath
-echo Schedule: Sundays at $scheduleTime
-echo File exists check:
-if exist "$FilePath" (echo YES - File found) else (echo NO - File missing)
-echo.
-echo Running schtasks...
-schtasks.exe /Create /TN "$TaskName" /TR "$taskCommand" /SC WEEKLY /D SUN /ST $scheduleTime /RU "$UserName" /RP "$Password" /RL HIGHEST /F
-if %ERRORLEVEL% EQU 0 (
-    echo SUCCESS: Task created successfully - scheduled for Sundays at $scheduleTime
-) else (
-    echo FAILED: Task creation failed with exit code %ERRORLEVEL%
-)
-"@
-        
-        try {
-            # Create and run batch file
-            $batchContent | Out-File -FilePath $batchFile -Encoding ASCII
-            $output = cmd.exe /c "`"$batchFile`"" 2>&1
-            $exitCode = $LASTEXITCODE
-            
-            Write-LogEntry "Batch execution output:" 'INFO'
-            $output | ForEach-Object { 
-                if ($_ -match "SUCCESS") {
-                    Write-LogEntry "  $_" 'SUCCESS'
-                } elseif ($_ -match "FAILED|ERROR") {
-                    Write-LogEntry "  $_" 'ERROR'
-                } else {
-                    Write-LogEntry "  $_" 'INFO'
-                }
-            }
-            
-            # Clean up batch file
-            Remove-Item $batchFile -Force -ErrorAction SilentlyContinue
-            
-            return ($exitCode -eq 0)
-            
-        } catch {
-            Write-LogEntry "Exception creating task $TaskName`: $($_.Exception.Message)" 'ERROR'
-            Remove-Item $batchFile -Force -ErrorAction SilentlyContinue
-            return $false
-        }
+
+        Write-Host "[$timestamp] [$Level] $Message" -ForegroundColor $color
     }
 
-    # Main execution
+    Write-Option17Log 'Starting Option 17: Stage lab scripts and run Register-Tasks scripts.' 'INFO'
+
     try {
-        Write-LogEntry "=== FINAL WORKING VERSION ===" 'SUCCESS'
-        Write-LogEntry "Using PROVEN command format from testing!" 'SUCCESS'
-        
-        # Get credentials
-        $credInfo = Get-AdminCredentials -AccountName $AdminAccount
-        $userName = $credInfo.UserName
-        $password = $credInfo.Password
-        
-        Write-LogEntry "Using user: $userName" 'SUCCESS'
-        
-        # Copy files
-        Write-LogEntry "Copying files from $SourcePath to $DestinationPath" 'INFO'
-        
-        if (-not (Test-Path $DestinationPath)) {
-            New-Item -Path $DestinationPath -ItemType Directory -Force | Out-Null
+        if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+            throw 'Option 17 must be run from an elevated PowerShell session.'
         }
-        
-        $sourceFiles = Get-ChildItem -Path $SourcePath -Include @("*.bat", "*.cmd", "*.ps1") -Recurse
-        Write-LogEntry "Found $($sourceFiles.Count) executable files to copy" 'INFO'
-        
-        foreach ($file in $sourceFiles) {
-            $destFile = Join-Path $DestinationPath $file.Name
-            Copy-Item -Path $file.FullName -Destination $destFile -Force
-            Write-LogEntry "Copied: $($file.Name)" 'INFO'
+
+        Write-Option17Log "Ensuring destination folder exists: $DestinationPath" 'INFO'
+        if (-not (Test-Path -LiteralPath $DestinationPath)) {
+            New-Item -Path $DestinationPath -ItemType Directory -Force -ErrorAction Stop | Out-Null
+            Write-Option17Log "Created destination folder: $DestinationPath" 'OK'
         }
-        
-        # Register all tasks using PROVEN method
-        $copiedFiles = Get-ChildItem -Path $DestinationPath -Include @("*.bat", "*.cmd", "*.ps1") -Recurse
-        Write-LogEntry "Registering $($copiedFiles.Count) tasks using PROVEN method..." 'INFO'
-        
+        else {
+            Write-Option17Log "Destination folder already exists: $DestinationPath" 'OK'
+        }
+
+        Write-Option17Log "Verifying source path is reachable: $SourcePath" 'INFO'
+        if (-not (Test-Path -LiteralPath $SourcePath)) {
+            throw "Source path is not reachable: $SourcePath"
+        }
+
+        Write-Option17Log "Copying root-level *.ps1 files from $SourcePath to $DestinationPath using robocopy." 'INFO'
+
+        $robocopyArgs = @(
+            $SourcePath,
+            $DestinationPath,
+            '*.ps1',
+            '/COPY:DAT',
+            '/DCOPY:DAT',
+            '/R:2',
+            '/W:5',
+            '/NP',
+            '/NFL',
+            '/NDL'
+        )
+
+        $robocopyOutput = & robocopy.exe @robocopyArgs 2>&1
+        $robocopyExitCode = $LASTEXITCODE
+
+        if ($robocopyOutput) {
+            $robocopyOutput | ForEach-Object {
+                $line = [string]$_
+                if (-not [string]::IsNullOrWhiteSpace($line)) {
+                    Write-Option17Log "ROBOCOPY: $line" 'INFO'
+                }
+            }
+        }
+
+        if ($robocopyExitCode -ge 8) {
+            throw "Robocopy failed with exit code $robocopyExitCode."
+        }
+
+        Write-Option17Log "Robocopy completed successfully with exit code $robocopyExitCode." 'OK'
+
+        $registerScripts = Get-ChildItem -LiteralPath $DestinationPath -Filter 'Register-Tasks*.ps1' -File -ErrorAction Stop | Sort-Object Name
+
+        if (-not $registerScripts -or $registerScripts.Count -eq 0) {
+            Write-Option17Log "No Register-Tasks*.ps1 files were found in $DestinationPath after copy." 'WARN'
+            $global:LastStatus = '[WARN] Option 17 completed, but no Register-Tasks scripts were found.'
+            return
+        }
+
+        Write-Option17Log "Found $($registerScripts.Count) Register-Tasks script(s) to run." 'OK'
+
         $successCount = 0
-        $failCount = 0
-        
-        foreach ($file in $copiedFiles) {
-            $taskName = "LabTask_$($file.BaseName)"
-            
-            # Remove existing task if Force specified
-            if ($Force) {
-                $existingTask = schtasks.exe /Query /TN $taskName 2>$null
-                if ($LASTEXITCODE -eq 0) {
-                    Write-LogEntry "Removing existing task: $taskName" 'INFO'
-                    schtasks.exe /Delete /TN $taskName /F | Out-Null
-                }
-            }
-            
-            # Create task using proven method
-            $success = Create-ScheduledTaskProven -TaskName $taskName -FilePath $file.FullName -UserName $userName -Password $password
-            
-            if ($success) {
+        $failureCount = 0
+
+        foreach ($scriptFile in $registerScripts) {
+            Write-Option17Log "Running: $($scriptFile.FullName)" 'INFO'
+
+            $process = Start-Process -FilePath 'powershell.exe' `
+                -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $scriptFile.FullName) `
+                -Wait `
+                -PassThru `
+                -WindowStyle Hidden
+
+            if ($process.ExitCode -eq 0) {
                 $successCount++
-                
-                # Verify task exists
-                $verifyTask = schtasks.exe /Query /TN $taskName 2>$null
-                if ($LASTEXITCODE -eq 0) {
-                    Write-LogEntry "VERIFIED: Task $taskName exists and is registered" 'SUCCESS'
-                } else {
-                    Write-LogEntry "WARNING: Task $taskName created but verification failed" 'WARNING'
-                }
-            } else {
-                $failCount++
+                Write-Option17Log "Completed successfully: $($scriptFile.Name)" 'OK'
+            }
+            else {
+                $failureCount++
+                Write-Option17Log "Script exited with code $($process.ExitCode): $($scriptFile.Name)" 'ERROR'
             }
         }
-        
-        # Clear password
-        $password = $null
-        [System.GC]::Collect()
-        
-        Write-LogEntry "=== FINAL RESULTS ===" 'INFO'
-        Write-LogEntry "Successfully registered: $successCount tasks" 'SUCCESS'
-        Write-LogEntry "Failed to register: $failCount tasks" 'WARNING'
-        
-        if ($successCount -gt 0) {
-            Write-LogEntry "SUCCESS! Lab scheduled tasks have been registered!" 'SUCCESS'
-            Write-LogEntry "Tasks are scheduled to run on Sundays at staggered times:" 'INFO'
-            Write-LogEntry "  01_Remove-UserProfiles.ps1     -> 1:30 AM" 'INFO'
-            Write-LogEntry "  02_Weekend_Apps_Updates.ps1    -> 2:00 AM" 'INFO'
-            Write-LogEntry "  03_Weekend_HP_Drivers_Updates.ps1 -> 2:45 AM" 'INFO'
-            Write-LogEntry "  04_Weekend_Windows_Updates.ps1 -> 4:00 AM" 'INFO'
-            Write-LogEntry "  05_SystemRepair.ps1            -> 8:00 AM" 'INFO'
-        } else {
-            Write-LogEntry "No tasks were successfully registered" 'ERROR'
+
+        Write-Option17Log "Option 17 complete. Successful: $successCount ; Failed: $failureCount" 'INFO'
+
+        if ($failureCount -gt 0) {
+            $global:LastStatus = "[WARN] Option 17 completed with $failureCount Register-Tasks script failure(s)."
         }
-        
-    } catch {
-        Write-LogEntry "Critical error: $_" 'ERROR'
-        throw
+        else {
+            $global:LastStatus = "[OK] Option 17 completed successfully. Copied scripts and ran $successCount Register-Tasks script(s)."
+        }
+    }
+    catch {
+        $global:LastStatus = "[ERROR] Option 17 failed: $($_.Exception.Message)"
+        Write-Option17Log $global:LastStatus 'ERROR'
     }
 }
 
@@ -11438,7 +13528,7 @@ Function '$FunctionName' failed with error:
             EstimatedDuration = 300
         }
         'HPDrivers' = @{
-            Name = 'Update HP Drivers'
+            Name = 'Update HP/Dell Drivers'
             Function = 'Update-HPDrivers'
             Category = 'Drivers'
             Priority = 9
@@ -11714,7 +13804,7 @@ function Get-AvailableDeploymentTasks {
         'TimeSync'          = 'Configure Automatic Time Sync'
         'WingetDependencies'= 'Ensure Winget Dependencies'
         'UpdateApplications'= 'Update Applications via Winget'
-        'HPDrivers'         = 'Update HP Drivers'
+        'HPDrivers'         = 'Update HP/Dell Drivers'
         'WindowsUpdate'     = 'Run Windows Update'
     }
     
@@ -13279,17 +15369,17 @@ function Show-Menu {
     Write-Host "4.  Optimize Windows Services" -ForegroundColor White
     Write-Host "5.  Enable PowerShell Remote Management" -ForegroundColor White
     Write-Host "6.  Configure Automatic Time Sync" -ForegroundColor White
-    Write-Host "7.  Set Desktop Power Settings" -ForegroundColor White
+    Write-Host "7.  Set Desktop/Laptop Power Settings" -ForegroundColor White
     Write-Host "8.  Network Optimization" -ForegroundColor White
     Write-Host "9.  Application Updates" -ForegroundColor White
-    Write-Host "10. HP Driver Updates" -ForegroundColor White
+    Write-Host "10. HP/Dell Driver Updates" -ForegroundColor White
     Write-Host "11. Windows Updates" -ForegroundColor White
     Write-Host "12. Disk Cleanup" -ForegroundColor White
     Write-Host "13. System Repair" -ForegroundColor White
     Write-Host "14. Remove User Profiles" -ForegroundColor White
     Write-Host "15. Disable Last User Display" -ForegroundColor White
     Write-Host "16. Enable Automatic Login with CC-Student" -ForegroundColor White
-    Write-Host "17. Install Computer Lab Scheduled Tasks" -ForegroundColor White
+    Write-Host "17. Stage Lab Scripts and Register Scheduled Tasks" -ForegroundColor White
     Write-Host "18. Set OneDrive Auto Login on Boot" -ForegroundColor White
     Write-Host "19. Run Full System Updates" -ForegroundColor White
     Write-Host "20. Network Diag & Repair" -ForegroundColor White
