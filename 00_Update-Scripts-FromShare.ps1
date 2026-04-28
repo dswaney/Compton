@@ -1,7 +1,7 @@
 # =====================================================================
 # ScriptName: 00_Update-Scripts-FromShare.ps1
-# ScriptVersion: 2.0
-# LastUpdated: 2026-04-16
+# ScriptVersion: 2.2
+# LastUpdated: 2026-04-28
 # =====================================================================
 
 [CmdletBinding()]
@@ -21,6 +21,7 @@ $LogFolder     = 'C:\Logs'
 $BackupFolder  = 'C:\Scripts\Backup'
 
 $ScriptFiles = @(
+    '00_Update-Scripts-FromShare.ps1',
     '01_Enable_Windows_Update_Services.ps1',
     '02_Remove_User_Profiles.ps1',
     '03_Weekend_Apps_Update.ps1',
@@ -29,7 +30,13 @@ $ScriptFiles = @(
     '06_Weekend_Windows_Updates.ps1',
     '07_Force_Reboot_Install_Updates.ps1',
     '08_System_Repair.ps1',
-    '09_Disable_Windows_Update_Services.ps1'
+    '09_Disable_Windows_Update_Services.ps1',
+    'Register-Tasks_SYSTEM_v2.0.ps1'
+)
+
+$LegacyFilesToDelete = @(
+    '00_Update-Scripts-FromGithub.ps1',
+    'Register-Tasks_SYSTEM.ps1'
 )
 
 # ---------------------------
@@ -142,8 +149,8 @@ function Write-YamlLog {
         $lines = New-Object System.Collections.Generic.List[string]
 
         $lines.Add("computer_name: $(ConvertTo-YamlScalar $script:ComputerName)") | Out-Null
-        $lines.Add("script_name: '00_Update-Scripts-FromGitHub.ps1'") | Out-Null
-        $lines.Add("script_version: '1.8'") | Out-Null
+        $lines.Add("script_name: '00_Update-Scripts-FromShare.ps1'") | Out-Null
+        $lines.Add("script_version: '2.2'") | Out-Null
         $lines.Add("run_started: $(ConvertTo-YamlScalar $script:RunStart)") | Out-Null
         $lines.Add("run_finished: $(ConvertTo-YamlScalar $runEnd)") | Out-Null
         $lines.Add("duration_seconds: $duration") | Out-Null
@@ -371,6 +378,38 @@ function Initialize-SourceRoot {
     throw "Neither source path is reachable. Preferred [$PreferredSourceRoot], Fallback [$FallbackSourceRoot]."
 }
 
+function Remove-LegacyScriptFiles {
+    foreach ($legacyFile in $LegacyFilesToDelete) {
+        $legacyPath = Join-Path $LocalScripts $legacyFile
+
+        if (Test-Path -LiteralPath $legacyPath) {
+            try {
+                Remove-Item -LiteralPath $legacyPath -Force -ErrorAction Stop
+                Write-Status "Deleted legacy script: $legacyPath" 'OK'
+            }
+            catch {
+                Write-Status "Failed deleting legacy script [$legacyPath] : $($_.Exception.Message)" 'ERROR'
+                $script:FileResults.Add([PSCustomObject]@{
+                    FileName          = $legacyFile
+                    LocalPath         = $legacyPath
+                    SourcePath        = $null
+                    SourceLabel       = 'LegacyCleanup'
+                    Status            = 'Error'
+                    LocalVersion      = $null
+                    RemoteVersion     = $null
+                    LocalLastUpdated  = $null
+                    RemoteLastUpdated = $null
+                    BackupPath        = $null
+                    Message           = "Failed deleting legacy script: $($_.Exception.Message)"
+                }) | Out-Null
+            }
+        }
+        else {
+            Write-Status "Legacy script not present, no deletion needed: $legacyPath" 'INFO'
+        }
+    }
+}
+
 function Get-SourceFileContent {
     param(
         [Parameter(Mandatory)]
@@ -412,6 +451,8 @@ try {
     Write-Status "Preferred source: $PreferredSourceRoot" 'INFO'
     Write-Status "Fallback source: $FallbackSourceRoot" 'INFO'
     Write-Status "Local script folder: $LocalScripts" 'INFO'
+
+    Remove-LegacyScriptFiles
 
     Initialize-SourceRoot
 
