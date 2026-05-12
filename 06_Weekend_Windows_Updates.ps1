@@ -1,7 +1,7 @@
 # =====================================================================
 # ScriptName: 06_Weekend_Windows_Updates.ps1
-# ScriptVersion: 1.5
-# LastUpdated: 2026-04-15
+# ScriptVersion: 1.8
+# LastUpdated: 2026-04-26
 # Purpose: Installs Windows Updates using PSWindowsUpdate, writes a
 #          YAML audit log in C:\Logs, and explicitly reboots if Windows
 #          reports that a reboot is required.
@@ -20,12 +20,29 @@ $ErrorActionPreference = 'Stop'
 $script:RunStart        = Get-Date
 $script:ComputerName    = $env:COMPUTERNAME
 $script:YamlLogPath     = $null
+$script:RuntimeLogPath  = $null
 $script:UpdateEntries   = New-Object System.Collections.Generic.List[object]
 $script:RawUpdateLines  = New-Object System.Collections.Generic.List[string]
 $script:ActionHistory   = New-Object System.Collections.Generic.List[object]
 $script:OverallResult   = 'Unknown'
 $script:RebootRequired  = $false
 $script:FailureMessage  = $null
+
+function Write-ImmediateRuntimeLog {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Line
+    )
+
+    try {
+        if (-not [string]::IsNullOrWhiteSpace($script:RuntimeLogPath)) {
+            Add-Content -Path $script:RuntimeLogPath -Value $Line -Encoding UTF8
+        }
+    }
+    catch {
+        # Intentionally suppress runtime log write failures to avoid masking the main task.
+    }
+}
 
 function Write-Log {
     param(
@@ -49,6 +66,17 @@ function Write-Log {
         Level   = $Level
         Message = $Message
     }) | Out-Null
+
+    Write-ImmediateRuntimeLog -Line $line
+
+    if (-not [string]::IsNullOrWhiteSpace($script:YamlLogPath)) {
+        try {
+            Write-YamlLog
+        }
+        catch {
+            # Intentionally suppress checkpoint write failures to avoid recursion from logging.
+        }
+    }
 }
 
 function Test-IsAdministrator {
@@ -102,9 +130,30 @@ function Initialize-YamlLog {
     Ensure-Folder -Path $YamlLogFolder
 
     $timestamp = Get-Date -Format 'yyyy-MM-dd_HHmmss'
-    $fileName = "$($script:ComputerName)-WindowsUpdates-$timestamp.yml"
-    $script:YamlLogPath = Join-Path $YamlLogFolder $fileName
+    $baseName = "$($script:ComputerName)-WindowsUpdates-$timestamp"
+    $script:YamlLogPath = Join-Path $YamlLogFolder ($baseName + '.yaml')
+    $script:RuntimeLogPath = Join-Path $YamlLogFolder ($baseName + '.log')
 
+    Set-Content -Path $script:RuntimeLogPath -Value @(
+        "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [INFO ] Runtime log initialized.",
+        "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [INFO ] YAML checkpoint file: $($script:YamlLogPath)"
+    ) -Encoding UTF8
+
+    Set-Content -Path $script:YamlLogPath -Value @(
+        'computer_name: ' + (ConvertTo-YamlSafeValue $script:ComputerName),
+        'script_name: "06_Weekend_Windows_Updates.ps1"',
+        'script_version: "1.8"',
+        'status: "Initializing"',
+        'run_started: ' + (ConvertTo-YamlSafeValue ($script:RunStart.ToString('yyyy-MM-dd HH:mm:ss'))),
+        'yaml_log_path: ' + (ConvertTo-YamlSafeValue $script:YamlLogPath),
+        'runtime_log_path: ' + (ConvertTo-YamlSafeValue $script:RuntimeLogPath),
+        'actions:',
+        '  - time: ' + (ConvertTo-YamlSafeValue (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')),
+        '    level: "INFO"',
+        '    message: "Logging initialized"'
+    ) -Encoding UTF8
+
+    Write-Log "Runtime log will be written to: $($script:RuntimeLogPath)" 'INFO'
     Write-Log "YAML log will be written to: $($script:YamlLogPath)" 'INFO'
 }
 
@@ -220,11 +269,12 @@ function Write-YamlLog {
 
         $yamlLines.Add('computer_name: ' + (ConvertTo-YamlSafeValue $script:ComputerName)) | Out-Null
         $yamlLines.Add('script_name: "06_Weekend_Windows_Updates.ps1"') | Out-Null
-        $yamlLines.Add('script_version: "1.4"') | Out-Null
+        $yamlLines.Add('script_version: "1.8"') | Out-Null
         $yamlLines.Add('run_started: ' + (ConvertTo-YamlSafeValue ($script:RunStart.ToString('yyyy-MM-dd HH:mm:ss')))) | Out-Null
         $yamlLines.Add('run_finished: ' + (ConvertTo-YamlSafeValue ($runEnd.ToString('yyyy-MM-dd HH:mm:ss')))) | Out-Null
         $yamlLines.Add('duration_seconds: ' + $duration) | Out-Null
         $yamlLines.Add('yaml_log_path: ' + (ConvertTo-YamlSafeValue $script:YamlLogPath)) | Out-Null
+        $yamlLines.Add('runtime_log_path: ' + (ConvertTo-YamlSafeValue $script:RuntimeLogPath)) | Out-Null
         $yamlLines.Add('reset_wu_components_first: ' + ($(if ($ResetWUComponentsFirst) { 'true' } else { 'false' }))) | Out-Null
         $yamlLines.Add('operation_timeout_seconds: ' + $OperationTimeoutSeconds) | Out-Null
         $yamlLines.Add('reboot_delay_seconds: ' + $RebootDelaySeconds) | Out-Null
@@ -484,28 +534,60 @@ function Reset-WUComponentsSafe {
     Write-Log "Windows Update components reset complete." 'OK'
 }
 
-function Install-AvailableWindowsUpdates {
-    Write-Log "Scanning for and installing available Windows Updates..." 'INFO'
+function Invoke-PSWindowsUpdateJobOnce {
+    param(
+        [Parameter(Mandatory)]
+        [int]$TimeoutSeconds
+    )
 
-    if (-not (Get-Command -Name Install-WindowsUpdate -ErrorAction SilentlyContinue)) {
-        throw "Install-WindowsUpdate command was not found."
-    }
-
+    Write-Log "Starting background job for Install-WindowsUpdate..." 'INFO'
     $job = Start-Job -ScriptBlock {
-        param($ResetModulePath)
         Import-Module PSWindowsUpdate -Force
         Install-WindowsUpdate -MicrosoftUpdate -AcceptAll -IgnoreReboot -Verbose *>&1
     }
 
-    $completed = Wait-Job -Job $job -Timeout $OperationTimeoutSeconds
+    Write-Log "Background job started with ID $($job.Id). Waiting for completion for up to $TimeoutSeconds seconds..." 'INFO'
 
-    if (-not $completed) {
-        Stop-Job -Job $job -Force | Out-Null
-        Remove-Job -Job $job -Force | Out-Null
-        throw "Install-WindowsUpdate exceeded timeout of $OperationTimeoutSeconds seconds."
+    $pollIntervalSeconds = 5
+    $heartbeatIntervalSeconds = 60
+    $elapsedSeconds = 0
+    $completed = $null
+
+    while (-not $completed -and $elapsedSeconds -lt $TimeoutSeconds) {
+        $completed = Wait-Job -Job $job -Timeout $pollIntervalSeconds
+        if ($completed) { break }
+
+        $elapsedSeconds += $pollIntervalSeconds
+
+        if (($elapsedSeconds % $heartbeatIntervalSeconds) -eq 0) {
+            $jobState = (Get-Job -Id $job.Id).State
+            Write-Log "Windows Update job still running after $elapsedSeconds seconds. Current job state: $jobState" 'INFO'
+        }
     }
 
-    $results = Receive-Job -Job $job
+    if (-not $completed) {
+        $jobState = (Get-Job -Id $job.Id).State
+        Write-Log "Windows Update job did not finish before timeout. Final observed state: $jobState" 'ERROR'
+        Stop-Job -Job $job -Force | Out-Null
+        Remove-Job -Job $job -Force | Out-Null
+        throw "Install-WindowsUpdate exceeded timeout of $TimeoutSeconds seconds."
+    }
+
+    Write-Log "Background job completed. Receiving Windows Update output..." 'INFO'
+
+    $receiveErrors = @()
+    $results = Receive-Job -Job $job -ErrorAction SilentlyContinue -ErrorVariable receiveErrors
+
+    $jobState = $job.State
+    $jobReason = $null
+    try {
+        if ($job.ChildJobs -and $job.ChildJobs.Count -gt 0 -and $job.ChildJobs[0].JobStateInfo.Reason) {
+            $jobReason = $job.ChildJobs[0].JobStateInfo.Reason.Message
+        }
+    }
+    catch {}
+
+    Write-Log "Removing completed background job..." 'INFO'
     Remove-Job -Job $job -Force | Out-Null
 
     if ($results) {
@@ -519,8 +601,69 @@ function Install-AvailableWindowsUpdates {
             [void](Try-ParseUpdateObject -Item $item)
         }
     }
+    else {
+        Write-Log "Install-WindowsUpdate returned no normal output objects." 'WARN'
+    }
 
-    Write-Log "Windows Update installation command completed." 'OK'
+    if ($receiveErrors -and $receiveErrors.Count -gt 0) {
+        foreach ($err in $receiveErrors) {
+            $errText = [string]$err
+            if (-not [string]::IsNullOrWhiteSpace($errText)) {
+                $script:RawUpdateLines.Add("ERROR: $errText") | Out-Null
+                Write-Log "Install-WindowsUpdate reported error output: $errText" 'WARN'
+            }
+        }
+
+        $errorText = (($receiveErrors | ForEach-Object { [string]$_ }) -join ' | ')
+        throw $errorText
+    }
+
+    if ($jobState -eq 'Failed') {
+        if ([string]::IsNullOrWhiteSpace($jobReason)) {
+            throw "Install-WindowsUpdate background job failed."
+        }
+        else {
+            throw "Install-WindowsUpdate background job failed: $jobReason"
+        }
+    }
+
+    return $results
+}
+
+function Install-AvailableWindowsUpdates {
+    Write-Log "Scanning for and installing available Windows Updates..." 'INFO'
+
+    if (-not (Get-Command -Name Install-WindowsUpdate -ErrorAction SilentlyContinue)) {
+        throw "Install-WindowsUpdate command was not found."
+    }
+
+    $attempt = 1
+    $maxAttempts = 2
+
+    while ($attempt -le $maxAttempts) {
+        try {
+            if ($attempt -gt 1) {
+                Write-Log "Retrying Windows Update install phase. Attempt $attempt of $maxAttempts..." 'INFO'
+            }
+
+            [void](Invoke-PSWindowsUpdateJobOnce -TimeoutSeconds $OperationTimeoutSeconds)
+            Write-Log "Windows Update installation command completed." 'OK'
+            return
+        }
+        catch {
+            $message = $_.Exception.Message
+            Write-Log "Windows Update install attempt $attempt failed: $message" 'WARN'
+
+            if ($message -match '0x80248007' -and $attempt -lt $maxAttempts) {
+                Write-Log "Detected Windows Update datastore/catalog error 0x80248007. Resetting Windows Update components and retrying once..." 'WARN'
+                Reset-WUComponentsSafe
+                $attempt++
+                continue
+            }
+
+            throw
+        }
+    }
 }
 
 function Test-WURebootRequired {
@@ -583,14 +726,18 @@ Initialize-YamlLog
 Write-Log "Initializing weekend Windows update script..." 'INFO'
 
 try {
+    Write-Log "Beginning prerequisite validation and module preparation..." 'INFO'
     Ensure-PSWindowsUpdate
 
     if ($ResetWUComponentsFirst) {
+        Write-Log "ResetWUComponentsFirst switch detected. Beginning Windows Update component reset..." 'INFO'
         Reset-WUComponentsSafe
     }
 
+    Write-Log "Beginning Windows Update scan and install phase..." 'INFO'
     Install-AvailableWindowsUpdates
 
+    Write-Log "Checking whether Windows reports a reboot requirement..." 'INFO'
     $script:RebootRequired = Test-WURebootRequired
 
     if ($script:RebootRequired) {
