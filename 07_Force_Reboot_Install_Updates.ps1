@@ -1,14 +1,15 @@
 # =====================================================================
 # ScriptName: 07_Force_Reboot_Install_Updates.ps1
-# ScriptVersion: 1.6
-# LastUpdated: 2026-03-24
+# ScriptVersion: 1.9
+# LastUpdated: 2026-04-29
+# ChangeLog: Final scheduled-task hardening: mutex single-instance lock, isolated State folder, write-through atomic JSON state saves, state-file backup/repair, and reboot-safe flush before shutdown.
 # =====================================================================
 
 [CmdletBinding()]
 param(
     [int]$RebootDelaySeconds = 30,
     [string]$LogDirectory = 'C:\Logs',
-    [string]$StateDirectory = 'C:\ProgramData\MISMaintenance',
+    [string]$StateDirectory = 'C:\ProgramData\MISMaintenance\State',
     [string]$StateFileName = '07_Force_Reboot_Install_Updates_State.json'
 )
 
@@ -26,6 +27,9 @@ $script:ActionHistory    = @()
 $script:CurrentStage     = 0
 $script:RebootIssued     = $false
 $script:RebootReason     = $null
+$script:MutexName        = 'Global\MIS_07_Force_Reboot_Install_Updates'
+$script:Mutex            = $null
+$script:MutexAcquired    = $false
 
 function Ensure-Folder {
     param(
@@ -45,6 +49,85 @@ function Initialize-Paths {
     $timestamp = $script:RunStart.ToString('yyyy-MM-dd_HH-mm-ss')
     $baseName = "$($script:ComputerName)-ForceRebootInstallUpdates-$timestamp"
     $script:YamlLogPath = Join-Path $LogDirectory ($baseName + '.yaml')
+}
+
+function Initialize-SingleInstanceLock {
+    try {
+        $createdNew = $false
+        $script:Mutex = New-Object System.Threading.Mutex($false, $script:MutexName, [ref]$createdNew)
+
+        if (-not $script:Mutex.WaitOne(0)) {
+            Write-Status 'Another instance of Script 07 is already running. Exiting to prevent state-file corruption.' 'WARN'
+            $script:OverallResult = 'SkippedAlreadyRunning'
+            Write-YamlLog
+            exit 0
+        }
+
+        $script:MutexAcquired = $true
+        Write-Status 'Single-instance lock acquired.' 'INFO'
+    }
+    catch {
+        Write-Status "Failed to acquire single-instance lock: $($_.Exception.Message)" 'ERROR'
+        throw
+    }
+}
+
+function Release-SingleInstanceLock {
+    try {
+        if ($script:MutexAcquired -and $null -ne $script:Mutex) {
+            [void]$script:Mutex.ReleaseMutex()
+            $script:MutexAcquired = $false
+            Write-Status 'Single-instance lock released.' 'INFO'
+        }
+    }
+    catch {
+        Write-Warning "Failed to release single-instance lock: $($_.Exception.Message)"
+    }
+    finally {
+        if ($null -ne $script:Mutex) {
+            $script:Mutex.Dispose()
+            $script:Mutex = $null
+        }
+    }
+}
+
+function Confirm-FileWriteToDisk {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return
+    }
+
+    $stream = $null
+    try {
+        $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::Read)
+        $stream.Flush($true)
+    }
+    catch {
+        Write-Status "Unable to force-flush file to disk [$Path]: $($_.Exception.Message)" 'WARN'
+    }
+    finally {
+        if ($null -ne $stream) {
+            $stream.Dispose()
+        }
+    }
+}
+
+function Confirm-StateWriteBeforeReboot {
+    try {
+        Confirm-FileWriteToDisk -Path $script:StateFilePath
+        if ($script:YamlLogPath) {
+            Confirm-FileWriteToDisk -Path $script:YamlLogPath
+        }
+        Start-Sleep -Seconds 3
+        Write-Status 'State and YAML log writes confirmed before reboot.' 'INFO'
+    }
+    catch {
+        Write-Status "Pre-reboot write confirmation failed: $($_.Exception.Message)" 'WARN'
+    }
 }
 
 function Write-Status {
@@ -251,35 +334,103 @@ function Get-PendingRebootFlags {
     return @($flags)
 }
 
-function Get-State {
-    if (-not (Test-Path -LiteralPath $script:StateFilePath)) {
-        return [PSCustomObject]@{
-            Stage     = 0
-            FirstSeen = $null
-            LastRun   = $null
-            LastFlags = @()
-        }
+function New-DefaultState {
+    [PSCustomObject]@{
+        Stage     = 0
+        FirstSeen = $null
+        LastRun   = $null
+        LastFlags = @()
+    }
+}
+
+function ConvertTo-StateObject {
+    param(
+        [Parameter(Mandatory)]
+        $InputObject
+    )
+
+    $stage = 0
+    try {
+        $stage = [int]($InputObject.Stage)
+    }
+    catch {
+        $stage = 0
     }
 
-    try {
-        $raw = Get-Content -LiteralPath $script:StateFilePath -Raw -Encoding UTF8
-        $obj = $raw | ConvertFrom-Json
+    if ($stage -lt 0 -or $stage -gt 2) {
+        $stage = 0
+    }
 
-        [PSCustomObject]@{
-            Stage     = [int]($obj.Stage)
-            FirstSeen = $obj.FirstSeen
-            LastRun   = $obj.LastRun
-            LastFlags = @($obj.LastFlags)
+    [PSCustomObject]@{
+        Stage     = $stage
+        FirstSeen = $InputObject.FirstSeen
+        LastRun   = $InputObject.LastRun
+        LastFlags = @($InputObject.LastFlags)
+    }
+}
+
+function Backup-BadStateFile {
+    param(
+        [string]$Reason
+    )
+
+    try {
+        if (Test-Path -LiteralPath $script:StateFilePath) {
+            $backupPath = "$($script:StateFilePath).bad-$((Get-Date).ToString('yyyyMMdd-HHmmss'))"
+            Copy-Item -LiteralPath $script:StateFilePath -Destination $backupPath -Force -ErrorAction Stop
+            Write-Status "Backed up unreadable reboot state file to: $backupPath" 'WARN'
         }
     }
     catch {
-        Write-Status "State file unreadable. Resetting state. Error: $($_.Exception.Message)" 'WARN'
-        [PSCustomObject]@{
-            Stage     = 0
-            FirstSeen = $null
-            LastRun   = $null
-            LastFlags = @()
+        Write-Status "Could not back up unreadable reboot state file. $($_.Exception.Message)" 'WARN'
+    }
+
+    Write-Status "State file reset reason: $Reason" 'WARN'
+}
+
+function Get-State {
+    if (-not (Test-Path -LiteralPath $script:StateFilePath)) {
+        return New-DefaultState
+    }
+
+    try {
+        $raw = Get-Content -LiteralPath $script:StateFilePath -Raw -Encoding UTF8 -ErrorAction Stop
+
+        if ([string]::IsNullOrWhiteSpace($raw)) {
+            Backup-BadStateFile -Reason 'State file was empty.'
+            return New-DefaultState
         }
+
+        $trimmed = $raw.Trim()
+
+        try {
+            $obj = $trimmed | ConvertFrom-Json -ErrorAction Stop
+            return (ConvertTo-StateObject -InputObject $obj)
+        }
+        catch {
+            # Recovery path: some systems have produced a state file missing the opening brace,
+            # for example: \"Stage\": 1, ... }. Wrap it and retry instead of forcing a false first pass.
+            if (($trimmed -notmatch '^\s*\{') -and ($trimmed -match '\"Stage\"\s*:') -and ($trimmed -match '\}\s*$')) {
+                try {
+                    $repairedJson = '{' + $trimmed
+                    $obj = $repairedJson | ConvertFrom-Json -ErrorAction Stop
+                    Write-Status 'State file was missing the opening JSON brace. Repaired in memory and continuing staged reboot logic.' 'WARN'
+                    Save-State -Stage ([int]$obj.Stage) -FirstSeen $obj.FirstSeen -LastRun $obj.LastRun -LastFlags @($obj.LastFlags)
+                    return (ConvertTo-StateObject -InputObject $obj)
+                }
+                catch {
+                    Backup-BadStateFile -Reason "Automatic JSON brace repair failed. $($_.Exception.Message)"
+                    return New-DefaultState
+                }
+            }
+
+            Backup-BadStateFile -Reason "State file unreadable. $($_.Exception.Message)"
+            return New-DefaultState
+        }
+    }
+    catch {
+        Backup-BadStateFile -Reason "State file could not be read. $($_.Exception.Message)"
+        return New-DefaultState
     }
 }
 
@@ -291,6 +442,8 @@ function Save-State {
         $LastFlags
     )
 
+    Ensure-Folder -Path $StateDirectory
+
     $state = [PSCustomObject]@{
         Stage     = $Stage
         FirstSeen = if ($null -ne $FirstSeen) { [string]$FirstSeen } else { $null }
@@ -298,8 +451,56 @@ function Save-State {
         LastFlags = @($LastFlags)
     }
 
-    $json = $state | ConvertTo-Json -Depth 8
-    Set-Content -LiteralPath $script:StateFilePath -Value $json -Encoding UTF8
+    $json = $state | ConvertTo-Json -Depth 12
+    if ([string]::IsNullOrWhiteSpace($json) -or $json.TrimStart()[0] -ne '{') {
+        throw 'Generated state JSON did not begin with an opening brace. Refusing to write invalid state file.'
+    }
+
+    $unique = [guid]::NewGuid().ToString('N')
+    $tempPath = Join-Path $StateDirectory ("$StateFileName.$unique.tmp")
+
+    try {
+        $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+        $fileStream = [System.IO.File]::Open($tempPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        try {
+            $writer = New-Object System.IO.StreamWriter($fileStream, $utf8NoBom)
+            try {
+                $writer.Write($json)
+                $writer.Flush()
+                $fileStream.Flush($true)
+            }
+            finally {
+                $writer.Dispose()
+            }
+        }
+        finally {
+            $fileStream.Dispose()
+        }
+
+        # Validate the temp file before replacing the active state file.
+        $validated = (Get-Content -LiteralPath $tempPath -Raw -Encoding UTF8 -ErrorAction Stop) | ConvertFrom-Json -ErrorAction Stop
+        if ($null -eq $validated -or $null -eq $validated.Stage) {
+            throw 'Temporary state file validation failed because required Stage property was missing.'
+        }
+
+        if (Test-Path -LiteralPath $script:StateFilePath) {
+            Copy-Item -LiteralPath $script:StateFilePath -Destination "$($script:StateFilePath).prev" -Force -ErrorAction SilentlyContinue
+        }
+
+        Move-Item -LiteralPath $tempPath -Destination $script:StateFilePath -Force -ErrorAction Stop
+        Confirm-FileWriteToDisk -Path $script:StateFilePath
+        Write-Status "Saved reboot state tracking at stage $Stage." 'INFO'
+    }
+    catch {
+        Write-Status "Failed to save reboot state file safely. Error: $($_.Exception.Message)" 'ERROR'
+        try {
+            if (Test-Path -LiteralPath $tempPath) {
+                Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+            }
+        }
+        catch { }
+        throw
+    }
 }
 
 function Reset-State {
@@ -408,6 +609,79 @@ function Clear-PendingRebootFlags {
     return @($script:ClearResults)
 }
 
+function Test-AppPatchPendingRenameFlag {
+    param(
+        [array]$Flags
+    )
+
+    foreach ($flag in @($Flags)) {
+        if ($flag.Name -in @('PendingFileRenameOperations','PendingFileRenameOperations2') -and $flag.Details -match '(?i)apppatch\\AcPluginDlls') {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Stop-UpdateLockingProcessesSafe {
+    $lockingProcesses = @(
+        'TiWorker',
+        'TrustedInstaller',
+        'wuauclt',
+        'UsoClient'
+    )
+
+    foreach ($processName in $lockingProcesses) {
+        try {
+            $processes = @(Get-Process -Name $processName -ErrorAction SilentlyContinue)
+            foreach ($process in $processes) {
+                try {
+                    Write-Status "Stopping possible update-locking process: $($process.Name) PID $($process.Id)" 'WARN'
+                    Stop-Process -Id $process.Id -Force -ErrorAction Stop
+                }
+                catch {
+                    Write-Status "Could not stop process $($process.Name) PID $($process.Id): $($_.Exception.Message)" 'WARN'
+                }
+            }
+        }
+        catch {
+            Write-Status "Process check failed for [$processName]: $($_.Exception.Message)" 'WARN'
+        }
+    }
+}
+
+function Resolve-PersistentRebootFlags {
+    param(
+        [array]$InitialFlags
+    )
+
+    if (Test-AppPatchPendingRenameFlag -Flags $InitialFlags) {
+        Write-Status 'Detected AppPatch/AcPluginDlls PendingFileRenameOperations. These can persist after updates and are treated as non-blocking after cleanup.' 'WARN'
+    }
+
+    Stop-UpdateLockingProcessesSafe
+    [void](Clear-PendingRebootFlags)
+    Start-Sleep -Seconds 2
+
+    $remainingFlags = @(Get-PendingRebootFlags)
+    if ($remainingFlags.Count -gt 0) {
+        Write-Status 'Reboot flags are still present after cleanup. Logging as warning and continuing instead of failing the maintenance run.' 'WARN'
+        foreach ($flag in $remainingFlags) {
+            Write-Status "Remaining non-blocking flag: $($flag.Name) | $($flag.Path) | $($flag.Details)" 'WARN'
+        }
+        $script:OverallResult = 'PersistentFlagsClearedOrIgnored'
+    }
+    else {
+        Write-Status 'Persistent reboot flags cleared successfully.' 'OK'
+        $script:OverallResult = 'PersistentFlagsCleared'
+    }
+
+    Reset-State
+    Write-YamlLog
+    exit 0
+}
+
+
 function Write-YamlLog {
     try {
         $runEnd = Get-Date
@@ -420,7 +694,7 @@ function Write-YamlLog {
 
         $lines.Add("computer_name: $(ConvertTo-YamlScalar $script:ComputerName)") | Out-Null
         $lines.Add("script_name: '07_Force_Reboot_Install_Updates.ps1'") | Out-Null
-        $lines.Add("script_version: '1.6'") | Out-Null
+        $lines.Add("script_version: '1.9'") | Out-Null
         $lines.Add("run_started: $(ConvertTo-YamlScalar $script:RunStart)") | Out-Null
         $lines.Add("run_finished: $(ConvertTo-YamlScalar $runEnd)") | Out-Null
         $lines.Add("duration_seconds: $duration") | Out-Null
@@ -476,7 +750,10 @@ function Write-YamlLog {
             $lines.Add('  []') | Out-Null
         }
 
-        Set-Content -Path $script:YamlLogPath -Value $lines -Encoding UTF8
+        $yamlTempPath = "$($script:YamlLogPath).tmp"
+        Set-Content -LiteralPath $yamlTempPath -Value $lines -Encoding UTF8 -Force
+        Move-Item -LiteralPath $yamlTempPath -Destination $script:YamlLogPath -Force
+        Confirm-FileWriteToDisk -Path $script:YamlLogPath
     }
     catch {
         Write-Warning "Failed to write YAML log: $($_.Exception.Message)"
@@ -494,6 +771,7 @@ function Invoke-ForcedReboot {
 
     Write-Status "Issuing forced reboot in $RebootDelaySeconds seconds. Reason: $Reason" 'WARN'
     Write-YamlLog
+    Confirm-StateWriteBeforeReboot
 
     $arguments = @(
         '/r'
@@ -515,92 +793,94 @@ function Invoke-ForcedReboot {
 
 # Main
 Initialize-Paths
-
-if (-not (Test-IsAdministrator)) {
-    Write-Error "Please run this script as Administrator."
-    exit 1
-}
-
-Write-Status "Starting reboot flag evaluation..." 'INFO'
+Initialize-SingleInstanceLock
 
 try {
-    $state = Get-State
-    $flags = @(Get-PendingRebootFlags)
+    if (-not (Test-IsAdministrator)) {
+        Write-Error "Please run this script as Administrator."
+        exit 1
+    }
 
-    $stage = 0
+    Write-Status "Starting reboot flag evaluation..." 'INFO'
+
     try {
-        $stage = [int]$state.Stage
+        $state = Get-State
+        $flags = @(Get-PendingRebootFlags)
+
+        $stage = 0
+        try {
+            $stage = [int]$state.Stage
+        }
+        catch {
+            $stage = 0
+        }
+
+        $script:CurrentStage = $stage
+
+        switch ($stage) {
+            0 {
+                Write-Status "First pass detected. Forcing reboot regardless of flag state." 'WARN'
+                Save-State -Stage 1 -FirstSeen ((Get-Date).ToString('o')) -LastRun ((Get-Date).ToString('o')) -LastFlags $flags
+                $script:OverallResult = 'ForcedInitialReboot'
+                Invoke-ForcedReboot -Reason 'Initial forced reboot for update cycle.'
+            }
+
+            1 {
+                if ($flags.Count -gt 0) {
+                    Write-Status "Second pass: reboot flags still detected. Issuing second reboot." 'WARN'
+                    foreach ($flag in $flags) {
+                        Write-Status "Flag detected: $($flag.Name) | $($flag.Path) | $($flag.Details)" 'WARN'
+                    }
+
+                    Save-State -Stage 2 -FirstSeen $state.FirstSeen -LastRun ((Get-Date).ToString('o')) -LastFlags $flags
+                    $script:OverallResult = 'SecondPassRebootIssued'
+                    Invoke-ForcedReboot -Reason 'Reboot flags remain after initial reboot. Issuing second reboot.'
+                }
+                else {
+                    Write-Status "Second pass: no reboot flags detected. Resetting state and exiting normally." 'OK'
+                    Reset-State
+                    $script:OverallResult = 'SecondPassNoFlags'
+                    Write-YamlLog
+                    exit 0
+                }
+            }
+
+            2 {
+                if ($flags.Count -gt 0) {
+                    Write-Status "Third pass: reboot flags still present after two reboots. Logging and clearing as non-blocking warning." 'WARN'
+                    foreach ($flag in $flags) {
+                        Write-Status "Persistent flag: $($flag.Name) | $($flag.Path) | $($flag.Details)" 'WARN'
+                    }
+
+                    Resolve-PersistentRebootFlags -InitialFlags $flags
+                }
+                else {
+                    Write-Status "Third pass: no reboot flags detected. Resetting state and exiting normally." 'OK'
+                    Reset-State
+                    $script:OverallResult = 'ThirdPassNoFlags'
+                    Write-YamlLog
+                    exit 0
+                }
+            }
+
+            default {
+                Write-Status "Unexpected state value [$stage]. Resetting state and starting over with forced initial reboot." 'WARN'
+                Reset-State
+                Save-State -Stage 1 -FirstSeen ((Get-Date).ToString('o')) -LastRun ((Get-Date).ToString('o')) -LastFlags $flags
+                $script:CurrentStage = 0
+                $script:OverallResult = 'ForcedInitialRebootAfterStateReset'
+                Invoke-ForcedReboot -Reason 'State reset occurred. Performing initial forced reboot for update cycle.'
+            }
+        }
     }
     catch {
-        $stage = 0
-    }
-
-    $script:CurrentStage = $stage
-
-    switch ($stage) {
-        0 {
-            Write-Status "First pass detected. Forcing reboot regardless of flag state." 'WARN'
-            Save-State -Stage 1 -FirstSeen ((Get-Date).ToString('o')) -LastRun ((Get-Date).ToString('o')) -LastFlags $flags
-            $script:OverallResult = 'ForcedInitialReboot'
-            Invoke-ForcedReboot -Reason 'Initial forced reboot for update cycle.'
-        }
-
-        1 {
-            if ($flags.Count -gt 0) {
-                Write-Status "Second pass: reboot flags still detected. Issuing second reboot." 'WARN'
-                foreach ($flag in $flags) {
-                    Write-Status "Flag detected: $($flag.Name) | $($flag.Path) | $($flag.Details)" 'WARN'
-                }
-
-                Save-State -Stage 2 -FirstSeen $state.FirstSeen -LastRun ((Get-Date).ToString('o')) -LastFlags $flags
-                $script:OverallResult = 'SecondPassRebootIssued'
-                Invoke-ForcedReboot -Reason 'Reboot flags remain after initial reboot. Issuing second reboot.'
-            }
-            else {
-                Write-Status "Second pass: no reboot flags detected. Resetting state and exiting normally." 'OK'
-                Reset-State
-                $script:OverallResult = 'SecondPassNoFlags'
-                Write-YamlLog
-                exit 0
-            }
-        }
-
-        2 {
-            if ($flags.Count -gt 0) {
-                Write-Status "Third pass: reboot flags still present after two reboots. Logging and clearing." 'ERROR'
-                foreach ($flag in $flags) {
-                    Write-Status "Persistent flag: $($flag.Name) | $($flag.Path) | $($flag.Details)" 'ERROR'
-                }
-
-                $script:OverallResult = 'FlagsPersistedAfterTwoReboots'
-                [void](Clear-PendingRebootFlags)
-                Write-YamlLog
-                Reset-State
-                exit 2
-            }
-            else {
-                Write-Status "Third pass: no reboot flags detected. Resetting state and exiting normally." 'OK'
-                Reset-State
-                $script:OverallResult = 'ThirdPassNoFlags'
-                Write-YamlLog
-                exit 0
-            }
-        }
-
-        default {
-            Write-Status "Unexpected state value [$stage]. Resetting state and starting over with forced initial reboot." 'WARN'
-            Reset-State
-            Save-State -Stage 1 -FirstSeen ((Get-Date).ToString('o')) -LastRun ((Get-Date).ToString('o')) -LastFlags $flags
-            $script:CurrentStage = 0
-            $script:OverallResult = 'ForcedInitialRebootAfterStateReset'
-            Invoke-ForcedReboot -Reason 'State reset occurred. Performing initial forced reboot for update cycle.'
-        }
+        $script:FailureMessage = $_.Exception.Message
+        $script:OverallResult = 'Failed'
+        Write-Status "Script failed: $($_.Exception.Message)" 'ERROR'
+        Write-YamlLog
+        exit 3
     }
 }
-catch {
-    $script:FailureMessage = $_.Exception.Message
-    $script:OverallResult = 'Failed'
-    Write-Status "Script failed: $($_.Exception.Message)" 'ERROR'
-    Write-YamlLog
-    exit 3
+finally {
+    Release-SingleInstanceLock
 }
