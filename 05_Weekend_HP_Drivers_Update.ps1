@@ -1,663 +1,1255 @@
-# =====================================================================
 # ScriptName: 05_Weekend_HP_Drivers_Update.ps1
-# ScriptVersion: 1.4
-# LastUpdated: 2026-04-07
-# =====================================================================
+# ScriptVersion: 2.5.0
+# LastUpdated: 2026-05-06
+# Purpose: Weekend vendor driver update script with clean HP + Dell support,
+#          YAML logging, local power policy enforcement, colored output,
+#          section headers, progress display, and structured per-driver results.
 
 [CmdletBinding()]
-param(
-    [switch]$IncludeBIOS = $false, # Ignored in this hardened version; BIOS updates are blocked
-    [switch]$IncludeSoftware = $false,
-    [switch]$SuspendBitLockerForBIOS = $false, # Ignored in this hardened version; BIOS updates are blocked
-    [string]$WorkingRoot = 'C:\Temp\HPDrivers',
-    [string]$LogPath = 'C:\Temp\HPDrivers\HP-Driver-Update.log',
+param([string]$WorkingRoot = 'C:\Temp\DriverUpdates',
     [string]$YamlLogFolder = 'C:\Logs',
-    [int]$CleanupRetryCount = 12,
-    [int]$CleanupRetryDelaySeconds = 10
+    [switch]$IncludeSoftware,
+    [switch]$IncludeBIOS,
+    [string]$HpiaSourceFolder = '\\filesvr\Labscripts\HPImageAssistant',
+    [string]$LocalHpiaFolder = 'C:\ProgramData\Compton\HPImageAssistant'
 )
 
+Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:RunStart = Get-Date
-$script:ComputerName = $env:COMPUTERNAME
-$script:YamlLogPath = $null
-$script:OverallResult = 'Unknown'
-$script:FailureMessage = $null
-$script:CleanupResult = $false
-$script:DetectedSoftPaqs = New-Object System.Collections.Generic.List[object]
-$script:InstalledSoftPaqResults = New-Object System.Collections.Generic.List[object]
+# -----------------------------
+# Script metadata
+# -----------------------------
+$script:ScriptName        = '05_Weekend_HP_Drivers_Update.ps1'
+$script:ScriptVersion     = '2.5.0'
+$script:StartTime         = Get-Date
+$script:RunFailures       = New-Object System.Collections.Generic.List[string]
+$script:InstalledList     = New-Object System.Collections.Generic.List[string]
+$script:SkippedList       = New-Object System.Collections.Generic.List[string]
+$script:YamlActionLines   = New-Object System.Collections.Generic.List[string]
+$script:DriverResults     = New-Object System.Collections.Generic.List[object]
+$script:DetectedVendor    = $null
+$script:YamlPath          = $null
+$script:ComputerName      = $env:COMPUTERNAME
 
+# -----------------------------
+# Logging helpers
+# -----------------------------
 function Write-Log {
     param(
-        [string]$Message,
-        [ValidateSet('INFO','OK','WARN','ERROR')]
-        [string]$Level = 'INFO'
+        [Parameter(Mandatory)][string]$Message,
+        [ValidateSet('INFO','OK','WARN','ERROR')][string]$Level = 'INFO'
     )
 
     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    $line = "[$timestamp] [$('{0,-5}' -f $Level)] $Message"
+    $line = "[{0}] [{1}] {2}" -f $timestamp, $Level.PadRight(5), $Message
 
     switch ($Level) {
         'INFO'  { Write-Host $line -ForegroundColor Cyan }
         'OK'    { Write-Host $line -ForegroundColor Green }
         'WARN'  { Write-Host $line -ForegroundColor Yellow }
         'ERROR' { Write-Host $line -ForegroundColor Red }
+        default { Write-Host $line }
+    }
+}
+
+function Write-Section {
+    param([Parameter(Mandatory)][string]$Title)
+
+    $border = ('=' * 72)
+    Write-Host ''
+    Write-Host $border -ForegroundColor Magenta
+    Write-Host ("  {0}" -f $Title) -ForegroundColor Magenta
+    Write-Host $border -ForegroundColor Magenta
+    Add-YamlAction ("Section: {0}" -f $Title)
+}
+
+function Add-RunFailure {
+    param([Parameter(Mandatory)][string]$Message)
+    $script:RunFailures.Add($Message) | Out-Null
+    Write-Log $Message 'WARN'
+}
+
+function Add-DriverResult {
+    param(
+        [Parameter(Mandatory)][string]$Vendor,
+        [Parameter(Mandatory)][string]$Name,
+        [string]$Id,
+        [string]$Category,
+        [ValidateSet('Detected','Installed','Downloaded','Skipped','Failed','Blocked')][string]$Status,
+        [string]$Message = ''
+    )
+
+    $script:DriverResults.Add([pscustomobject]@{
+        Vendor   = $Vendor
+        Name     = $Name
+        Id       = $Id
+        Category = $Category
+        Status   = $Status
+        Message  = $Message
+    }) | Out-Null
+}
+
+function ConvertTo-YamlSafeString {
+    param([AllowNull()][object]$Value)
+
+    if ($null -eq $Value) { return 'null' }
+
+    $text = [string]$Value
+    $text = $text -replace "`r", ''
+    $text = $text -replace "`n", ' '
+    $text = $text -replace "'", "''"
+    return "'$text'"
+}
+
+function Initialize-YamlLog {
+    param(
+        [Parameter(Mandatory)][string]$ComputerName,
+        [Parameter(Mandatory)][string]$YamlPath
+    )
+
+    $script:YamlPath = $YamlPath
+    $script:YamlActionLines.Clear()
+
+    Add-YamlAction 'Script initialized.'
+    Add-YamlAction ("Working root: {0}" -f $WorkingRoot)
+    Add-YamlAction ("Computer: {0}" -f $ComputerName)
+}
+
+function Add-YamlAction {
+    param([Parameter(Mandatory)][string]$Text)
+    $script:YamlActionLines.Add(("    - {0}" -f (ConvertTo-YamlSafeString $Text))) | Out-Null
+}
+
+function Save-YamlLog {
+    param(
+        [Parameter(Mandatory)][string]$Status
+    )
+
+    if ([string]::IsNullOrWhiteSpace($script:YamlPath)) {
+        return
     }
 
-    try {
-        $logDir = Split-Path -Path $LogPath -Parent
-        if (-not [string]::IsNullOrWhiteSpace($logDir) -and -not (Test-Path -LiteralPath $logDir)) {
-            New-Item -Path $logDir -ItemType Directory -Force | Out-Null
+    $endTime = Get-Date
+    $duration = [math]::Round(($endTime - $script:StartTime).TotalSeconds, 0)
+
+    $lines = New-Object System.Collections.Generic.List[string]
+
+    $lines.Add('script:') | Out-Null
+    $lines.Add(("  name: {0}" -f (ConvertTo-YamlSafeString $script:ScriptName))) | Out-Null
+    $lines.Add(("  version: {0}" -f (ConvertTo-YamlSafeString $script:ScriptVersion))) | Out-Null
+    $lines.Add(("  computer: {0}" -f (ConvertTo-YamlSafeString $script:ComputerName))) | Out-Null
+    $lines.Add(("  started: {0}" -f (ConvertTo-YamlSafeString ($script:StartTime.ToString('s'))))) | Out-Null
+    $lines.Add(("  ended: {0}" -f (ConvertTo-YamlSafeString ($endTime.ToString('s'))))) | Out-Null
+    $lines.Add(("  duration_seconds: {0}" -f $duration)) | Out-Null
+
+    $lines.Add('run:') | Out-Null
+    $lines.Add(("  status: {0}" -f (ConvertTo-YamlSafeString $Status))) | Out-Null
+    $lines.Add(("  vendor: {0}" -f (ConvertTo-YamlSafeString $script:DetectedVendor))) | Out-Null
+
+    $lines.Add('  actions:') | Out-Null
+    if ($script:YamlActionLines.Count -eq 0) {
+        $lines.Add('    []') | Out-Null
+    }
+    else {
+        foreach ($line in $script:YamlActionLines) {
+            $lines.Add($line) | Out-Null
         }
-        Add-Content -Path $LogPath -Value $line -Encoding UTF8
     }
-    catch {
+
+    $lines.Add('  installed:') | Out-Null
+    if ($script:InstalledList.Count -eq 0) {
+        $lines.Add('    []') | Out-Null
     }
+    else {
+        foreach ($item in $script:InstalledList) {
+            $lines.Add(("    - {0}" -f (ConvertTo-YamlSafeString $item))) | Out-Null
+        }
+    }
+
+    $lines.Add('  skipped:') | Out-Null
+    if ($script:SkippedList.Count -eq 0) {
+        $lines.Add('    []') | Out-Null
+    }
+    else {
+        foreach ($item in $script:SkippedList) {
+            $lines.Add(("    - {0}" -f (ConvertTo-YamlSafeString $item))) | Out-Null
+        }
+    }
+
+    $lines.Add('  failures:') | Out-Null
+    if ($script:RunFailures.Count -eq 0) {
+        $lines.Add('    []') | Out-Null
+    }
+    else {
+        foreach ($item in $script:RunFailures) {
+            $lines.Add(("    - {0}" -f (ConvertTo-YamlSafeString $item))) | Out-Null
+        }
+    }
+
+    $lines.Add('drivers:') | Out-Null
+    if ($script:DriverResults.Count -eq 0) {
+        $lines.Add('  []') | Out-Null
+    }
+    else {
+        foreach ($driver in $script:DriverResults) {
+            $lines.Add('  -') | Out-Null
+            $lines.Add(("    vendor: {0}" -f (ConvertTo-YamlSafeString $driver.Vendor))) | Out-Null
+            $lines.Add(("    name: {0}" -f (ConvertTo-YamlSafeString $driver.Name))) | Out-Null
+            $lines.Add(("    id: {0}" -f (ConvertTo-YamlSafeString $driver.Id))) | Out-Null
+            $lines.Add(("    category: {0}" -f (ConvertTo-YamlSafeString $driver.Category))) | Out-Null
+            $lines.Add(("    status: {0}" -f (ConvertTo-YamlSafeString $driver.Status))) | Out-Null
+            $lines.Add(("    message: {0}" -f (ConvertTo-YamlSafeString $driver.Message))) | Out-Null
+        }
+    }
+
+    Set-Content -LiteralPath $script:YamlPath -Value $lines -Encoding UTF8
+    Write-Host ("YAML log written successfully: {0}" -f $script:YamlPath) -ForegroundColor Green
 }
 
-function Test-IsAdministrator {
-    try {
-        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-        $principal = New-Object Security.Principal.WindowsPrincipal($identity)
-        return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-    }
-    catch {
-        return $false
-    }
-}
-
-function Test-IsHPSystem {
-    try {
-        $manufacturer = (Get-CimInstance -ClassName Win32_ComputerSystem).Manufacturer
-        return ($manufacturer -match 'HP|Hewlett-Packard')
-    }
-    catch {
-        return $false
-    }
-}
-
+# -----------------------------
+# File/folder helpers
+# -----------------------------
 function Ensure-Folder {
-    param([string]$Path)
+    param([Parameter(Mandatory)][string]$Path)
 
     if (-not (Test-Path -LiteralPath $Path)) {
         New-Item -Path $Path -ItemType Directory -Force | Out-Null
     }
 }
 
-function ConvertTo-YamlSafeValue {
-    param(
-        [AllowNull()]
-        [object]$Value
-    )
-
-    if ($null -eq $Value) {
-        return 'null'
-    }
-
-    $text = [string]$Value
-    $text = $text -replace "`r", ' '
-    $text = $text -replace "`n", ' '
-    $text = $text -replace '"', '\"'
-    return '"' + $text + '"'
-}
-
-function Initialize-YamlLog {
-    Ensure-Folder -Path $YamlLogFolder
-
-    $timestamp = Get-Date -Format 'yyyy-MM-dd_HHmmss'
-    $fileName = "$($script:ComputerName)-HPDrivers-$timestamp.yml"
-    $script:YamlLogPath = Join-Path $YamlLogFolder $fileName
-
-    Write-Log "YAML log will be written to: $($script:YamlLogPath)" 'INFO'
-}
-
-function Add-DetectedSoftPaq {
-    param(
-        [string]$Id,
-        [string]$Name,
-        [string]$Version,
-        [string]$Category
-    )
-
-    $script:DetectedSoftPaqs.Add([PSCustomObject]@{
-        Id       = $Id
-        Name     = $Name
-        Version  = $Version
-        Category = $Category
-    }) | Out-Null
-}
-
-function Add-InstalledSoftPaqResult {
-    param(
-        [string]$Id,
-        [string]$Name,
-        [string]$Version,
-        [string]$Status,
-        [string]$Message
-    )
-
-    $script:InstalledSoftPaqResults.Add([PSCustomObject]@{
-        Id      = $Id
-        Name    = $Name
-        Version = $Version
-        Status  = $Status
-        Message = $Message
-    }) | Out-Null
-}
-
-function Write-YamlLog {
-    try {
-        if ([string]::IsNullOrWhiteSpace($script:YamlLogPath)) {
-            Initialize-YamlLog
-        }
-
-        $runEnd = Get-Date
-        $duration = [math]::Round(($runEnd - $script:RunStart).TotalSeconds, 0)
-
-        $yamlLines = New-Object System.Collections.Generic.List[string]
-
-        $yamlLines.Add('computer_name: ' + (ConvertTo-YamlSafeValue $script:ComputerName)) | Out-Null
-        $yamlLines.Add('script_name: "05_Weekend_HP_Drivers_Update.ps1"') | Out-Null
-        $yamlLines.Add('script_version: "1.4"') | Out-Null
-        $yamlLines.Add('run_started: ' + (ConvertTo-YamlSafeValue ($script:RunStart.ToString('yyyy-MM-dd HH:mm:ss')))) | Out-Null
-        $yamlLines.Add('run_finished: ' + (ConvertTo-YamlSafeValue ($runEnd.ToString('yyyy-MM-dd HH:mm:ss')))) | Out-Null
-        $yamlLines.Add('duration_seconds: ' + $duration) | Out-Null
-
-        $yamlLines.Add('options:') | Out-Null
-        $yamlLines.Add('  include_bios: ' + ($(if ($IncludeBIOS) { 'true' } else { 'false' }))) | Out-Null
-        $yamlLines.Add('  include_software: ' + ($(if ($IncludeSoftware) { 'true' } else { 'false' }))) | Out-Null
-        $yamlLines.Add('  suspend_bitlocker_for_bios: ' + ($(if ($SuspendBitLockerForBIOS) { 'true' } else { 'false' }))) | Out-Null
-        $yamlLines.Add('  working_root: ' + (ConvertTo-YamlSafeValue $WorkingRoot)) | Out-Null
-        $yamlLines.Add('  cleanup_retry_count: ' + $CleanupRetryCount) | Out-Null
-        $yamlLines.Add('  cleanup_retry_delay_seconds: ' + $CleanupRetryDelaySeconds) | Out-Null
-
-        $yamlLines.Add('cleanup_successful: ' + ($(if ($script:CleanupResult) { 'true' } else { 'false' }))) | Out-Null
-        $yamlLines.Add('overall_result: ' + (ConvertTo-YamlSafeValue $script:OverallResult)) | Out-Null
-
-        if (-not [string]::IsNullOrWhiteSpace($script:FailureMessage)) {
-            $yamlLines.Add('failure_message: ' + (ConvertTo-YamlSafeValue $script:FailureMessage)) | Out-Null
-        }
-        else {
-            $yamlLines.Add('failure_message: null') | Out-Null
-        }
-
-        $yamlLines.Add('detected_softpaqs:') | Out-Null
-        if ($script:DetectedSoftPaqs.Count -gt 0) {
-            foreach ($item in $script:DetectedSoftPaqs) {
-                $yamlLines.Add('  - id: ' + (ConvertTo-YamlSafeValue $item.Id)) | Out-Null
-                $yamlLines.Add('    name: ' + (ConvertTo-YamlSafeValue $item.Name)) | Out-Null
-                $yamlLines.Add('    version: ' + (ConvertTo-YamlSafeValue $item.Version)) | Out-Null
-                $yamlLines.Add('    category: ' + (ConvertTo-YamlSafeValue $item.Category)) | Out-Null
-            }
-        }
-        else {
-            $yamlLines.Add('  - id: null') | Out-Null
-            $yamlLines.Add('    name: "No applicable HP SoftPaq updates detected"') | Out-Null
-            $yamlLines.Add('    version: null') | Out-Null
-            $yamlLines.Add('    category: null') | Out-Null
-        }
-
-        $yamlLines.Add('install_results:') | Out-Null
-        if ($script:InstalledSoftPaqResults.Count -gt 0) {
-            foreach ($item in $script:InstalledSoftPaqResults) {
-                $yamlLines.Add('  - id: ' + (ConvertTo-YamlSafeValue $item.Id)) | Out-Null
-                $yamlLines.Add('    name: ' + (ConvertTo-YamlSafeValue $item.Name)) | Out-Null
-                $yamlLines.Add('    version: ' + (ConvertTo-YamlSafeValue $item.Version)) | Out-Null
-                $yamlLines.Add('    status: ' + (ConvertTo-YamlSafeValue $item.Status)) | Out-Null
-                $yamlLines.Add('    message: ' + (ConvertTo-YamlSafeValue $item.Message)) | Out-Null
-            }
-        }
-        else {
-            $yamlLines.Add('  - id: null') | Out-Null
-            $yamlLines.Add('    name: "No SoftPaq install operations were performed"') | Out-Null
-            $yamlLines.Add('    version: null') | Out-Null
-            $yamlLines.Add('    status: "None"') | Out-Null
-            $yamlLines.Add('    message: "None"') | Out-Null
-        }
-
-        Set-Content -Path $script:YamlLogPath -Value $yamlLines -Encoding UTF8
-        Write-Log "YAML log written successfully: $($script:YamlLogPath)" 'OK'
-    }
-    catch {
-        Write-Log "Failed to write YAML log: $($_.Exception.Message)" 'WARN'
-    }
-}
-
-function Save-PowerSettings {
-    $settings = [ordered]@{}
-
-    $settings.DisplayTimeoutDC = (
-        Get-CimInstance -Namespace root\cimv2\power -Class Win32_PowerSettingDataIndex |
-        Where-Object InstanceID -EQ 'Microsoft:PowerSettingDataIndex\{381b4222-f694-41f0-9685-ff5bb260df2e}\DC\{3c0bc021-c8a8-4e07-a973-6b14cbcb2b7e}'
-    ).SettingIndexValue / 60
-
-    $settings.DisplayTimeoutAC = (
-        Get-CimInstance -Namespace root\cimv2\power -Class Win32_PowerSettingDataIndex |
-        Where-Object InstanceID -EQ 'Microsoft:PowerSettingDataIndex\{381b4222-f694-41f0-9685-ff5bb260df2e}\AC\{3c0bc021-c8a8-4e07-a973-6b14cbcb2b7e}'
-    ).SettingIndexValue / 60
-
-    $settings.SleepTimeoutDC = (
-        Get-CimInstance -Namespace root\cimv2\power -Class Win32_PowerSettingDataIndex |
-        Where-Object InstanceID -EQ 'Microsoft:PowerSettingDataIndex\{381b4222-f694-41f0-9685-ff5bb260df2e}\DC\{29f6c1db-86da-48c5-9fdb-f2b67b1f44da}'
-    ).SettingIndexValue / 60
-
-    $settings.SleepTimeoutAC = (
-        Get-CimInstance -Namespace root\cimv2\power -Class Win32_PowerSettingDataIndex |
-        Where-Object InstanceID -EQ 'Microsoft:PowerSettingDataIndex\{381b4222-f694-41f0-9685-ff5bb260df2e}\AC\{29f6c1db-86da-48c5-9fdb-f2b67b1f44da}'
-    ).SettingIndexValue / 60
-
-    return [PSCustomObject]$settings
-}
-
-function Set-UnlimitedPowerTimeouts {
-    Write-Log "Temporarily disabling monitor and sleep timeouts..." 'INFO'
-    powercfg -change -monitor-timeout-dc 0 | Out-Null
-    powercfg -change -monitor-timeout-ac 0 | Out-Null
-    powercfg -change -standby-timeout-dc 0 | Out-Null
-    powercfg -change -standby-timeout-ac 0 | Out-Null
-}
-
-function Restore-PowerSettings {
-    param($Saved)
-
-    if ($null -eq $Saved) { return }
-
-    Write-Log "Restoring previous power timeout settings..." 'INFO'
-    powercfg -change -monitor-timeout-dc $Saved.DisplayTimeoutDC | Out-Null
-    powercfg -change -monitor-timeout-ac $Saved.DisplayTimeoutAC | Out-Null
-    powercfg -change -standby-timeout-dc $Saved.SleepTimeoutDC | Out-Null
-    powercfg -change -standby-timeout-ac $Saved.SleepTimeoutAC | Out-Null
-}
-
-function Ensure-Tls12 {
-    try {
-        [Net.ServicePointManager]::SecurityProtocol =
-            [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-        Write-Log "Enabled TLS 1.2 for PowerShell Gallery access." 'OK'
-    }
-    catch {
-        Write-Log "Could not explicitly enable TLS 1.2: $($_.Exception.Message)" 'WARN'
-    }
-}
-
-function Ensure-NuGetProvider {
-    Write-Log "Ensuring NuGet provider is installed..." 'INFO'
-    try {
-        Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope AllUsers | Out-Null
-        Write-Log "NuGet provider is ready." 'OK'
-    }
-    catch {
-        Write-Log "NuGet provider installation/check failed: $($_.Exception.Message)" 'WARN'
-    }
-}
-
-function Ensure-PSGalleryTrusted {
-    try {
-        $repo = Get-PSRepository -Name 'PSGallery' -ErrorAction Stop
-        if ($repo.InstallationPolicy -ne 'Trusted') {
-            Set-PSRepository -Name 'PSGallery' -InstallationPolicy Trusted
-            Write-Log "Set PSGallery repository to Trusted." 'OK'
-        }
-        else {
-            Write-Log "PSGallery repository already Trusted." 'INFO'
-        }
-    }
-    catch {
-        Write-Log "Could not validate/set PSGallery trust: $($_.Exception.Message)" 'WARN'
-    }
-}
-
-function Install-ModuleIfPossible {
-    param(
-        [Parameter(Mandatory)][string]$Name,
-        [switch]$AllowClobber
-    )
-
-    $args = @{
-        Name        = $Name
-        Scope       = 'AllUsers'
-        Force       = $true
-        ErrorAction = 'Stop'
-    }
-
-    if ($AllowClobber) {
-        $args['AllowClobber'] = $true
-    }
-
-    Install-Module @args | Out-Null
-}
-
-function Ensure-PackageTooling {
-    Write-Log "Ensuring PowerShell package tooling is current enough for HPCMSL..." 'INFO'
-
-    Ensure-Tls12
-    Ensure-NuGetProvider
-    Ensure-PSGalleryTrusted
+function Ensure-WorkingFolderPermissions {
+    param([Parameter(Mandatory)][string]$Path)
 
     try {
-        Install-ModuleIfPossible -Name 'PowerShellGet' -AllowClobber
-        Write-Log "PowerShellGet installed/updated." 'OK'
+        & icacls.exe $Path '/grant' '*S-1-1-0:(OI)(CI)F' '/T' '/C' | Out-Null
     }
     catch {
-        Write-Log "PowerShellGet update failed: $($_.Exception.Message)" 'WARN'
+        Write-Log ("Unable to relax working folder permissions on {0}: {1}" -f $Path, $_.Exception.Message) 'WARN'
     }
-
-    try {
-        Install-ModuleIfPossible -Name 'Microsoft.PowerShell.PSResourceGet'
-        Write-Log "Microsoft.PowerShell.PSResourceGet installed/updated." 'OK'
-    }
-    catch {
-        Write-Log "PSResourceGet install/update failed: $($_.Exception.Message)" 'WARN'
-    }
-
-    try {
-        Import-Module PowerShellGet -Force -ErrorAction Stop
-    }
-    catch {
-        Write-Log "Could not import PowerShellGet: $($_.Exception.Message)" 'WARN'
-    }
-
-    try {
-        Import-Module Microsoft.PowerShell.PSResourceGet -Force -ErrorAction Stop
-    }
-    catch {
-        Write-Log "Could not import PSResourceGet yet: $($_.Exception.Message)" 'WARN'
-    }
-}
-
-function Ensure-HPCMSL {
-    Write-Log "Ensuring HP CMSL is available..." 'INFO'
-
-    Ensure-PackageTooling
-
-    $moduleLoaded = $false
-
-    if (-not (Get-Module -ListAvailable -Name HPCMSL)) {
-        try {
-            if (Get-Command -Name Install-PSResource -ErrorAction SilentlyContinue) {
-                Write-Log "Installing HPCMSL with Install-PSResource..." 'INFO'
-                Install-PSResource -Name HPCMSL -Scope AllUsers -TrustRepository -Quiet -AcceptLicense -ErrorAction Stop | Out-Null
-            }
-            else {
-                Write-Log "Install-PSResource not available. Falling back to Install-Module for HPCMSL..." 'WARN'
-                Install-ModuleIfPossible -Name 'HPCMSL' -AllowClobber
-            }
-        }
-        catch {
-            Write-Log "Primary HPCMSL install attempt failed: $($_.Exception.Message)" 'WARN'
-
-            try {
-                Write-Log "Trying fallback HPCMSL install with Install-Module..." 'INFO'
-                Install-ModuleIfPossible -Name 'HPCMSL' -AllowClobber
-            }
-            catch {
-                throw "Failed to install HPCMSL. $($_.Exception.Message)"
-            }
-        }
-    }
-    else {
-        Write-Log "HPCMSL already present on system." 'INFO'
-    }
-
-    try {
-        Import-Module HPCMSL -Force -ErrorAction Stop
-        $moduleLoaded = $true
-    }
-    catch {
-        try {
-            Import-Module HP.Softpaq -Force -ErrorAction Stop
-            $moduleLoaded = $true
-        }
-        catch {
-            throw "HPCMSL/HP.Softpaq could not be imported after installation. $($_.Exception.Message)"
-        }
-    }
-
-    if ($moduleLoaded) {
-        Write-Log "HP CMSL imported successfully." 'OK'
-    }
-}
-
-function Get-HPSoftpaqCategories {
-    $categories = @('Driver')
-
-    if ($IncludeBIOS) {
-        Write-Log "IncludeBIOS was requested, but this script is hardened to block BIOS updates. BIOS updates will not be installed." 'WARN'
-    }
-
-    if ($IncludeSoftware) {
-        $categories += @('Diagnostic', 'Dock', 'Software', 'Utility')
-    }
-
-    return $categories
-}
-
-function Get-DriverList {
-    $categories = Get-HPSoftpaqCategories
-    Write-Log "Querying HP SoftPaq list for categories: $($categories -join ', ')" 'INFO'
-
-    $list = Get-SoftpaqList -Category $categories
-
-    if (-not $list) {
-        Write-Log "No applicable HP SoftPaq updates were returned." 'OK'
-        return @()
-    }
-
-    foreach ($item in $list) {
-        $category = $null
-        if ($item.PSObject.Properties.Name -contains 'Category') {
-            $category = [string]$item.Category
-        }
-
-        Add-DetectedSoftPaq -Id ([string]$item.Id) -Name ([string]$item.Name) -Version ([string]$item.Version) -Category $category
-        Write-Log "Detected: [$($item.Id)] $($item.Name) Version $($item.Version)" 'INFO'
-    }
-
-    return @($list)
-}
-
-
-function Exclude-BiosAndFirmwareSoftpaqs {
-    param([object[]]$Softpaqs)
-
-    if (-not $Softpaqs) {
-        return @()
-    }
-
-    $blockedPattern = '(?i)\b(BIOS|Firmware|UEFI|System\s+Firmware|Embedded\s+Controller|EC\s+Firmware|Thunderbolt\s+Firmware|Dock\s+Firmware)\b'
-    $allowed = @()
-
-    foreach ($item in $Softpaqs) {
-        $category = ''
-        $name = ''
-        $id = ''
-        $version = ''
-
-        if ($null -ne $item) {
-            if ($item.PSObject.Properties.Name -contains 'Category' -and $null -ne $item.Category) {
-                $category = [string]$item.Category
-            }
-            if ($item.PSObject.Properties.Name -contains 'Name' -and $null -ne $item.Name) {
-                $name = [string]$item.Name
-            }
-            if ($item.PSObject.Properties.Name -contains 'Id' -and $null -ne $item.Id) {
-                $id = [string]$item.Id
-            }
-            if ($item.PSObject.Properties.Name -contains 'Version' -and $null -ne $item.Version) {
-                $version = [string]$item.Version
-            }
-        }
-
-        $isBlocked = $false
-        if ($category -match '(?i)\bBIOS\b' -or $category -match '(?i)\bFirmware\b' -or $name -match $blockedPattern) {
-            $isBlocked = $true
-        }
-
-        if ($isBlocked) {
-            Write-Log "Blocking BIOS/Firmware SoftPaq: [$id] $name (Category: $category)" 'WARN'
-            Add-InstalledSoftPaqResult -Id $id -Name $name -Version $version -Status 'Blocked' -Message 'Skipped because BIOS/Firmware updates are not allowed in this script'
-        }
-        else {
-            $allowed += $item
-        }
-    }
-
-    return $allowed
-}
-
-function Install-SoftpaqList {
-    param([object[]]$Softpaqs)
-
-    $failures = 0
-
-    foreach ($item in $Softpaqs) {
-        try {
-            Write-Log "Installing SoftPaq [$($item.Id)] $($item.Name)..." 'INFO'
-            Get-Softpaq -Number $item.Id -Action SilentInstall | Out-Null
-            Write-Log "Installed SoftPaq [$($item.Id)] $($item.Name)." 'OK'
-            Add-InstalledSoftPaqResult -Id ([string]$item.Id) -Name ([string]$item.Name) -Version ([string]$item.Version) -Status 'Succeeded' -Message 'Installed successfully'
-        }
-        catch {
-            $msg = $_.Exception.Message
-            Write-Log "Failed SoftPaq [$($item.Id)] $($item.Name): $msg" 'WARN'
-            Add-InstalledSoftPaqResult -Id ([string]$item.Id) -Name ([string]$item.Name) -Version ([string]$item.Version) -Status 'Failed' -Message $msg
-            $failures++
-        }
-    }
-
-    return $failures
-}
-
-function Suspend-BitLockerIfNeeded {
-    if ($SuspendBitLockerForBIOS) {
-        Write-Log "SuspendBitLockerForBIOS was requested, but this script is hardened to block BIOS updates. BitLocker suspend will not be used." 'WARN'
-    }
-    return
 }
 
 function Remove-WorkingFolderRobust {
     param(
         [Parameter(Mandatory)][string]$Path,
-        [int]$RetryCount = 12,
-        [int]$RetryDelaySeconds = 10
+        [int]$RetryCount = 6,
+        [int]$RetryDelaySeconds = 5
     )
 
     if (-not (Test-Path -LiteralPath $Path)) {
-        Write-Log "Working folder already absent: $Path" 'OK'
-        return $true
+        Write-Log ("Working folder already absent: {0}" -f $Path) 'OK'
+        return
     }
 
-    Write-Log "Attempting to remove working folder: $Path" 'INFO'
-
+    Write-Log ("Attempting to remove working folder: {0}" -f $Path) 'INFO'
     for ($i = 1; $i -le $RetryCount; $i++) {
         try {
-            Start-Sleep -Seconds 2
             Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
-
-            if (-not (Test-Path -LiteralPath $Path)) {
-                Write-Log "Working folder removed successfully." 'OK'
-                return $true
-            }
+            Write-Log 'Working folder removed successfully.' 'OK'
+            return
         }
         catch {
-            Write-Log "Cleanup attempt $i/$RetryCount failed: $($_.Exception.Message)" 'WARN'
-        }
-
-        if ($i -lt $RetryCount) {
+            if ($i -eq $RetryCount) {
+                Add-RunFailure ("Failed to remove working folder after retries: {0}" -f $_.Exception.Message)
+                return
+            }
             Start-Sleep -Seconds $RetryDelaySeconds
         }
     }
-
-    Write-Log "Working folder still exists after cleanup attempts: $Path" 'ERROR'
-    return $false
 }
 
+# -----------------------------
+# Power policy
+# -----------------------------
+function Set-LocalPowerPolicyDesktop {
+    try {
+        $base = 'HKLM:\SOFTWARE\Policies\Microsoft\Power\PowerSettings'
+
+        $displayGuid         = '3C0BC021-C8A8-4E07-A973-6B14CBCB2B7E'
+        $sleepGuid           = '29F6C1DB-86DA-48C5-9FDB-F2B67B1F44DA'
+        $unattendedSleepGuid = '7BC4A2F9-D8FC-4469-B07B-33EB785AACA0'
+        $hybridSleepGuid     = '94AC6D29-73CE-41A6-809F-6363BA21B47E'
+        $hibernateGuid       = '9D7815A6-7EE4-497E-8888-515A05F02364'
+
+        foreach ($guid in @($displayGuid,$sleepGuid,$unattendedSleepGuid,$hybridSleepGuid,$hibernateGuid)) {
+            $path = Join-Path $base $guid
+            if (-not (Test-Path -LiteralPath $path)) {
+                New-Item -Path $path -Force | Out-Null
+            }
+        }
+
+        New-ItemProperty -Path (Join-Path $base $displayGuid) -Name ACSettingIndex -PropertyType DWord -Value 3600 -Force | Out-Null
+        New-ItemProperty -Path (Join-Path $base $displayGuid) -Name DCSettingIndex -PropertyType DWord -Value 3600 -Force | Out-Null
+        New-ItemProperty -Path (Join-Path $base $sleepGuid) -Name ACSettingIndex -PropertyType DWord -Value 0 -Force | Out-Null
+        New-ItemProperty -Path (Join-Path $base $sleepGuid) -Name DCSettingIndex -PropertyType DWord -Value 0 -Force | Out-Null
+        New-ItemProperty -Path (Join-Path $base $unattendedSleepGuid) -Name ACSettingIndex -PropertyType DWord -Value 0 -Force | Out-Null
+        New-ItemProperty -Path (Join-Path $base $unattendedSleepGuid) -Name DCSettingIndex -PropertyType DWord -Value 0 -Force | Out-Null
+        New-ItemProperty -Path (Join-Path $base $hybridSleepGuid) -Name ACSettingIndex -PropertyType DWord -Value 1 -Force | Out-Null
+        New-ItemProperty -Path (Join-Path $base $hybridSleepGuid) -Name DCSettingIndex -PropertyType DWord -Value 1 -Force | Out-Null
+        New-ItemProperty -Path (Join-Path $base $hibernateGuid) -Name ACSettingIndex -PropertyType DWord -Value 0 -Force | Out-Null
+        New-ItemProperty -Path (Join-Path $base $hibernateGuid) -Name DCSettingIndex -PropertyType DWord -Value 0 -Force | Out-Null
+
+        powercfg -change -monitor-timeout-ac 60 > $null 2>&1
+        powercfg -change -monitor-timeout-dc 60 > $null 2>&1
+        powercfg -change -standby-timeout-ac 0 > $null 2>&1
+        powercfg -change -standby-timeout-dc 0 > $null 2>&1
+        powercfg -hibernate off > $null 2>&1
+
+        Add-YamlAction 'Applied local power policy (display 60 minutes, sleep never).'
+        Write-Log 'Local power policy applied successfully.' 'OK'
+    }
+    catch {
+        if (($_ | Out-String) -match 'Group policy override settings exist') {
+            Write-Log 'Local power policy already enforced by policy.' 'WARN'
+        }
+        else {
+            Add-RunFailure ("Failed to apply local power policy: {0}" -f $_.Exception.Message)
+        }
+    }
+}
+
+function Enforce-DesktopPowerSettings {
+    $highPerf = (powercfg -l | Select-String 'High performance' | ForEach-Object {
+        if ($_ -match '([A-Fa-f0-9\-]{36})') { $matches[1] }
+    } | Select-Object -First 1)
+
+    if ($highPerf) {
+        powercfg -setactive $highPerf > $null 2>&1
+        Write-Log ("High Performance power plan available: {0}" -f $highPerf) 'OK'
+    }
+    else {
+        Write-Log 'High Performance power plan was not found. Continuing with current plan.' 'WARN'
+    }
+
+    powercfg -change -monitor-timeout-ac 60 > $null 2>&1
+    powercfg -change -monitor-timeout-dc 60 > $null 2>&1
+    powercfg -change -standby-timeout-ac 0 > $null 2>&1
+    powercfg -change -standby-timeout-dc 0 > $null 2>&1
+    powercfg -hibernate off > $null 2>&1
+
+    Write-Log 'Desktop power settings enforced successfully.' 'OK'
+}
+
+# -----------------------------
+# Vendor detection
+# -----------------------------
+function Get-SystemManufacturer {
+    try {
+        return (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).Manufacturer
+    }
+    catch {
+        throw "Unable to determine system manufacturer. $($_.Exception.Message)"
+    }
+}
+
+function Get-DriverVendor {
+    $manufacturer = Get-SystemManufacturer
+    Write-Log ("Detected manufacturer: {0}" -f $manufacturer) 'INFO'
+
+    if ($manufacturer -match 'Dell') { return 'Dell' }
+    if ($manufacturer -match 'HP|Hewlett-Packard') { return 'HP' }
+
+    throw "Unsupported manufacturer for this script: $manufacturer"
+}
+
+# -----------------------------
+# HP Support - HP Image Assistant extracted-folder deployment
+# -----------------------------
+function Get-HPSystemModelInfo {
+    [CmdletBinding()]
+    param()
+
+    $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
+    $csp = Get-CimInstance Win32_ComputerSystemProduct -ErrorAction SilentlyContinue
+    $bb = Get-CimInstance Win32_BaseBoard -ErrorAction SilentlyContinue
+
+    $platform = $null
+    if ($bb -and $bb.Product) {
+        $platform = $bb.Product.ToString().Trim().ToUpper()
+        if ($platform.Length -gt 4) {
+            $platform = $platform.Substring(0,4)
+        }
+    }
+
+    $model = if ($cs.Model) { $cs.Model.ToString().Trim() } else { 'Unknown' }
+    $sku = if ($csp -and $csp.Version) { $csp.Version.ToString().Trim() } else { 'Unknown' }
+
+    $info = [pscustomobject]@{
+        Manufacturer = $cs.Manufacturer
+        Model        = $model
+        SKU          = $sku
+        Platform     = $platform
+    }
+
+    Write-Log ("Detected HP system model: {0}" -f $info.Model) 'INFO'
+    Write-Log ("Detected HP platform/baseboard ID: {0}" -f $info.Platform) 'INFO'
+    Add-YamlAction ("Detected HP system model: {0}" -f $info.Model)
+    Add-YamlAction ("Detected HP platform/baseboard ID: {0}" -f $info.Platform)
+
+    return $info
+}
+
+function Get-ExistingHPIAExecutable {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$PreferredFolder)
+
+    $candidateFolders = New-Object System.Collections.Generic.List[string]
+
+    if (-not [string]::IsNullOrWhiteSpace($PreferredFolder)) {
+        $candidateFolders.Add($PreferredFolder) | Out-Null
+    }
+
+    foreach ($folder in @(
+        'C:\Program Files\HP\HP Image Assistant',
+        'C:\Program Files (x86)\HP\HP Image Assistant',
+        'C:\SWSetup\HPImageAssistant',
+        'C:\ProgramData\Compton\HPImageAssistant'
+    )) {
+        if (-not $candidateFolders.Contains($folder)) {
+            $candidateFolders.Add($folder) | Out-Null
+        }
+    }
+
+    foreach ($folder in $candidateFolders) {
+        if ([string]::IsNullOrWhiteSpace($folder) -or -not (Test-Path -LiteralPath $folder)) {
+            continue
+        }
+
+        $exe = Get-ChildItem -Path $folder -Recurse -Filter 'HPImageAssistant.exe' -File -ErrorAction SilentlyContinue |
+            Sort-Object FullName |
+            Select-Object -First 1
+
+        if ($exe) {
+            return $exe.FullName
+        }
+    }
+
+    return $null
+}
+
+function Install-HPIAFromExtractedFolder {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$SourceFolder,
+        [Parameter(Mandatory)][string]$DestinationFolder
+    )
+
+    Write-Section 'HP Image Assistant Local Deployment'
+    Write-Log ("HPIA source folder: {0}" -f $SourceFolder) 'INFO'
+    Write-Log ("HPIA local folder: {0}" -f $DestinationFolder) 'INFO'
+    Add-YamlAction ("HPIA source folder: {0}" -f $SourceFolder)
+    Add-YamlAction ("HPIA local folder: {0}" -f $DestinationFolder)
+
+    $existingExe = Get-ExistingHPIAExecutable -PreferredFolder $DestinationFolder
+    if ($existingExe) {
+        try {
+            $existingVersion = (Get-Item -LiteralPath $existingExe -ErrorAction Stop).VersionInfo.FileVersion
+            Write-Log ("HP Image Assistant is already installed/found at: {0} (Version: {1})" -f $existingExe, $existingVersion) 'OK'
+            Add-YamlAction ("Skipped HPIA local deployment because HPImageAssistant.exe already exists: {0} (Version: {1})" -f $existingExe, $existingVersion)
+        }
+        catch {
+            Write-Log ("HP Image Assistant is already installed/found at: {0}" -f $existingExe) 'OK'
+            Add-YamlAction ("Skipped HPIA local deployment because HPImageAssistant.exe already exists: {0}" -f $existingExe)
+        }
+
+        return $existingExe
+    }
+
+    Write-Log 'HP Image Assistant was not found locally. Deploying from extracted source folder.' 'INFO'
+    Add-YamlAction 'HP Image Assistant was not found locally. Deploying from extracted source folder.'
+
+    if (-not (Test-Path -LiteralPath $SourceFolder)) {
+        throw "HPIA source folder not found: $SourceFolder"
+    }
+
+    $sourceFiles = @(Get-ChildItem -Path $SourceFolder -Recurse -File -ErrorAction SilentlyContinue)
+    Write-Log ("Source HPIA file count: {0}" -f $sourceFiles.Count) 'INFO'
+    Add-YamlAction ("Source HPIA file count: {0}" -f $sourceFiles.Count)
+
+    $sourceExe = Get-ChildItem -Path $SourceFolder -Recurse -Filter 'HPImageAssistant.exe' -File -ErrorAction SilentlyContinue |
+        Sort-Object FullName |
+        Select-Object -First 1
+
+    if (-not $sourceExe) {
+        throw "HPImageAssistant.exe was not found anywhere under source folder: $SourceFolder"
+    }
+
+    Write-Log ("Found source HPImageAssistant.exe: {0}" -f $sourceExe.FullName) 'OK'
+    Add-YamlAction ("Found source HPImageAssistant.exe: {0}" -f $sourceExe.FullName)
+
+    try {
+        if (Test-Path -LiteralPath $DestinationFolder) {
+            Write-Log ("Removing existing local HPIA folder before clean deployment: {0}" -f $DestinationFolder) 'INFO'
+            Remove-Item -LiteralPath $DestinationFolder -Recurse -Force -ErrorAction Stop
+        }
+
+        New-Item -Path $DestinationFolder -ItemType Directory -Force | Out-Null
+
+        Write-Log 'Copying extracted HPIA files locally with robocopy...' 'INFO'
+
+        $roboLog = Join-Path $DestinationFolder 'HPIA_robocopy.log'
+        $roboArgs = @(
+            ('"{0}"' -f $SourceFolder),
+            ('"{0}"' -f $DestinationFolder),
+            '/E',
+            '/COPY:DAT',
+            '/R:3',
+            '/W:5',
+            '/NFL',
+            '/NDL',
+            '/NP',
+            ('/LOG:"{0}"' -f $roboLog)
+        )
+
+        $robo = Start-Process -FilePath "$env:SystemRoot\System32\robocopy.exe" -ArgumentList ($roboArgs -join ' ') -Wait -PassThru -NoNewWindow
+
+        # Robocopy exit codes 0-7 are success/non-fatal. 8+ indicates failure.
+        if ($robo.ExitCode -ge 8) {
+            throw "Robocopy failed copying HPIA files. Exit code: $($robo.ExitCode). Log: $roboLog"
+        }
+
+        Write-Log ("HPIA files copied locally with robocopy exit code {0}." -f $robo.ExitCode) 'OK'
+        Add-YamlAction ("HPIA files copied locally with robocopy exit code {0}." -f $robo.ExitCode)
+
+        try {
+            Get-ChildItem -Path $DestinationFolder -Recurse -File -ErrorAction SilentlyContinue |
+                ForEach-Object { Unblock-File -Path $_.FullName -ErrorAction SilentlyContinue }
+        }
+        catch {}
+
+        $copiedFiles = @(Get-ChildItem -Path $DestinationFolder -Recurse -File -ErrorAction SilentlyContinue)
+        Write-Log ("Local HPIA folder file count after copy: {0}" -f $copiedFiles.Count) 'INFO'
+        Add-YamlAction ("Local HPIA folder file count after copy: {0}" -f $copiedFiles.Count)
+
+        $localExeItem = Get-ChildItem -Path $DestinationFolder -Recurse -Filter 'HPImageAssistant.exe' -File -ErrorAction SilentlyContinue |
+            Sort-Object FullName |
+            Select-Object -First 1
+
+        if (-not $localExeItem) {
+            $sampleFiles = $copiedFiles | Select-Object -First 20 | ForEach-Object { $_.FullName }
+            foreach ($sample in $sampleFiles) {
+                Write-Log ("Local HPIA sample file: {0}" -f $sample) 'WARN'
+            }
+
+            throw "HPImageAssistant.exe was not found anywhere under local copy folder: $DestinationFolder"
+        }
+
+        $localExe = $localExeItem.FullName
+
+        Write-Log ("Resolved local HPImageAssistant.exe location: {0}" -f $localExe) 'OK'
+        Add-YamlAction ("Resolved local HPImageAssistant.exe location: {0}" -f $localExe)
+
+        return $localExe
+    }
+    catch {
+        throw "Failed to deploy HP Image Assistant locally: $($_.Exception.Message)"
+    }
+}
+
+function Get-HpiaExitStatus {
+    param([int]$ExitCode)
+
+    switch ($ExitCode) {
+        0    { return 'success' }
+        1    { return 'failed' }
+        2    { return 'cancelled' }
+        3    { return 'needs_reboot' }
+        256  { return 'no_recommendations_or_success' }
+        257  { return 'recommendations_found' }
+        3010 { return 'needs_reboot' }
+        3011 { return 'not_auto_installable_skipped' }
+        4096 { return 'no_applicable_updates_or_platform_not_supported' }
+        4097 { return 'invalid_parameters' }
+        8193 { return 'hpia_analysis_or_report_generation_error' }
+        default { return 'unknown' }
+    }
+}
+
+function Get-HpiaRecommendationObjects {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ReportFolder
+    )
+
+    # Use a flexible PowerShell array instead of a strongly typed generic list.
+    # HPIA reports can contain mixed object types from JSON and XML parsing.
+    $recommendations = @()
+
+    $jsonFiles = @(Get-ChildItem -Path $ReportFolder -Filter '*.json' -Recurse -File -ErrorAction SilentlyContinue)
+    foreach ($jsonFile in $jsonFiles) {
+        try {
+            $json = Get-Content -LiteralPath $jsonFile.FullName -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+
+            if ($json.HPIA -and $json.HPIA.Recommendations) {
+                foreach ($rec in @($json.HPIA.Recommendations)) {
+                    $recommendations += $rec
+                    try {
+                        Write-Log ("HPIA JSON recommendation type: {0}" -f $rec.GetType().FullName) 'INFO'
+                    }
+                    catch {}
+                }
+            }
+            elseif ($json.Recommendations) {
+                foreach ($rec in @($json.Recommendations)) {
+                    $recommendations += $rec
+                    try {
+                        Write-Log ("HPIA JSON recommendation type: {0}" -f $rec.GetType().FullName) 'INFO'
+                    }
+                    catch {}
+                }
+            }
+        }
+        catch {
+            Write-Log ("Unable to parse HPIA JSON report {0}: {1}" -f $jsonFile.FullName, $_.Exception.Message) 'WARN'
+        }
+    }
+
+    $xmlFiles = @(Get-ChildItem -Path $ReportFolder -Filter '*.xml' -Recurse -File -ErrorAction SilentlyContinue)
+    foreach ($xmlFile in $xmlFiles) {
+        try {
+            [xml]$xml = Get-Content -LiteralPath $xmlFile.FullName -Raw -ErrorAction Stop
+
+            $nodes = @($xml.SelectNodes('//*[contains(translate(local-name(), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "recommend")]'))
+            foreach ($node in $nodes) {
+                $recommendations += $node
+                try {
+                    Write-Log ("HPIA XML recommendation node type: {0}" -f $node.GetType().FullName) 'INFO'
+                }
+                catch {}
+            }
+        }
+        catch {
+            Write-Log ("Unable to parse HPIA XML report {0}: {1}" -f $xmlFile.FullName, $_.Exception.Message) 'WARN'
+        }
+    }
+
+    return @($recommendations)
+}
+
+function Get-HpiaRecommendationValue {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Recommendation,
+        [Parameter(Mandatory)][string[]]$PropertyNames
+    )
+
+    foreach ($prop in $PropertyNames) {
+        try {
+            if ($Recommendation.PSObject.Properties.Name -contains $prop) {
+                $value = $Recommendation.$prop
+                if ($null -ne $value -and -not [string]::IsNullOrWhiteSpace($value.ToString())) {
+                    return $value.ToString()
+                }
+            }
+        }
+        catch {}
+    }
+
+    # XML fallback
+    try {
+        foreach ($prop in $PropertyNames) {
+            $node = $Recommendation.SelectSingleNode('.//*[local-name()="' + $prop + '"]')
+            if ($node -and -not [string]::IsNullOrWhiteSpace($node.InnerText)) {
+                return $node.InnerText.Trim()
+            }
+        }
+    }
+    catch {}
+
+    return $null
+}
+
+function Get-HpiaSoftPaqNumber {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Recommendation)
+
+    $candidate = Get-HpiaRecommendationValue -Recommendation $Recommendation -PropertyNames @(
+        'SoftPaqId','SoftpaqId','SoftPaq','Softpaq','SoftPaqNumber','SoftpaqNumber','SP','Id','ID','Number'
+    )
+
+    if ($candidate -match '(?i)sp?(\d{5,6})') {
+        return $matches[1]
+    }
+
+    $text = ($Recommendation | Out-String)
+    if ($text -match '(?i)sp(\d{5,6})') {
+        return $matches[1]
+    }
+
+    if ($text -match '\b(\d{5,6})\b') {
+        return $matches[1]
+    }
+
+    return $null
+}
+
+function Get-HpiaRecommendationCategory {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Recommendation)
+
+    return (Get-HpiaRecommendationValue -Recommendation $Recommendation -PropertyNames @(
+        'Category','Type','RecommendationType','ComponentType','Class','Group'
+    ))
+}
+
+function Get-HpiaRecommendationName {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Recommendation)
+
+    $name = Get-HpiaRecommendationValue -Recommendation $Recommendation -PropertyNames @(
+        'Name','Title','Component','ComponentName','Description','SoftPaqName','SoftpaqName'
+    )
+
+    if ($name) { return $name }
+
+    $text = ($Recommendation | Out-String).Trim()
+    if ($text.Length -gt 160) {
+        return $text.Substring(0,160)
+    }
+
+    return $text
+}
+
+function New-HpiaDriverSPList {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ReportFolder,
+        [Parameter(Mandatory)][string]$SPListPath
+    )
+
+    $recommendations = @(Get-HpiaRecommendationObjects -ReportFolder $ReportFolder)
+    Write-Log ("HPIA recommendations parsed from reports: {0}" -f $recommendations.Count) 'INFO'
+    Add-YamlAction ("HPIA recommendations parsed from reports: {0}" -f $recommendations.Count)
+
+    $selected = @()
+    $seen = @{}
+
+    foreach ($rec in $recommendations) {
+        $category = Get-HpiaRecommendationCategory -Recommendation $rec
+        $name = Get-HpiaRecommendationName -Recommendation $rec
+        $sp = Get-HpiaSoftPaqNumber -Recommendation $rec
+
+        if (-not $sp) {
+            continue
+        }
+
+        # Exclude BIOS/Firmware explicitly.
+        $combined = ("{0} {1}" -f $category, $name)
+        if ($combined -match '(?i)\bBIOS\b|Firmware') {
+            $script:SkippedList.Add(("SP{0} {1}" -f $sp, $name)) | Out-Null
+            Add-DriverResult -Vendor 'HP' -Name $name -Id $sp -Category $category -Status 'Blocked' -Message 'Excluded because it appears to be BIOS/Firmware.'
+            continue
+        }
+
+        # Prefer driver-like recommendations, but allow blank category if the SoftPaq was recommended and not BIOS/Firmware.
+        if ($combined -notmatch '(?i)Driver|Bluetooth|Chipset|Audio|Graphics|Video|LAN|WLAN|Wireless|NIC|Touch|Fingerprint|Card Reader|Storage|Serial|USB|Management Engine' -and $category) {
+            $script:SkippedList.Add(("SP{0} {1}" -f $sp, $name)) | Out-Null
+            Add-DriverResult -Vendor 'HP' -Name $name -Id $sp -Category $category -Status 'Skipped' -Message 'Excluded because it did not appear to be a driver recommendation.'
+            continue
+        }
+
+        if (-not $seen.ContainsKey($sp)) {
+            $seen[$sp] = $true
+            $selected += $sp
+            Add-DriverResult -Vendor 'HP' -Name $name -Id $sp -Category $category -Status 'Detected' -Message 'Selected for HPIA SPList install.'
+        }
+    }
+
+    if (@($selected).Count -gt 0) {
+        Set-Content -LiteralPath $SPListPath -Value $selected -Encoding ASCII
+        Write-Log ("Created filtered HPIA SPList with {0} SoftPaqs: {1}" -f @($selected).Count, $SPListPath) 'OK'
+        Add-YamlAction ("Created filtered HPIA SPList with {0} SoftPaqs: {1}" -f @($selected).Count, $SPListPath)
+    }
+    else {
+        Write-Log 'No non-BIOS/Firmware driver SoftPaq recommendations were selected from HPIA reports.' 'OK'
+        Add-YamlAction 'No non-BIOS/Firmware driver SoftPaq recommendations were selected from HPIA reports.'
+    }
+
+    return @($selected)
+}
+
+
+function Invoke-HPDriverUpdates {
+    Write-Section 'HP Driver Analysis and Installation'
+
+    $hpInfo = Get-HPSystemModelInfo
+
+    $hpiaExe = Install-HPIAFromExtractedFolder -SourceFolder $HpiaSourceFolder -DestinationFolder $LocalHpiaFolder
+
+    $hpiaReportFolder = Join-Path $YamlLogFolder 'HPIA'
+    $hpiaDownloadFolder = Join-Path $WorkingRoot 'HPIADownloads'
+    $hpiaExtractFolder = Join-Path $WorkingRoot 'HPIAExtracted'
+
+    Ensure-Folder -Path $hpiaReportFolder
+    Ensure-Folder -Path $hpiaDownloadFolder
+    Ensure-Folder -Path $hpiaExtractFolder
+    Ensure-Folder -Path 'C:\Temp'
+
+    # HPIA is more reliable under Task Scheduler/SYSTEM when TEMP/TMP are local and TLS 1.2 is forced.
+    $env:TEMP = 'C:\Temp'
+    $env:TMP  = 'C:\Temp'
+
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Write-Log 'TLS 1.2 enabled for HP Image Assistant network operations.' 'INFO'
+        Add-YamlAction 'TLS 1.2 enabled for HPIA network operations.'
+    }
+    catch {
+        Write-Log ("Unable to force TLS 1.2 before HPIA run: {0}" -f $_.Exception.Message) 'WARN'
+        Add-YamlAction ("Unable to force TLS 1.2 before HPIA run: {0}" -f $_.Exception.Message)
+    }
+
+    # Production unattended HPIA workflow:
+    # - Avoids /Action:List because it has been returning 8193 on this platform.
+    # - Uses /Category:Drivers to avoid BIOS/Firmware/Dock/Thunderbolt firmware during unattended runs.
+    # - Uses /Noninteractive, /AutoCleanup, and /Debug for scheduled task reliability and better logs.
+    Write-Log 'Running HP Image Assistant production analyze/install pass for drivers only...' 'INFO'
+    Add-YamlAction 'Running HPIA production analyze/install pass for drivers only.'
+
+    $hpiaArgs = @(
+        '/Operation:Analyze',
+        '/Action:Install',
+        '/Category:Drivers',
+        '/Selection:All',
+        '/Silent',
+        '/Noninteractive',
+        '/AutoCleanup',
+        '/Debug',
+        "/ReportFolder:`"$hpiaReportFolder`"",
+        "/SoftpaqDownloadFolder:`"$hpiaDownloadFolder`"",
+        "/SoftpaqExtractFolder:`"$hpiaExtractFolder`""
+    )
+
+    Write-Log ("HPIA production command: {0} {1}" -f $hpiaExe, ($hpiaArgs -join ' ')) 'INFO'
+    Add-YamlAction ("HPIA production command: {0} {1}" -f $hpiaExe, ($hpiaArgs -join ' '))
+
+    Write-Progress -Activity 'HP Image Assistant' -Status ("Installing recommended drivers for {0}" -f $hpInfo.Model) -PercentComplete 50
+
+    $hpiaProc = Start-Process -FilePath $hpiaExe -ArgumentList ($hpiaArgs -join ' ') -Wait -PassThru -NoNewWindow
+    $exitCode = [int]$hpiaProc.ExitCode
+    $status = Get-HpiaExitStatus -ExitCode $exitCode
+
+    Write-Progress -Activity 'HP Image Assistant' -Completed
+
+    Write-Log ("HP Image Assistant production pass completed with exit code {0} ({1})." -f $exitCode, $status) 'INFO'
+    Add-YamlAction ("HP Image Assistant production pass completed with exit code {0} ({1})." -f $exitCode, $status)
+
+    $downloadedFiles = @(Get-ChildItem -Path $hpiaDownloadFolder -File -Recurse -ErrorAction SilentlyContinue)
+    foreach ($file in $downloadedFiles) {
+        Add-DriverResult -Vendor 'HP' -Name $file.Name -Id $null -Category 'Driver' -Status 'Detected' -Message ("Downloaded/processed by HPIA: {0}" -f $file.FullName)
+    }
+
+    $reportFiles = @(Get-ChildItem -Path $hpiaReportFolder -File -Recurse -ErrorAction SilentlyContinue)
+    foreach ($report in $reportFiles) {
+        Add-YamlAction ("HPIA report generated: {0}" -f $report.FullName)
+    }
+
+    switch ($exitCode) {
+        0 {
+            Write-Log 'HPIA completed successfully.' 'OK'
+            Add-YamlAction 'HPIA completed successfully.'
+            return
+        }
+
+        256 {
+            Write-Log 'HPIA completed successfully. No applicable driver recommendations were found or no action was required.' 'OK'
+            Add-YamlAction 'HPIA completed successfully with no applicable driver recommendations or no action required.'
+            return
+        }
+
+        257 {
+            Write-Log 'HPIA completed and reported recommendations/driver actions.' 'OK'
+            Add-YamlAction 'HPIA completed and reported recommendations/driver actions.'
+            return
+        }
+
+        3010 {
+            Write-Log 'HPIA completed successfully. Reboot required.' 'WARN'
+            Add-YamlAction 'HPIA completed successfully and indicated reboot required.'
+            return
+        }
+
+        3011 {
+            Write-Log 'One or more HPIA items were not auto-installable and were skipped.' 'WARN'
+            Add-YamlAction 'One or more HPIA items were not auto-installable and were skipped.'
+            return
+        }
+
+        4096 {
+            Write-Log 'HPIA completed but did not find applicable driver updates for this platform.' 'OK'
+            Add-YamlAction 'HPIA completed but did not find applicable driver updates for this platform.'
+            return
+        }
+
+        8193 {
+            Write-Log 'HPIA returned 8193. Checking whether reports/logs were generated before failing the run.' 'WARN'
+            Add-YamlAction 'HPIA returned 8193. Checking whether reports/logs were generated before failing the run.'
+
+            $generatedReports = @(Get-ChildItem -Path $hpiaReportFolder -File -Recurse -ErrorAction SilentlyContinue)
+            if ($generatedReports.Count -gt 0) {
+                Write-Log ("HPIA generated {0} report/log file(s) despite exit code 8193. Continuing so the scheduled workflow does not hard fail." -f $generatedReports.Count) 'WARN'
+                Add-YamlAction ("HPIA generated {0} report/log file(s) despite exit code 8193. Continuing without hard failure." -f $generatedReports.Count)
+                return
+            }
+
+            throw "HPIA failed with exit code 8193 and produced no report/log files in $hpiaReportFolder."
+        }
+
+        default {
+            throw "HP Image Assistant production pass failed or returned an unexpected exit code: $exitCode ($status). Review reports in $hpiaReportFolder."
+        }
+    }
+}
+
+# -----------------------------
+# Dell support
+# -----------------------------
+function Wait-ForFile {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [int]$TimeoutSeconds = 30
+    )
+
+    $start = Get-Date
+    while (-not (Test-Path -LiteralPath $Path)) {
+        Start-Sleep -Seconds 1
+        if (((Get-Date) - $start).TotalSeconds -ge $TimeoutSeconds) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Get-DcuReportXmlSafely {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [int]$RetryCount = 5,
+        [int]$RetryDelaySeconds = 2
+    )
+
+    if (-not (Wait-ForFile -Path $Path -TimeoutSeconds 20)) {
+        throw "Dell DCU report file was not found: $Path"
+    }
+
+    Start-Sleep -Seconds 3
+
+    for ($i = 1; $i -le $RetryCount; $i++) {
+        try {
+            $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+            try {
+                $sr = New-Object System.IO.StreamReader($fs)
+                try {
+                    $content = $sr.ReadToEnd()
+                }
+                finally {
+                    $sr.Dispose()
+                }
+            }
+            finally {
+                $fs.Dispose()
+            }
+
+            $xml = New-Object System.Xml.XmlDocument
+            $xml.LoadXml($content)
+            return $xml
+        }
+        catch {
+            if ($i -eq $RetryCount) {
+                throw
+            }
+            Start-Sleep -Seconds $RetryDelaySeconds
+        }
+    }
+}
+
+function Get-DellNodeText {
+    param(
+        [Parameter(Mandatory)][xml]$Node,
+        [Parameter(Mandatory)][string[]]$Names
+    )
+
+    foreach ($name in $Names) {
+        try {
+            $xpath = './/*[local-name()="' + $name + '"]'
+            $child = $Node.SelectSingleNode($xpath)
+            if ($child -and -not [string]::IsNullOrWhiteSpace($child.InnerText)) {
+                return $child.InnerText.Trim()
+            }
+        }
+        catch {}
+    }
+
+    return $null
+}
+
+function Get-DellReportItems {
+    param([Parameter(Mandatory)][xml]$Xml)
+
+    $items = @()
+    try {
+        $xpath = '//*[local-name()="Update" or local-name()="Package" or local-name()="SoftwareComponent" or local-name()="component" or local-name()="Device"]'
+        $nodes = $Xml.SelectNodes($xpath)
+        foreach ($node in $nodes) {
+            $name = Get-DellNodeText -Node $node -Names @('Name','Title','PackageName')
+            $version = Get-DellNodeText -Node $node -Names @('Version','PackageVersion')
+            $category = Get-DellNodeText -Node $node -Names @('Category','Type')
+            $id = Get-DellNodeText -Node $node -Names @('Id','PackageId','ReleaseId')
+
+            if ($name -or $id) {
+                $items += [pscustomobject]@{
+                    Id       = $id
+                    Name     = $name
+                    Version  = $version
+                    Category = $category
+                }
+            }
+        }
+    }
+    catch {}
+
+    return @($items)
+}
+
+function Get-DellDCUService {
+    $candidateNames = @(
+        'DellClientManagementService',
+        'DellCommandUpdate',
+        'DellUpdateService'
+    )
+
+    foreach ($name in $candidateNames) {
+        $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
+        if ($svc) { return $svc }
+    }
+
+    $svc = Get-Service -ErrorAction SilentlyContinue |
+        Where-Object { $_.DisplayName -match 'Dell.*Client.*Management|Dell.*Command.*Update' } |
+        Select-Object -First 1
+
+    return $svc
+}
+
+function Ensure-DellDCUService {
+    param(
+        [int]$TimeoutSeconds = 30
+    )
+
+    Write-Log 'Validating Dell Client Management Service...' 'INFO'
+    Add-YamlAction 'Validating Dell Client Management Service.'
+
+    $service = Get-DellDCUService
+    if (-not $service) {
+        throw 'Dell Client Management Service was not found. Dell Command | Update may need to be repaired or reinstalled.'
+    }
+
+    Write-Log ("Dell service detected: {0} ({1})" -f $service.DisplayName, $service.Name) 'OK'
+
+    try {
+        $wmiService = Get-CimInstance -ClassName Win32_Service -Filter ("Name='{0}'" -f $service.Name) -ErrorAction Stop
+        if ($wmiService.StartMode -eq 'Disabled') {
+            Write-Log 'Dell service startup type is Disabled. Setting it to Manual.' 'WARN'
+            Set-Service -Name $service.Name -StartupType Manual -ErrorAction Stop
+        }
+    }
+    catch {
+        Write-Log ("Could not validate/set Dell service startup type: {0}" -f $_.Exception.Message) 'WARN'
+    }
+
+    $service.Refresh()
+    if ($service.Status -ne 'Running') {
+        Write-Log 'Starting Dell Client Management Service...' 'INFO'
+        try {
+            Start-Service -Name $service.Name -ErrorAction Stop
+        }
+        catch {
+            Write-Log ("Start-Service failed. Attempting sc.exe recovery start. Error: {0}" -f $_.Exception.Message) 'WARN'
+            & sc.exe start $service.Name | Out-Null
+        }
+    }
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    do {
+        Start-Sleep -Seconds 2
+        $service = Get-Service -Name $service.Name -ErrorAction SilentlyContinue
+        if ($service -and $service.Status -eq 'Running') {
+            Write-Log 'Dell Client Management Service is running.' 'OK'
+            Add-YamlAction 'Dell Client Management Service is running.'
+            return $true
+        }
+    } while ((Get-Date) -lt $deadline)
+
+    throw 'Dell Client Management Service did not reach the Running state before timeout.'
+}
+
+function Invoke-DellDCUCommandWithRetry {
+    param(
+        [Parameter(Mandatory)][string]$DcuCli,
+        [Parameter(Mandatory)][string]$Arguments,
+        [Parameter(Mandatory)][string]$OperationName,
+        [int[]]$AcceptableExitCodes = @(0),
+        [int]$MaxAttempts = 2
+    )
+
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        Write-Log ("Dell DCU {0} attempt {1} of {2}..." -f $OperationName, $attempt, $MaxAttempts) 'INFO'
+        Add-YamlAction ("Dell DCU {0} attempt {1} of {2}." -f $OperationName, $attempt, $MaxAttempts)
+
+        $proc = Start-Process -FilePath $DcuCli -ArgumentList $Arguments -Wait -PassThru -NoNewWindow
+        $exitCode = [int]$proc.ExitCode
+        Write-Log ("Dell DCU {0} exit code: {1}" -f $OperationName, $exitCode) 'INFO'
+
+        if ($AcceptableExitCodes -contains $exitCode) {
+            return $proc
+        }
+
+        if ($exitCode -eq 3000) {
+            Write-Log 'Dell DCU returned 3000, which normally indicates the Dell Client Management Service stopped or crashed.' 'WARN'
+            Add-YamlAction 'Dell DCU returned 3000; attempting Dell service recovery before retry.'
+        }
+        else {
+            Write-Log ("Dell DCU {0} returned non-success exit code {1}." -f $OperationName, $exitCode) 'WARN'
+        }
+
+        if ($attempt -lt $MaxAttempts) {
+            Ensure-DellDCUService | Out-Null
+            Start-Sleep -Seconds 5
+            continue
+        }
+
+        throw "Dell DCU $OperationName failed after $MaxAttempts attempt(s). Last exit code: $exitCode"
+    }
+}
+
+function Invoke-DellDriverUpdates {
+    Write-Section 'Dell Command Update Workflow'
+
+    $dcuCli = Join-Path ${env:ProgramFiles} 'Dell\CommandUpdate\dcu-cli.exe'
+    if (-not (Test-Path -LiteralPath $dcuCli)) {
+        throw "Dell Command | Update CLI was not found: $dcuCli"
+    }
+
+    Write-Log ("Using Dell Command | Update CLI: {0}" -f $dcuCli) 'OK'
+    Add-YamlAction 'Using Dell Command | Update CLI.'
+
+    Ensure-DellDCUService | Out-Null
+
+    $dcuScanLog  = Join-Path $WorkingRoot 'Dell-DCU-Scan.log'
+    $dcuApplyLog = Join-Path $WorkingRoot 'Dell-DCU-Apply.log'
+    $dcuReport   = Join-Path $WorkingRoot 'Dell-DCU-ApplicableUpdates.xml'
+
+    Write-Log 'Dell DCU Configure...' 'INFO'
+    Write-Progress -Activity 'Dell Driver Update Workflow' -Status 'Configuring Dell Command Update' -PercentComplete 10
+    $configureArgs = "/configure -silent -scheduleAuto -lockSettings=disable"
+    Invoke-DellDCUCommandWithRetry -DcuCli $dcuCli -Arguments $configureArgs -OperationName 'Configure' -MaxAttempts 2 | Out-Null
+
+    Write-Log 'Dell DCU Scan...' 'INFO'
+    Write-Progress -Activity 'Dell Driver Update Workflow' -Status 'Scanning for updates' -PercentComplete 35
+    $scanArgs = "/scan -silent -outputLog=""$dcuScanLog"" -report=""$dcuReport"""
+    Invoke-DellDCUCommandWithRetry -DcuCli $dcuCli -Arguments $scanArgs -OperationName 'Scan' -MaxAttempts 2 | Out-Null
+    Write-Log 'Waiting for Dell Command | Update to finish writing the report...' 'INFO'
+
+    try {
+        $xml = Get-DcuReportXmlSafely -Path $dcuReport
+        $items = Get-DellReportItems -Xml $xml
+
+        if ($items.Count -gt 0) {
+            Add-YamlAction ("Dell DCU report parsed successfully. Updates detected: {0}" -f $items.Count)
+
+            $total = $items.Count
+            $index = 0
+
+            foreach ($item in $items) {
+                $index++
+                $percent = 35 + [math]::Floor(($index / $total) * 35)
+                $label = if ($item.Name) { $item.Name } elseif ($item.Id) { $item.Id } else { 'Dell update' }
+
+                Write-Progress -Activity 'Dell Driver Update Workflow' -Status ("Parsing report: {0}" -f $label) -PercentComplete $percent
+
+                if ($item.Category -match 'BIOS|Firmware') {
+                    $script:SkippedList.Add($label) | Out-Null
+                    Add-DriverResult -Vendor 'Dell' -Name $item.Name -Id $item.Id -Category $item.Category -Status 'Blocked' -Message 'BIOS/Firmware update blocked by script policy.'
+                    Write-Log ("Blocking Dell BIOS/Firmware update: {0}" -f $label) 'WARN'
+                }
+                else {
+                    Add-DriverResult -Vendor 'Dell' -Name $item.Name -Id $item.Id -Category $item.Category -Status 'Detected' -Message 'Detected in Dell DCU report.'
+                }
+            }
+        }
+        else {
+            Add-YamlAction 'Dell DCU report parsed but returned no identifiable updates.'
+        }
+    }
+    catch {
+        Write-Log ("Failed to parse Dell DCU report: {0}" -f $_.Exception.Message) 'WARN'
+        Add-YamlAction ("Failed to parse Dell DCU report: {0}" -f $_.Exception.Message)
+    }
+
+    Write-Log 'Dell DCU ApplyUpdates...' 'INFO'
+    Write-Progress -Activity 'Dell Driver Update Workflow' -Status 'Applying updates' -PercentComplete 85
+    $applyArgs = "/applyUpdates -silent -reboot=disable -outputLog=""$dcuApplyLog"""
+    Invoke-DellDCUCommandWithRetry -DcuCli $dcuCli -Arguments $applyArgs -OperationName 'ApplyUpdates' -MaxAttempts 2 | Out-Null
+
+    Write-Log (("Dell DCU logs: {0} ; {1} ; {2}") -f $dcuScanLog, $dcuApplyLog, $dcuReport) 'OK'
+    Write-Progress -Activity 'Dell Driver Update Workflow' -Completed
+}
+# -----------------------------
 # Main
-if (-not (Test-IsAdministrator)) {
-    Write-Error "Please run this script as Administrator."
-    exit 1
-}
-
-Initialize-YamlLog
-
-if (-not (Test-IsHPSystem)) {
-    Write-Log "This is not an HP or Hewlett-Packard system. Skipping HP driver update." 'WARN'
-    $script:OverallResult = 'SkippedNonHPSystem'
-    Write-YamlLog
-    exit 0
-}
-
-Ensure-Folder -Path $WorkingRoot
-
-$SavedPower = $null
-$OriginalLocation = (Get-Location).Path
-$Failures = 0
-$CleanupOk = $false
+# -----------------------------
+$finalStatus = 'success'
 
 try {
-    Write-Log "Initializing HP driver update script..." 'INFO'
-    Write-Log "Working root: $WorkingRoot" 'INFO'
+    Write-Section 'Initialization'
 
-    $SavedPower = Save-PowerSettings
-    Set-UnlimitedPowerTimeouts
-    Ensure-HPCMSL
-    Suspend-BitLockerIfNeeded
+    Ensure-Folder -Path $YamlLogFolder
+    Ensure-Folder -Path $WorkingRoot
+    Ensure-WorkingFolderPermissions -Path $WorkingRoot
 
-    Set-Location -Path $WorkingRoot
+    $yamlName = "{0}-{1}-{2}.yml" -f $script:ComputerName, '05_Weekend_Vendor_Drivers_Update', (Get-Date -Format 'yyyy-MM-dd_HHmmss')
+    $yamlPath = Join-Path $YamlLogFolder $yamlName
 
-    $softpaqs = Get-DriverList
-    $softpaqs = @(Exclude-BiosAndFirmwareSoftpaqs -Softpaqs $softpaqs)
-    if ($softpaqs.Count -eq 0) {
-        $CleanupOk = Remove-WorkingFolderRobust -Path $WorkingRoot -RetryCount $CleanupRetryCount -RetryDelaySeconds $CleanupRetryDelaySeconds
-        $script:CleanupResult = $CleanupOk
-        $script:OverallResult = if ($CleanupOk) { 'SucceededNoApplicableUpdates' } else { 'SucceededNoApplicableUpdatesCleanupIncomplete' }
-        Write-YamlLog
-        exit $(if ($CleanupOk) { 0 } else { 2 })
+    Write-Log ("YAML log will be written to: {0}" -f $yamlPath) 'INFO'
+    Initialize-YamlLog -ComputerName $script:ComputerName -YamlPath $yamlPath
+
+    Write-Log 'Initializing vendor driver update script...' 'INFO'
+
+    Write-Section 'Power Policy Enforcement'
+    Set-LocalPowerPolicyDesktop
+
+    Write-Section 'Vendor Detection'
+    $script:DetectedVendor = Get-DriverVendor
+    Write-Log ("Detected vendor workflow: {0}" -f $script:DetectedVendor) 'INFO'
+    Write-Log ("Working root: {0}" -f $WorkingRoot) 'INFO'
+
+    if ($script:DetectedVendor -eq 'HP') {
+        Invoke-HPDriverUpdates
+    }
+    elseif ($script:DetectedVendor -eq 'Dell') {
+        Invoke-DellDriverUpdates
     }
 
-    $Failures = Install-SoftpaqList -Softpaqs $softpaqs
+    Write-Section 'Final Power Reapply'
+    Write-Log 'Reapplying enforced local desktop power policy (display 60 minutes, sleep never)...' 'INFO'
+    Set-LocalPowerPolicyDesktop
+    Enforce-DesktopPowerSettings
 }
 catch {
-    $script:FailureMessage = $_.Exception.Message
-    Write-Log "Script failed: $($_.Exception.Message)" 'ERROR'
-    $Failures++
+    $finalStatus = 'failed'
+    Add-RunFailure ("Script failed: {0}" -f $_.Exception.Message)
 }
 finally {
-    try {
-        Set-Location -Path $OriginalLocation
-    }
-    catch {
+    Write-Section 'Cleanup'
+    Remove-WorkingFolderRobust -Path $WorkingRoot
+
+    if ($script:RunFailures.Count -gt 0 -and $finalStatus -ne 'failed') {
+        $finalStatus = 'completed_with_warnings'
     }
 
-    try {
-        Restore-PowerSettings -Saved $SavedPower
+    if ($script:RunFailures.Count -gt 0) {
+        Write-Log (("{0} driver update completed with one or more failures.") -f $script:DetectedVendor) 'WARN'
     }
-    catch {
-        Write-Log "Failed restoring power settings: $($_.Exception.Message)" 'WARN'
+    else {
+        Write-Log (("{0} driver update script completed successfully.") -f $script:DetectedVendor) 'OK'
     }
 
-    $CleanupOk = Remove-WorkingFolderRobust -Path $WorkingRoot -RetryCount $CleanupRetryCount -RetryDelaySeconds $CleanupRetryDelaySeconds
-    $script:CleanupResult = $CleanupOk
-}
-
-if ($Failures -eq 0 -and $CleanupOk) {
-    Write-Log "HP driver update script completed successfully." 'OK'
-    $script:OverallResult = 'Succeeded'
-    Write-YamlLog
-    exit 0
-}
-elseif ($Failures -eq 0 -and -not $CleanupOk) {
-    Write-Log "HP driver update succeeded, but cleanup was incomplete." 'WARN'
-    $script:OverallResult = 'SucceededCleanupIncomplete'
-    Write-YamlLog
-    exit 2
-}
-else {
-    Write-Log "HP driver update completed with one or more failures." 'WARN'
-    if ([string]::IsNullOrWhiteSpace($script:FailureMessage)) {
-        $script:FailureMessage = 'One or more SoftPaq installations failed.'
-    }
-    $script:OverallResult = 'Failed'
-    Write-YamlLog
-    exit 3
+    Save-YamlLog -Status $finalStatus
 }
