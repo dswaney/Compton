@@ -1,7 +1,7 @@
 # =====================================================================
 # ScriptName: Compton_Tech_Utils.ps1
-# ScriptVersion: 1.10.0
-# LastUpdated: 2026-04-27
+# ScriptVersion: 1.10.1
+# LastUpdated: 2026-05-26
 # =====================================================================
 
 # -----------------------------------------------------------------------------
@@ -15381,7 +15381,7 @@ function Show-Menu {
     Write-Host "16. Enable Automatic Login with CC-Student" -ForegroundColor White
     Write-Host "17. Stage Lab Scripts and Register Scheduled Tasks" -ForegroundColor White
     Write-Host "18. Set OneDrive Auto Login on Boot" -ForegroundColor White
-    Write-Host "19. Run Full System Updates" -ForegroundColor White
+    Write-Host "19. Run Full System Updates Only (Apps, Drivers, Windows Updates)" -ForegroundColor White
     Write-Host "20. Network Diag & Repair" -ForegroundColor White
     Write-Host "Q.  Exit" -ForegroundColor Red
 
@@ -15492,7 +15492,15 @@ function Main {
 			}
 			"19" {
 				Clear-Host
-				Run-CorePostDeploymentTasks
+				# Option 19 is intended to run update-related tasks only.
+				# Without -IncludeTasks, Run-CorePostDeploymentTasks runs the full post-deployment task set,
+				# including bloatware removal, registry settings, service optimization, remoting, and time sync.
+				Run-CorePostDeploymentTasks -IncludeTasks @(
+					'WingetDependencies',
+					'UpdateApplications',
+					'HPDrivers',
+					'WindowsUpdate'
+				)
 				Pause
 			}
 			"20" {
