@@ -1,8 +1,8 @@
 # =====================================================================
 # ScriptName: Compton_Tech_Utils.ps1
-# ScriptVersion: 1.12.3
+# ScriptVersion: 1.12.6
 # LastUpdated: 2026-05-29
-# Changes: Option 12 now treats locked/in-use temp files as skipped items, reports lock-owner hints when available, and keeps DISM status updates.
+# Changes: Standardized all option-generated logs and reports to C:\Logs with automatic directory creation.
 # =====================================================================
 
 # -----------------------------------------------------------------------------
@@ -159,12 +159,60 @@ try {
     Write-Warning "Could not set execution policy: $($_.Exception.Message)"
 }
 
+
+# -----------------------------------------------------------------------------
+# Global Logging Directory
+# -----------------------------------------------------------------------------
+$Global:ComptonLogRoot = 'C:\Logs'
+
+function Initialize-ComptonLogDirectory {
+    [CmdletBinding()]
+    param(
+        [string]$Path = $Global:ComptonLogRoot
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        $Path = 'C:\Logs'
+    }
+
+    try {
+        if (-not (Test-Path -LiteralPath $Path)) {
+            New-Item -Path $Path -ItemType Directory -Force -ErrorAction Stop | Out-Null
+        }
+
+        $resolved = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).ProviderPath
+        $Global:ComptonLogRoot = $resolved
+        return $resolved
+    }
+    catch {
+        Write-Warning ("Unable to create or access log directory {0}: {1}" -f $Path, $_.Exception.Message)
+        throw
+    }
+}
+
+function Get-ComptonLogDirectory {
+    [CmdletBinding()]
+    param()
+
+    return (Initialize-ComptonLogDirectory -Path $Global:ComptonLogRoot)
+}
+
+try {
+    $null = Initialize-ComptonLogDirectory
+}
+catch {
+    Write-Warning ("Startup log directory initialization failed: {0}" -f $_.Exception.Message)
+}
+
 # Enhanced error handling with detailed logging
 trap {
     $errorMsg = "Unhandled Error at line $($_.InvocationInfo.ScriptLineNumber): $($_.Exception.Message)"
     Write-Error $errorMsg
-    # Optional: Log to file for debugging
-    # $errorMsg | Out-File -FilePath "C:\temp\script_errors.log" -Append
+    try {
+        $errorLogPath = Join-Path -Path (Get-ComptonLogDirectory) -ChildPath 'ComptonTechUtils_UnhandledErrors.log'
+        $errorMsg | Out-File -FilePath $errorLogPath -Append -Encoding UTF8 -ErrorAction SilentlyContinue
+    }
+    catch { }
     exit 1
 }
 
@@ -633,7 +681,7 @@ function Remove-BloatwareApps {
     )
 
     $started = Get-Date
-    $logRoot = 'C:\Logs'
+    $logRoot = Get-ComptonLogDirectory
     if (-not (Test-Path -LiteralPath $logRoot)) {
         try { New-Item -Path $logRoot -ItemType Directory -Force -ErrorAction Stop | Out-Null } catch { }
     }
@@ -5796,7 +5844,7 @@ function Update-HPDrivers {
     [CmdletBinding()]
     param(
         [string]$WorkingRoot = 'C:\Temp\DriverUpdates',
-        [string]$YamlLogFolder = 'C:\Logs',
+        [string]$YamlLogFolder = (Get-ComptonLogDirectory),
         [switch]$IncludeSoftware,
         [switch]$IncludeBIOS,
         [string]$HpiaSourceFolder = '\\filesvr\Labscripts\HPImageAssistant',
@@ -8239,7 +8287,7 @@ function Run-DiskCleanup {
         [switch]$SkipSSDTrim,
         [int]$WearWarningPercent = 10,
         [int]$TimeoutSeconds = 1800,
-        [string]$LogPath = (Join-Path $env:TEMP ('DiskCleanup_{0}.log' -f (Get-Date -Format 'yyyyMMdd_HHmmss')))
+        [string]$LogPath = (Join-Path (Get-ComptonLogDirectory) ('DiskCleanup_{0}.log' -f (Get-Date -Format 'yyyyMMdd_HHmmss')))
     )
 
     $previousErrorActionPreference = $ErrorActionPreference
@@ -8590,8 +8638,8 @@ namespace DiskCleanup {
             if ($StatusIntervalSeconds -lt 5) { $StatusIntervalSeconds = 5 }
 
             $argumentText = ($ArgumentList -join ' ')
-            $stdoutPath = Join-Path $env:TEMP ('DiskCleanup_{0}_stdout.log' -f ([guid]::NewGuid().ToString('N')))
-            $stderrPath = Join-Path $env:TEMP ('DiskCleanup_{0}_stderr.log' -f ([guid]::NewGuid().ToString('N')))
+            $stdoutPath = Join-Path (Get-ComptonLogDirectory) ('DiskCleanup_{0}_stdout.log' -f ([guid]::NewGuid().ToString('N')))
+            $stderrPath = Join-Path (Get-ComptonLogDirectory) ('DiskCleanup_{0}_stderr.log' -f ([guid]::NewGuid().ToString('N')))
 
             Write-DiskCleanupLog ('Starting {0}: {1} {2}' -f $Description, $FilePath, $argumentText) 'INFO'
             Write-DiskCleanupLog ('{0} can take several minutes. Status will update every {1} seconds until it finishes.' -f $Description, $StatusIntervalSeconds) 'INFO'
@@ -9041,7 +9089,7 @@ function Invoke-SystemMaintenance {
         [int]$SoftwareDistributionCleanupTimeLimitMinutes = 40,
         [int]$SoftwareDistributionFolderJobTimeoutMinutes = 15,
         [string]$SoftwareDistributionCleanupStatePath = 'C:\ProgramData\SystemRepair\SoftwareDistributionCleanupState.json',
-        [string]$LogDirectory = 'C:\Logs'
+        [string]$LogDirectory = (Get-ComptonLogDirectory)
     )
 
     $previousErrorActionPreference = $ErrorActionPreference
@@ -10291,8 +10339,8 @@ function Invoke-SystemMaintenance {
                 [string]$Description = 'Native process'
             )
 
-            $outputPath = Join-Path $env:TEMP ('NativeProcessOutput_{0}.log' -f ([guid]::NewGuid().ToString('N')))
-            $errorPath = Join-Path $env:TEMP ('NativeProcessError_{0}.log' -f ([guid]::NewGuid().ToString('N')))
+            $outputPath = Join-Path (Get-ComptonLogDirectory) ('NativeProcessOutput_{0}.log' -f ([guid]::NewGuid().ToString('N')))
+            $errorPath = Join-Path (Get-ComptonLogDirectory) ('NativeProcessError_{0}.log' -f ([guid]::NewGuid().ToString('N')))
 
             $result = [ordered]@{
                 FilePath       = $FilePath
@@ -10788,8 +10836,8 @@ function Invoke-SystemMaintenance {
                     )
 
                     $p = $null
-                    $outputFile = Join-Path $env:TEMP ('sdcleanup_out_' + [guid]::NewGuid().ToString('N') + '.txt')
-                    $errorFile = Join-Path $env:TEMP ('sdcleanup_err_' + [guid]::NewGuid().ToString('N') + '.txt')
+                    $outputFile = Join-Path (Get-ComptonLogDirectory) ('sdcleanup_out_' + [guid]::NewGuid().ToString('N') + '.txt')
+                    $errorFile = Join-Path (Get-ComptonLogDirectory) ('sdcleanup_err_' + [guid]::NewGuid().ToString('N') + '.txt')
                     $nativeResult = [ordered]@{ ExitCode = $null; TimedOut = $false; ErrorMessage = '' }
 
                     try {
@@ -13317,7 +13365,7 @@ function Invoke-SystemMaintenance {
         function Invoke-LogArchiveRetention {
             [CmdletBinding()]
             param(
-                [string]$LogDirectory = 'C:\Logs',
+                [string]$LogDirectory = (Get-ComptonLogDirectory),
                 [string]$ComputerName = $env:COMPUTERNAME
             )
 
@@ -13720,7 +13768,7 @@ function Remove-UserProfilesClassroom {
         [string[]]$ExcludedProfiles = @('Default', 'Public', 'MISAdmin'),
         [switch]$Force,
         [switch]$WhatIf,
-        [string]$LogPath = "$env:TEMP\ProfileCleanup_$(Get-Date -Format 'yyyyMMdd_HHmmss').log",
+        [string]$LogPath = (Join-Path (Get-ComptonLogDirectory) ("ProfileCleanup_{0}.log" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))),
         [int]$TimeoutSeconds = 30
     )
 
@@ -14111,7 +14159,7 @@ function Set-DomainAutoLogin {
         [switch]$DisableAutoLogin,
         [switch]$WhatIf,
         [switch]$Force,
-        [string]$LogPath = "$env:TEMP\AutoLoginConfig_$(Get-Date -Format 'yyyyMMdd_HHmmss').log",
+        [string]$LogPath = (Join-Path (Get-ComptonLogDirectory) ("AutoLoginConfig_{0}.log" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))),
         [int]$AutoLoginCount = 1,  # Number of auto-logins before disabling
         [switch]$UseLocalSystemEncryption
     )
@@ -14198,7 +14246,7 @@ function Set-DomainAutoLogin {
         
         if ($backupData.Count -gt 0) {
             try {
-                $backupFile = "$env:TEMP\AutoLoginBackup_$(Get-Date -Format 'yyyyMMdd_HHmmss').json"
+                $backupFile = Join-Path (Get-ComptonLogDirectory) ("AutoLoginBackup_{0}.json" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
                 $backupData | ConvertTo-Json | Out-File -FilePath $backupFile -Encoding UTF8
                 Write-LogEntry "[OK] Registry backup saved to: $backupFile" 'INFO'
                 return $backupFile
@@ -14554,7 +14602,7 @@ function Set-DesktopPowerSettings {
     [CmdletBinding(SupportsShouldProcess)]
     param(
         [switch]$Force,
-        [string]$LogPath = "C:\Logs\PowerSettings_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+        [string]$LogPath = (Join-Path (Get-ComptonLogDirectory) ("PowerSettings_{0}.log" -f (Get-Date -Format 'yyyyMMdd_HHmmss')))
     )
 
     if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -14721,7 +14769,7 @@ function Set-DesktopPowerSettings {
                 ActiveScheme = (powercfg.exe /getactivescheme 2>$null | Out-String).Trim()
                 AvailableSchemes = (powercfg.exe /list 2>$null | Out-String).Trim()
             }
-            $backupFile = "C:\Logs\PowerSettingsBackup_$(Get-Date -Format 'yyyyMMdd_HHmmss').json"
+            $backupFile = Join-Path (Get-ComptonLogDirectory) ("PowerSettingsBackup_{0}.json" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
             $backup | ConvertTo-Json -Depth 4 | Out-File -LiteralPath $backupFile -Encoding UTF8 -Force
             Write-PowerLog "Power settings backup saved to: $backupFile" 'OK'
         }
@@ -14922,7 +14970,7 @@ function Set-OneDriveAutoLoginPolicy {
         [ValidateRange(1, 30)]
         [int]$SyncThrottleKbps = 0,  # 0 = No throttling
         [switch]$BackupSettings,
-        [string]$LogPath = "$env:TEMP\OneDrivePolicy_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+        [string]$LogPath = (Join-Path (Get-ComptonLogDirectory) ("OneDrivePolicy_{0}.log" -f (Get-Date -Format 'yyyyMMdd_HHmmss')))
     )
 
     # Security: Require elevation for policy configuration
@@ -15170,7 +15218,7 @@ function Set-OneDriveAutoLoginPolicy {
             }
             
             if ($backupData.Count -gt 0) {
-                $backupFile = "$env:TEMP\OneDrivePolicyBackup_$(Get-Date -Format 'yyyyMMdd_HHmmss').json"
+                $backupFile = Join-Path (Get-ComptonLogDirectory) ("OneDrivePolicyBackup_{0}.json" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
                 $backupData | ConvertTo-Json -Depth 4 | Out-File -FilePath $backupFile -Encoding UTF8
                 Write-LogEntry "[OK] Policy backup saved to: $backupFile" 'INFO'
                 return $backupFile
@@ -15533,7 +15581,7 @@ function Run-CorePostDeploymentTasks {
         [int]$MaxParallelJobs = 4,
         [ValidateRange(5, 180)]
         [int]$TaskTimeoutMinutes = 30,
-        [string]$LogPath = "$env:TEMP\PostDeploymentTasks_$(Get-Date -Format 'yyyyMMdd_HHmmss').log",
+        [string]$LogPath = (Join-Path (Get-ComptonLogDirectory) ("PostDeploymentTasks_{0}.log" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))),
         [switch]$GenerateReport,
         [switch]$ContinueOnError
     )
@@ -15897,7 +15945,7 @@ Function '$FunctionName' failed with error:
         if ($GenerateReport) {
             Write-LogEntry "`n[SUMMARY] Generating deployment report..." 'INFO'
             $deploymentReport = New-DeploymentReport -TaskResults $taskResults
-            $reportFile = "$env:TEMP\DeploymentReport_$(Get-Date -Format 'yyyyMMdd_HHmmss').json"
+            $reportFile = Join-Path (Get-ComptonLogDirectory) ("DeploymentReport_{0}.json" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
             $deploymentReport | ConvertTo-Json -Depth 5 | Out-File -FilePath $reportFile -Encoding UTF8
             Write-LogEntry "[OK] Deployment report saved to: $reportFile" 'SUCCESS'
         }
@@ -17073,7 +17121,7 @@ $Script:NetworkOptimizationResults = New-Object System.Collections.Generic.List[
 function Initialize-NetworkOptimizationLogging {
     [CmdletBinding()]
     param(
-        [string]$LogDirectory = 'C:\Logs'
+        [string]$LogDirectory = (Get-ComptonLogDirectory)
     )
 
     try {
@@ -17082,7 +17130,7 @@ function Initialize-NetworkOptimizationLogging {
         }
     }
     catch {
-        $LogDirectory = $env:TEMP
+        $LogDirectory = Get-ComptonLogDirectory
     }
 
     $Script:NetworkOptimizationLogPath = Join-Path -Path $LogDirectory -ChildPath ("NetworkOptimization_{0}.log" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
@@ -17178,7 +17226,7 @@ function Invoke-NetworkExternalCommand {
 function Backup-NetworkOptimizationConfiguration {
     [CmdletBinding()]
     param(
-        [string]$BackupRoot = 'C:\Logs'
+        [string]$BackupRoot = (Get-ComptonLogDirectory)
     )
 
     try {
@@ -17577,7 +17625,7 @@ function Start-NetworkOptimization {
     #>
     [CmdletBinding()]
     param(
-        [string]$LogDirectory = 'C:\Logs'
+        [string]$LogDirectory = (Get-ComptonLogDirectory)
     )
 
     Initialize-NetworkOptimizationLogging -LogDirectory $LogDirectory
@@ -17610,6 +17658,812 @@ function Start-NetworkOptimization {
 }
 
 # -----------------------------------------------------------------------------
+# Option 19 - Windows Update Services Repair
+# Merged from 01_Enable_Windows_Update_Services.ps1 v2.1 on 2026-05-29
+# -----------------------------------------------------------------------------
+function Invoke-WindowsUpdateServicesRepair {
+    [CmdletBinding()]
+    param()
+
+    $previousErrorActionPreference = $ErrorActionPreference
+    $script:WindowsUpdateServicesRepairRebootIssued = $false
+    $ErrorActionPreference = 'Stop'
+
+    try {
+
+    function Write-Status {
+        param(
+            [string]$Message,
+            [ValidateSet('INFO','OK','WARN','ERROR')]
+            [string]$Level = 'INFO'
+        )
+
+        $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+        switch ($Level) {
+            'INFO'  { Write-Host "[$timestamp] [INFO ] $Message" -ForegroundColor Cyan }
+            'OK'    { Write-Host "[$timestamp] [ OK  ] $Message" -ForegroundColor Green }
+            'WARN'  { Write-Host "[$timestamp] [WARN ] $Message" -ForegroundColor Yellow }
+            'ERROR' { Write-Host "[$timestamp] [ERROR] $Message" -ForegroundColor Red }
+        }
+    }
+
+    function Test-IsAdmin {
+        $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = New-Object Security.Principal.WindowsPrincipal($currentIdentity)
+        return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    }
+
+    function Set-ServiceStartRegistry {
+        param(
+            [Parameter(Mandatory)]
+            [string]$ServiceName,
+
+            [Parameter(Mandatory)]
+            [int]$StartValue
+        )
+
+        $paths = @(
+            "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName",
+            "HKLM:\SYSTEM\ControlSet001\Services\$ServiceName"
+        )
+
+        foreach ($path in $paths) {
+            if (Test-Path $path) {
+                try {
+                    Set-ItemProperty -Path $path -Name Start -Value $StartValue -Type DWord -ErrorAction Stop
+                    Write-Status "Set registry Start=$StartValue for $ServiceName at $path" 'OK'
+                }
+                catch {
+                    Write-Status "Failed setting Start for $ServiceName at $path : $($_.Exception.Message)" 'WARN'
+                }
+            }
+            else {
+                Write-Status "Registry path not found for $ServiceName at $path" 'WARN'
+            }
+        }
+    }
+
+    function Set-ServiceStartupAndStart {
+        param(
+            [Parameter(Mandatory)]
+            [string]$Name,
+
+            [Parameter(Mandatory)]
+            [ValidateSet('Automatic','Manual')]
+            [string]$StartupType
+        )
+
+        try {
+            $svc = Get-Service -Name $Name -ErrorAction Stop
+
+            try {
+                Set-Service -Name $Name -StartupType $StartupType -ErrorAction Stop
+                Write-Status "Set startup type for $Name to $StartupType" 'OK'
+            }
+            catch {
+                Write-Status "Set-Service failed for $Name. Trying sc.exe config..." 'WARN'
+                $startValue = if ($StartupType -eq 'Automatic') { 'auto' } else { 'demand' }
+                & sc.exe config $Name start= $startValue | Out-Null
+                Write-Status "Configured startup type for $Name via sc.exe" 'OK'
+            }
+
+            try {
+                Start-Service -Name $Name -ErrorAction Stop
+                Write-Status "Started service: $Name" 'OK'
+            }
+            catch {
+                Write-Status "Could not start service $Name immediately: $($_.Exception.Message)" 'WARN'
+            }
+        }
+        catch {
+            Write-Status "Service not found or inaccessible: $Name" 'WARN'
+        }
+    }
+
+    function Get-ServiceStateSafe {
+        param(
+            [Parameter(Mandatory)]
+            [string]$Name
+        )
+
+        try {
+            return (Get-Service -Name $Name -ErrorAction Stop).Status
+        }
+        catch {
+            return $null
+        }
+    }
+
+    function Wait-ForServiceRunning {
+        param(
+            [Parameter(Mandatory)]
+            [string]$Name,
+
+            [int]$TimeoutSeconds = 15
+        )
+
+        $stopWatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+        while ($stopWatch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
+            $status = Get-ServiceStateSafe -Name $Name
+            if ($status -eq 'Running') {
+                return $true
+            }
+
+            Start-Sleep -Seconds 2
+        }
+
+        return $false
+    }
+
+    function Ensure-ServiceRunningWithRetry {
+        param(
+            [Parameter(Mandatory)]
+            [string]$Name,
+
+            [Parameter(Mandatory)]
+            [ValidateSet('Automatic','Manual')]
+            [string]$StartupType,
+
+            [int]$MaxAttempts = 4,
+
+            [int]$WaitPerAttemptSeconds = 15
+        )
+
+        for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+            $currentState = Get-ServiceStateSafe -Name $Name
+
+            if ($currentState -eq 'Running') {
+                Write-Status "Service $Name is already running." 'OK'
+                return $true
+            }
+
+            Write-Status "Attempt $attempt of $MaxAttempts to start service $Name..." 'INFO'
+
+            try {
+                Set-ServiceStartupAndStart -Name $Name -StartupType $StartupType
+            }
+            catch {
+                Write-Status "Unexpected error while attempting to start $Name : $($_.Exception.Message)" 'WARN'
+            }
+
+            if (Wait-ForServiceRunning -Name $Name -TimeoutSeconds $WaitPerAttemptSeconds) {
+                Write-Status "Verified service is running: $Name" 'OK'
+                return $true
+            }
+
+            $stateAfterWait = Get-ServiceStateSafe -Name $Name
+            Write-Status "Service $Name did not reach Running state after attempt $attempt. Current state: $stateAfterWait" 'WARN'
+
+            if ($attempt -lt $MaxAttempts) {
+                Start-Sleep -Seconds 5
+            }
+        }
+
+        Write-Status "Service $Name failed to reach Running state after $MaxAttempts attempts." 'ERROR'
+        return $false
+    }
+
+    function Force-RebootNow {
+        param(
+            [string]$Reason = 'Required Windows Update services failed to start after multiple attempts.'
+        )
+
+        Write-Status "FORCING REBOOT: $Reason" 'ERROR'
+
+        try {
+            shutdown.exe /r /f /t 30 /c "$Reason" | Out-Null
+            Write-Status "Forced reboot command issued successfully. System will restart in 30 seconds." 'ERROR'
+        }
+        catch {
+            Write-Status "Failed to issue shutdown.exe reboot command: $($_.Exception.Message)" 'ERROR'
+        }
+
+        $script:WindowsUpdateServicesRepairRebootIssued = $true
+        return
+    }
+
+    function Enable-ScheduledTaskSafe {
+        param(
+            [Parameter(Mandatory)]
+            [string]$TaskPath,
+
+            [Parameter(Mandatory)]
+            [string]$TaskName
+        )
+
+        try {
+            $task = Get-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction Stop
+            if ($task.State -eq 'Disabled') {
+                Enable-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction Stop | Out-Null
+                Write-Status "Enabled scheduled task: $TaskPath$TaskName" 'OK'
+            }
+            else {
+                Write-Status "Scheduled task already enabled or available: $TaskPath$TaskName" 'INFO'
+            }
+        }
+        catch {
+            Write-Status "Scheduled task not found or could not be enabled: $TaskPath$TaskName" 'WARN'
+        }
+    }
+
+    function Remove-RegistryValueSafe {
+        param(
+            [Parameter(Mandatory)]
+            [string]$Path,
+
+            [Parameter(Mandatory)]
+            [string]$Name
+        )
+
+        try {
+            if (Test-Path $Path) {
+                $prop = Get-ItemProperty -Path $Path -Name $Name -ErrorAction SilentlyContinue
+                if ($null -ne $prop) {
+                    Remove-ItemProperty -Path $Path -Name $Name -ErrorAction Stop
+                    Write-Status "Removed $Path\$Name" 'OK'
+                }
+                else {
+                    Write-Status "Registry value not present: $Path\$Name" 'INFO'
+                }
+            }
+            else {
+                Write-Status "Registry path not present: $Path" 'INFO'
+            }
+        }
+        catch {
+            Write-Status "Failed to remove $Path\$Name : $($_.Exception.Message)" 'WARN'
+        }
+    }
+
+    function Set-RegistryDwordSafe {
+        param(
+            [Parameter(Mandatory)]
+            [string]$Path,
+
+            [Parameter(Mandatory)]
+            [string]$Name,
+
+            [Parameter(Mandatory)]
+            [int]$Value
+        )
+
+        try {
+            if (-not (Test-Path $Path)) {
+                New-Item -Path $Path -Force | Out-Null
+            }
+
+            New-ItemProperty -Path $Path -Name $Name -PropertyType DWord -Value $Value -Force | Out-Null
+            Write-Status "Set $Path\$Name = $Value" 'OK'
+        }
+        catch {
+            Write-Status "Failed to set $Path\$Name : $($_.Exception.Message)" 'ERROR'
+        }
+    }
+
+    function Set-ClassicRightClickMenuForHive {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory)]
+            [string]$RegistryRoot,
+
+            [Parameter(Mandatory)]
+            [string]$DisplayName
+        )
+
+        $clsid = '{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}'
+        $basePath = "$RegistryRoot\Software\Classes\CLSID\$clsid"
+        $subPath  = "$basePath\InprocServer32"
+
+        try {
+            if (-not (Test-Path -LiteralPath $basePath)) {
+                New-Item -Path $basePath -Force -ErrorAction Stop | Out-Null
+                Write-Status "Created classic right-click menu CLSID key for $DisplayName" 'OK'
+            }
+            else {
+                Write-Status "Classic right-click menu CLSID key already exists for $DisplayName" 'INFO'
+            }
+
+            if (-not (Test-Path -LiteralPath $subPath)) {
+                New-Item -Path $subPath -Force -ErrorAction Stop | Out-Null
+                Write-Status "Created classic right-click menu InprocServer32 key for $DisplayName" 'OK'
+            }
+            else {
+                Write-Status "Classic right-click menu InprocServer32 key already exists for $DisplayName" 'INFO'
+            }
+
+            Set-Item -Path $subPath -Value '' -ErrorAction Stop
+            Write-Status "Enabled Windows 11 classic right-click menu for $DisplayName." 'OK'
+            return $true
+        }
+        catch {
+            Write-Status "Failed to enable Windows 11 classic right-click menu for $DisplayName : $($_.Exception.Message)" 'WARN'
+            return $false
+        }
+    }
+
+    function Invoke-WithLoadedUserHive {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory)]
+            [string]$HiveFile,
+
+            [Parameter(Mandatory)]
+            [string]$DisplayName,
+
+            [Parameter(Mandatory)]
+            [scriptblock]$Action
+        )
+
+        if (-not (Test-Path -LiteralPath $HiveFile)) {
+            Write-Status "User hive file not found for $DisplayName : $HiveFile" 'WARN'
+            return $false
+        }
+
+        $tempHiveName = "TempClassicContextMenu_$([guid]::NewGuid().ToString('N'))"
+        $loaded = $false
+
+        try {
+            $loadOutput = & reg.exe load "HKU\$tempHiveName" "$HiveFile" 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                Write-Status "Failed to load hive for $DisplayName : $($loadOutput -join ' ')" 'WARN'
+                return $false
+            }
+
+            $loaded = $true
+            $registryRoot = "Registry::HKEY_USERS\$tempHiveName"
+            & $Action $registryRoot $DisplayName | Out-Null
+            return $true
+        }
+        catch {
+            Write-Status "Unexpected error while processing hive for $DisplayName : $($_.Exception.Message)" 'WARN'
+            return $false
+        }
+        finally {
+            if ($loaded) {
+                try {
+                    [gc]::Collect()
+                    [gc]::WaitForPendingFinalizers()
+                    Start-Sleep -Milliseconds 300
+                    $unloadOutput = & reg.exe unload "HKU\$tempHiveName" 2>&1
+                    if ($LASTEXITCODE -eq 0) {
+                        Write-Status "Unloaded temporary registry hive for $DisplayName" 'OK'
+                    }
+                    else {
+                        Write-Status "Failed to unload temporary registry hive for $DisplayName : $($unloadOutput -join ' ')" 'WARN'
+                    }
+                }
+                catch {
+                    Write-Status "Unexpected error unloading hive for $DisplayName : $($_.Exception.Message)" 'WARN'
+                }
+            }
+        }
+    }
+
+    function Enable-ClassicWindows11RightClickMenu {
+        [CmdletBinding()]
+        param()
+
+        Write-Status "Applying Windows 11 classic right-click menu for all users..." 'INFO'
+
+        $processedSids = New-Object 'System.Collections.Generic.HashSet[string]'
+
+        [void](Set-ClassicRightClickMenuForHive -RegistryRoot 'HKCU:' -DisplayName 'current user')
+
+        try {
+            $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+            [void]$processedSids.Add($currentSid)
+        }
+        catch {
+            Write-Status "Could not determine current user SID: $($_.Exception.Message)" 'WARN'
+        }
+
+        try {
+            Get-ChildItem -Path 'Registry::HKEY_USERS' -ErrorAction Stop |
+                Where-Object {
+                    $_.PSChildName -match '^S-1-5-21-' -and
+                    $_.PSChildName -notmatch '_Classes$'
+                } |
+                ForEach-Object {
+                    $sid = $_.PSChildName
+                    [void]$processedSids.Add($sid)
+                    [void](Set-ClassicRightClickMenuForHive -RegistryRoot "Registry::HKEY_USERS\$sid" -DisplayName "loaded profile $sid")
+                }
+        }
+        catch {
+            Write-Status "Failed to enumerate loaded user registry hives: $($_.Exception.Message)" 'WARN'
+        }
+
+        try {
+            $profiles = Get-CimInstance -ClassName Win32_UserProfile -ErrorAction Stop |
+                Where-Object {
+                    -not $_.Special -and
+                    $_.SID -match '^S-1-5-21-' -and
+                    $_.LocalPath -and
+                    (Test-Path -LiteralPath (Join-Path $_.LocalPath 'NTUSER.DAT'))
+                }
+
+            foreach ($profile in $profiles) {
+                if ($processedSids.Contains($profile.SID) -or (Test-Path -LiteralPath "Registry::HKEY_USERS\$($profile.SID)")) {
+                    Write-Status "Profile already loaded or processed; skipping offline load for $($profile.LocalPath)" 'INFO'
+                    continue
+                }
+
+                $ntUserDat = Join-Path $profile.LocalPath 'NTUSER.DAT'
+                [void](Invoke-WithLoadedUserHive -HiveFile $ntUserDat -DisplayName "offline profile $($profile.LocalPath)" -Action {
+                    param($RegistryRoot, $DisplayName)
+                    Set-ClassicRightClickMenuForHive -RegistryRoot $RegistryRoot -DisplayName $DisplayName
+                })
+            }
+        }
+        catch {
+            Write-Status "Failed to process offline user profiles: $($_.Exception.Message)" 'WARN'
+        }
+
+        $defaultHive = Join-Path $env:SystemDrive 'Users\Default\NTUSER.DAT'
+        if (Test-Path -LiteralPath $defaultHive) {
+            [void](Invoke-WithLoadedUserHive -HiveFile $defaultHive -DisplayName 'Default User profile for future users' -Action {
+                param($RegistryRoot, $DisplayName)
+                Set-ClassicRightClickMenuForHive -RegistryRoot $RegistryRoot -DisplayName $DisplayName
+            })
+        }
+        else {
+            Write-Status "Default User hive not found at expected path: $defaultHive" 'WARN'
+        }
+
+        Write-Status "Completed Windows 11 classic right-click menu application for all available users." 'OK'
+    }
+
+    function Get-ScriptHeaderValue {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory)]
+            [string]$Path,
+
+            [Parameter(Mandatory)]
+            [string]$HeaderName
+        )
+
+        if (-not (Test-Path -LiteralPath $Path)) {
+            return $null
+        }
+
+        try {
+            $pattern = '^\s*#\s*' + [regex]::Escape($HeaderName) + '\s*:\s*(.+?)\s*$'
+            $match = Select-String -LiteralPath $Path -Pattern $pattern -CaseSensitive:$false -ErrorAction Stop | Select-Object -First 1
+            if ($match -and $match.Matches.Count -gt 0) {
+                return $match.Matches[0].Groups[1].Value.Trim()
+            }
+        }
+        catch {
+            Write-Status "Unable to read $HeaderName from $Path : $($_.Exception.Message)" 'WARN'
+        }
+
+        return $null
+    }
+
+    function Convert-ToVersionObjectSafe {
+        [CmdletBinding()]
+        param(
+            [AllowNull()]
+            [string]$VersionText
+        )
+
+        if ([string]::IsNullOrWhiteSpace($VersionText)) {
+            return [version]'0.0'
+        }
+
+        try {
+            return [version]$VersionText.Trim()
+        }
+        catch {
+            $cleanVersion = ($VersionText -replace '[^0-9\.]', '').Trim('.')
+            if ([string]::IsNullOrWhiteSpace($cleanVersion)) {
+                return [version]'0.0'
+            }
+
+            try {
+                return [version]$cleanVersion
+            }
+            catch {
+                Write-Status "Unable to parse version [$VersionText]. Treating as 0.0." 'WARN'
+                return [version]'0.0'
+            }
+        }
+    }
+
+    # Legacy updater staging/removal logic removed in v1.12.5.
+
+    function Get-WeeklySundayTriggerSummary {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory)]
+            [object[]]$Triggers
+        )
+
+        foreach ($trigger in $Triggers) {
+            try {
+                $days = [string]$trigger.DaysOfWeek
+                $startBoundary = [string]$trigger.StartBoundary
+                $startTime = $null
+
+                if (-not [string]::IsNullOrWhiteSpace($startBoundary)) {
+                    $startTime = ([datetime]$startBoundary).ToString('HH:mm')
+                }
+
+                if ($days -match 'Sunday' -and $startTime -eq '01:15') {
+                    return $true
+                }
+            }
+            catch {
+            }
+        }
+
+        return $false
+    }
+
+    function Test-CheckForUpdatedScriptsTaskCompliant {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory)]
+            [object]$Task,
+
+            [Parameter(Mandatory)]
+            [string]$ExpectedScriptPath,
+
+            [Parameter(Mandatory)]
+            [string]$ExpectedPowerShellExe
+        )
+
+        $issues = New-Object System.Collections.Generic.List[string]
+
+        $action = $Task.Actions | Select-Object -First 1
+        if ($null -eq $action) {
+            $issues.Add('Task has no action.') | Out-Null
+        }
+        else {
+            $actualExecute = [string]$action.Execute
+            $actualArguments = [string]$action.Arguments
+
+            if (($actualExecute -ine $ExpectedPowerShellExe) -and ((Split-Path -Leaf $actualExecute) -ine 'powershell.exe')) {
+                $issues.Add("Action executable is not Windows PowerShell. Current: $actualExecute") | Out-Null
+            }
+
+            if ($actualArguments -notmatch [regex]::Escape($ExpectedScriptPath)) {
+                $issues.Add("Action does not point to expected updater script. Current arguments: $actualArguments") | Out-Null
+            }
+
+            if ($actualArguments -notmatch '-NoProfile') {
+                $issues.Add('Action is missing -NoProfile.') | Out-Null
+            }
+
+            if ($actualArguments -notmatch '-ExecutionPolicy\s+Bypass') {
+                $issues.Add('Action is missing -ExecutionPolicy Bypass.') | Out-Null
+            }
+        }
+
+        if ($Task.Principal.UserId -notmatch 'SYSTEM') {
+            $issues.Add("Task principal is not SYSTEM. Current: $($Task.Principal.UserId)") | Out-Null
+        }
+
+        if ($Task.Principal.RunLevel -ne 'Highest') {
+            $issues.Add("Task run level is not Highest. Current: $($Task.Principal.RunLevel)") | Out-Null
+        }
+
+        if (-not (Get-WeeklySundayTriggerSummary -Triggers $Task.Triggers)) {
+            $issues.Add('Task trigger is not Sunday at 01:15.') | Out-Null
+        }
+
+        return $issues
+    }
+
+    function Ensure-CheckForUpdatedScriptsTask {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory)]
+            [string]$ScriptPath,
+
+            [string]$TaskName = '01. Check for Updated Scripts'
+        )
+
+        $windowsPowerShellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+
+        if (-not (Test-Path -LiteralPath $windowsPowerShellExe)) {
+            Write-Status "Windows PowerShell executable not found: $windowsPowerShellExe" 'ERROR'
+            return $false
+        }
+
+        if (-not (Test-Path -LiteralPath $ScriptPath)) {
+            Write-Status "Cannot register task because updater script is missing: $ScriptPath" 'ERROR'
+            return $false
+        }
+
+        try {
+            Import-Module ScheduledTasks -ErrorAction Stop | Out-Null
+        }
+        catch {
+            Write-Status "ScheduledTasks module is unavailable: $($_.Exception.Message)" 'ERROR'
+            return $false
+        }
+
+        $argumentString = "-NoProfile -ExecutionPolicy Bypass -File `"$ScriptPath`""
+        $needsRebuild = $true
+
+        try {
+            $existingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+            $issues = Test-CheckForUpdatedScriptsTaskCompliant -Task $existingTask -ExpectedScriptPath $ScriptPath -ExpectedPowerShellExe $windowsPowerShellExe
+
+            if ($issues.Count -eq 0) {
+                Write-Status "Scheduled task '$TaskName' is already configured correctly." 'OK'
+                $needsRebuild = $false
+            }
+            else {
+                Write-Status "Scheduled task '$TaskName' needs repair:" 'WARN'
+                foreach ($issue in $issues) {
+                    Write-Status " - $issue" 'WARN'
+                }
+            }
+        }
+        catch {
+            Write-Status "Scheduled task '$TaskName' does not exist and will be created." 'WARN'
+        }
+
+        if (-not $needsRebuild) {
+            return $true
+        }
+
+        try {
+            $action = New-ScheduledTaskAction -Execute $windowsPowerShellExe -Argument $argumentString
+            $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday -WeeksInterval 1 -At ([datetime]::Today.Add([timespan]::Parse('01:15')))
+            $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+            $settings = New-ScheduledTaskSettingsSet `
+                -AllowStartIfOnBatteries `
+                -DontStopIfGoingOnBatteries `
+                -StartWhenAvailable `
+                -ExecutionTimeLimit (New-TimeSpan -Hours 12)
+
+            Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+            Write-Status "Scheduled task '$TaskName' now points to: $ScriptPath" 'OK'
+            Write-Status "Task action: $windowsPowerShellExe $argumentString" 'INFO'
+            Write-Status "Task trigger: Sunday at 01:15 as SYSTEM with highest privileges." 'OK'
+            return $true
+        }
+        catch {
+            Write-Status "Failed to create/repair scheduled task '$TaskName': $($_.Exception.Message)" 'ERROR'
+            return $false
+        }
+    }
+
+
+    if (-not (Test-IsAdmin)) {
+        Write-Host ""
+        Write-Host "This script must be run as Administrator." -ForegroundColor Red
+        $script:WindowsUpdateServicesRepairRebootIssued = $true
+        return
+    }
+
+    Write-Status "Initializing script..." 'INFO'
+    Enable-ClassicWindows11RightClickMenu
+
+    # Restore registry startup values first
+    # Common defaults used for Windows Update-related services:
+    # wuauserv = Manual (3)
+    # bits = Manual (3)
+    # dosvc = Automatic family (2)
+    # UsoSvc = Automatic (2)
+    # WaaSMedicSvc = Manual/triggered on many systems (3)
+
+    Set-ServiceStartRegistry -ServiceName 'wuauserv'     -StartValue 3
+    Set-ServiceStartRegistry -ServiceName 'bits'         -StartValue 3
+    Set-ServiceStartRegistry -ServiceName 'dosvc'        -StartValue 2
+    Set-ServiceStartRegistry -ServiceName 'UsoSvc'       -StartValue 2
+    Set-ServiceStartRegistry -ServiceName 'WaaSMedicSvc' -StartValue 3
+
+    # Initial restore and startup
+    Set-ServiceStartupAndStart -Name 'wuauserv' -StartupType Manual
+    Set-ServiceStartupAndStart -Name 'bits'     -StartupType Manual
+    Set-ServiceStartupAndStart -Name 'dosvc'    -StartupType Automatic
+    Set-ServiceStartupAndStart -Name 'UsoSvc'   -StartupType Automatic
+
+    # WaaSMedicSvc can be protected; set registry above, then try starting via sc.exe
+    try {
+        & sc.exe config WaaSMedicSvc start= demand | Out-Null
+        Write-Status "Configured WaaSMedicSvc startup via sc.exe" 'OK'
+    }
+    catch {
+        Write-Status "Could not configure WaaSMedicSvc via sc.exe" 'WARN'
+    }
+
+    try {
+        & sc.exe start WaaSMedicSvc | Out-Null
+        Write-Status "Attempted to start WaaSMedicSvc" 'INFO'
+    }
+    catch {
+        Write-Status "Could not start WaaSMedicSvc directly" 'WARN'
+    }
+
+    # Restore Automatic Updates policy
+    $wuPolicyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
+    $auPolicyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'
+
+    Set-RegistryDwordSafe -Path $auPolicyPath -Name 'NoAutoUpdate' -Value 0
+    Set-RegistryDwordSafe -Path $auPolicyPath -Name 'AUOptions'    -Value 3
+
+    # Remove common WSUS redirection values if they were previously set
+    Remove-RegistryValueSafe -Path $wuPolicyPath -Name 'WUServer'
+    Remove-RegistryValueSafe -Path $wuPolicyPath -Name 'WUStatusServer'
+    Remove-RegistryValueSafe -Path $wuPolicyPath -Name 'UpdateServiceUrlAlternate'
+    Remove-RegistryValueSafe -Path $wuPolicyPath -Name 'SetProxyBehaviorForUpdateDetection'
+    Remove-RegistryValueSafe -Path $wuPolicyPath -Name 'DisableWindowsUpdateAccess'
+    Remove-RegistryValueSafe -Path $auPolicyPath -Name 'UseWUServer'
+
+    # Re-enable common update scheduled tasks
+    $tasks = @(
+        @{ Path = '\Microsoft\Windows\WindowsUpdate\';      Name = 'Scheduled Start' },
+        @{ Path = '\Microsoft\Windows\UpdateOrchestrator\'; Name = 'Schedule Scan' },
+        @{ Path = '\Microsoft\Windows\UpdateOrchestrator\'; Name = 'Schedule Scan Static Task' },
+        @{ Path = '\Microsoft\Windows\UpdateOrchestrator\'; Name = 'USO_UxBroker' },
+        @{ Path = '\Microsoft\Windows\UpdateOrchestrator\'; Name = 'Reboot' },
+        @{ Path = '\Microsoft\Windows\UpdateOrchestrator\'; Name = 'Maintenance Install' },
+        @{ Path = '\Microsoft\Windows\UpdateOrchestrator\'; Name = 'Refresh Settings' },
+        @{ Path = '\Microsoft\Windows\WaaSMedic\';          Name = 'PerformRemediation' }
+    )
+
+    foreach ($task in $tasks) {
+        Enable-ScheduledTaskSafe -TaskPath $task.Path -TaskName $task.Name
+    }
+
+    # Restart key services in a sensible order
+    $restartOrder = @('bits', 'dosvc', 'wuauserv', 'UsoSvc')
+    foreach ($svc in $restartOrder) {
+        try {
+            Restart-Service -Name $svc -Force -ErrorAction Stop
+            Write-Status "Restarted service: $svc" 'OK'
+        }
+        catch {
+            Write-Status "Could not restart $svc : $($_.Exception.Message)" 'WARN'
+        }
+    }
+
+    # Verify and retry critical services
+    $requiredServices = @(
+        @{ Name = 'wuauserv'; StartupType = 'Manual' },
+        @{ Name = 'bits';     StartupType = 'Manual' },
+        @{ Name = 'dosvc';    StartupType = 'Automatic' },
+        @{ Name = 'UsoSvc';   StartupType = 'Automatic' }
+    )
+
+    $failedServices = @()
+
+    foreach ($requiredService in $requiredServices) {
+        $serviceStarted = Ensure-ServiceRunningWithRetry -Name $requiredService.Name -StartupType $requiredService.StartupType -MaxAttempts 4 -WaitPerAttemptSeconds 15
+        if (-not $serviceStarted) {
+            $failedServices += $requiredService.Name
+        }
+    }
+
+    if ($failedServices.Count -gt 0) {
+        $failedList = $failedServices -join ', '
+        Write-Status "One or more critical Windows Update services failed to start: $failedList" 'ERROR'
+        Force-RebootNow -Reason "Windows Update service recovery failed. Services not running: $failedList"
+        $global:LastStatus = "[ERROR] Windows Update Services Repair could not start critical services: $failedList. Reboot command was issued."
+        return
+    }
+
+    Write-Status "Windows Update settings have been restored and critical services are running." 'OK'
+    Write-Status "No reboot required. Continuing normally." 'INFO'
+    $global:LastStatus = "[OK] Windows Update Services Repair completed successfully."
+    }
+    catch {
+        Write-Host ("[ERROR] Windows Update Services Repair failed: {0}" -f $_.Exception.Message) -ForegroundColor Red
+        $global:LastStatus = "[ERROR] Windows Update Services Repair failed: $($_.Exception.Message)"
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+}
+
+# -----------------------------------------------------------------------------
 # Menu Display
 # -----------------------------------------------------------------------------
 function Show-Menu {
@@ -17637,6 +18491,7 @@ function Show-Menu {
     Write-Host "16. Set OneDrive Auto Login on Boot" -ForegroundColor White
     Write-Host "17. Run Full System Updates" -ForegroundColor White
     Write-Host "18. Network Diag & Repair" -ForegroundColor White
+    Write-Host "19. Windows Update Services Repair" -ForegroundColor White
     Write-Host "Q.  Exit" -ForegroundColor Red
 
     Write-Host ""
@@ -17752,6 +18607,11 @@ function Main {
 			"18" {
 				Clear-Host
 				Run-NetworkDiagnostics
+				Pause
+			}
+			"19" {
+				Clear-Host
+				Invoke-WindowsUpdateServicesRepair
 				Pause
 			}
 			
