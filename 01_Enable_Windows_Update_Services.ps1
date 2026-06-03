@@ -1,6 +1,6 @@
 # =====================================================================
 # ScriptName: 01_Enable_Windows_Update_Services.ps1
-# ScriptVersion: 2.1
+# ScriptVersion: 2.2
 # LastUpdated: 2026-05-06
 # Purpose: Restore Windows Update services, tasks, policy settings,
 #          and Windows 11 classic right-click context menu behavior for all users;
