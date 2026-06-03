@@ -1,8 +1,8 @@
 # =====================================================================
 # ScriptName: Compton_Tech_Utils.ps1
-# ScriptVersion: 1.12.6
-# LastUpdated: 2026-05-29
-# Changes: Standardized all option-generated logs and reports to C:\Logs with automatic directory creation.
+# ScriptVersion: 1.12.8
+# LastUpdated: 2026-06-03
+# Changes: Updated Option 2 to exclude Microsoft Teams from bloatware removal and preserve Teams even if matched by custom/wildcard patterns.
 # =====================================================================
 
 # -----------------------------------------------------------------------------
@@ -660,9 +660,9 @@ function Remove-BloatwareApps {
     Removes Windows 11 consumer bloatware and disables Microsoft Copilot.
 
     .DESCRIPTION
-    Removes known Windows 11 inbox, consumer, promoted, OEM, Xbox, Teams, Outlook,
+    Removes known Windows 11 inbox, consumer, promoted, OEM, Xbox, Outlook,
     and Copilot AppX packages for existing users and from the online provisioned image.
-    DNS, network, shell-critical packages, Store infrastructure, Start, Search, and
+    DNS, network, Microsoft Teams, shell-critical packages, Store infrastructure, Start, Search, and
     MicrosoftWindows.Client.CBS are intentionally preserved.
 
     The function also applies machine and current-user policy registry values to disable
@@ -765,10 +765,6 @@ function Remove-BloatwareApps {
                 'Microsoft.Xbox*',
                 'Microsoft.GamingApp'
             )
-            'Teams Consumer' = @(
-                'MicrosoftTeams',
-                'MSTeams'
-            )
             'Copilot / AI App Packages' = @(
                 'Microsoft.Copilot',
                 'Microsoft.Copilot_*',
@@ -834,7 +830,9 @@ function Remove-BloatwareApps {
         )
 
         $protectedNames = @(
-            'Microsoft.XboxGameCallableUI'
+            'Microsoft.XboxGameCallableUI',
+            'MicrosoftTeams',
+            'MSTeams'
         )
 
         $name = [string]$Package.Name
@@ -1001,7 +999,9 @@ function Remove-BloatwareApps {
 
         # Explicit safety guard: Client.CBS can contain shell/start/search components and is not removed.
         $results.PreservedItems.Add('MicrosoftWindows.Client.CBS intentionally preserved; only Copilot-specific packages and policies are targeted.') | Out-Null
+        $results.PreservedItems.Add('Microsoft Teams intentionally preserved and excluded from Option 2 bloatware removal.') | Out-Null
         Write-Option2Log 'Safety guard active: MicrosoftWindows.Client.CBS is intentionally preserved.' 'INFO'
+        Write-Option2Log 'Safety guard active: Microsoft Teams packages are intentionally preserved and excluded from bloatware removal.' 'INFO'
         Write-Option2Log 'Safety guard active: protected Windows SystemApps such as Microsoft.XboxGameCallableUI are skipped instead of treated as failed removals.' 'INFO'
 
         foreach ($category in $patterns.Keys) {
@@ -14228,7 +14228,6 @@ function Set-DomainAutoLogin {
         $settingsToBackup = @(
             'AutoAdminLogon',
             'DefaultUserName', 
-            'DefaultPassword',
             'DefaultDomainName',
             'AutoLogonCount'
         )
@@ -14662,10 +14661,19 @@ function Set-DesktopPowerSettings {
         try {
             $output = & powercfg.exe @Arguments 2>&1
             $exitCode = $LASTEXITCODE
+            $outputText = if ($output) { ($output | Out-String).Trim() } else { '' }
+
             if ($exitCode -ne 0) {
-                $text = if ($output) { ($output | Out-String).Trim() } else { 'No output returned.' }
-                throw "$Description failed. ExitCode=$exitCode. $text"
+                if ($outputText -match 'Group policy override settings exist') {
+                    Write-PowerLog "[WARN] $Description was not changed directly by powercfg because a Group Policy override exists. The matching policy registry value will be written/enforced instead." 'WARN'
+                    Add-PowerResult -Setting $Description -Value (($Arguments -join ' ') + ' | Group Policy override handled by policy registry enforcement.')
+                    return $output
+                }
+
+                $message = if ($outputText) { $outputText } else { 'No output returned.' }
+                throw "$Description failed. ExitCode=$exitCode. $message"
             }
+
             Write-PowerLog "[OK] $Description" 'OK'
             Add-PowerResult -Setting $Description -Value ($Arguments -join ' ')
             return $output
@@ -18580,8 +18588,33 @@ function Main {
 			}
 			"15" {
 				Clear-Host
-				Set-DomainAutoLogin
-				# Get-AdminCredentials
+				Write-Host ""
+				Write-Host "Enter password for CC-Student auto-login configuration" -ForegroundColor Yellow
+
+				$Password1 = Read-Host "Password" -AsSecureString
+				$Password2 = Read-Host "Confirm Password" -AsSecureString
+
+				$Ptr1 = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Password1)
+				$Ptr2 = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Password2)
+
+				try {
+					$Plain1 = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($Ptr1)
+					$Plain2 = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($Ptr2)
+
+					if ([string]::IsNullOrWhiteSpace($Plain1)) {
+						Write-Host "No password entered. Operation cancelled." -ForegroundColor Red
+					}
+					elseif ($Plain1 -ne $Plain2) {
+						Write-Host "Passwords do not match. Operation cancelled." -ForegroundColor Red
+					}
+					else {
+						Set-DomainAutoLogin -Password $Password1
+					}
+				}
+				finally {
+					if ($Ptr1 -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($Ptr1) }
+					if ($Ptr2 -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($Ptr2) }
+				}
 				Pause
 			}
 			"16" {
