@@ -1,8 +1,8 @@
 # =====================================================================
 # ScriptName: Compton_Tech_Utils.ps1
-# ScriptVersion: 1.12.8
-# LastUpdated: 2026-06-03
-# Changes: Updated Option 2 to exclude Microsoft Teams from bloatware removal and preserve Teams even if matched by custom/wildcard patterns.
+# ScriptVersion: 1.12.9
+# LastUpdated: 2026-06-04
+# Changes: Fixed duplicate WhatIf parameter error in Option 15 CC-Student auto-login function; retained SupportsShouldProcess built-in -WhatIf behavior.
 # =====================================================================
 
 # -----------------------------------------------------------------------------
@@ -13767,7 +13767,6 @@ function Remove-UserProfilesClassroom {
     param(
         [string[]]$ExcludedProfiles = @('Default', 'Public', 'MISAdmin'),
         [switch]$Force,
-        [switch]$WhatIf,
         [string]$LogPath = (Join-Path (Get-ComptonLogDirectory) ("ProfileCleanup_{0}.log" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))),
         [int]$TimeoutSeconds = 30
     )
@@ -13941,7 +13940,7 @@ AND NOT LocalPath LIKE 'C:\\Users\\All Users%'
         Write-Host "This cannot be undone from this tool. Confirm backups are not needed before continuing." -ForegroundColor Red
         Write-Host ("=" * 78) -ForegroundColor Red
 
-        if ($WhatIf) {
+        if ($WhatIfPreference) {
             Write-LogEntry "WhatIf mode - no profiles will be deleted" 'INFO'
             $global:LastStatus = "[INFO] WhatIf completed - $($validatedProfiles.Count) profiles would be deleted."
             return
@@ -14157,7 +14156,6 @@ function Set-DomainAutoLogin {
         [string]$DomainName = "Compton.edu",
         
         [switch]$DisableAutoLogin,
-        [switch]$WhatIf,
         [switch]$Force,
         [string]$LogPath = (Join-Path (Get-ComptonLogDirectory) ("AutoLoginConfig_{0}.log" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))),
         [int]$AutoLoginCount = 1,  # Number of auto-logins before disabling
@@ -14372,7 +14370,7 @@ function Set-DomainAutoLogin {
     try {
         Write-LogEntry "=== Domain Auto-Login Configuration Started ===" 'INFO'
         
-        if ($WhatIf) {
+        if ($WhatIfPreference) {
             Write-LogEntry "WhatIf mode - no registry changes will be made" 'INFO'
         }
 
@@ -14471,7 +14469,7 @@ function Set-DomainAutoLogin {
         Write-LogEntry "[SAVE] Backing up current auto-login settings..." 'INFO'
         $backupFile = Backup-AutoLoginSettings
         
-        if ($WhatIf) {
+        if ($WhatIfPreference) {
             Write-LogEntry "WhatIf: Would configure auto-login for $DomainName\$UserName" 'INFO'
             Write-LogEntry "WhatIf: Would set AutoLogonCount to $AutoLoginCount" 'INFO'
             $global:LastStatus = "[INFO] WhatIf completed - auto-login would be configured."
@@ -14538,7 +14536,7 @@ function Set-DomainAutoLogin {
         Write-LogEntry "`n[SUMMARY] Configuration Summary:" 'INFO'
         Write-LogEntry "Duration: $([math]::Round($duration, 2)) seconds" 'INFO'
         
-        if (-not $DisableAutoLogin -and -not $WhatIf) {
+        if (-not $DisableAutoLogin -and -not $WhatIfPreference) {
             Write-LogEntry "User: $DomainName\$UserName" 'INFO'
             Write-LogEntry "Auto-login count: $AutoLoginCount" 'INFO'
             Write-LogEntry "Encryption: DPAPI (LocalMachine scope)" 'SECURITY'
