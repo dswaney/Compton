@@ -1,9 +1,7 @@
 # =====================================================================
 # ScriptName: 02_Remove_User_Profiles.ps1
-# ScriptVersion: 2.0.3
-# LastUpdated: 2026-05-06
-# Changes: Fixes YAML empty-array binding, adds native Win32_UserProfile cleanup before folder deletion, and retains capped parallel timeout-safe resumable profile cleanup.
-# Previous: v1.5 used sequential robocopy mirror deletion for profile folders.
+# ScriptVersion: 2.0.4
+# LastUpdated: 2026-06-15
 # =====================================================================
 
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Low')]
@@ -14,6 +12,7 @@ param(
         'Public',
         'All Users',
         'MISAdmin',
+		"CC-Student"
         'dswaney'
     ),
 
