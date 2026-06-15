@@ -1,8 +1,8 @@
 # ScriptName: 05_Weekend_HP_Drivers_Update.ps1
-# ScriptVersion: 2.5.0
-# LastUpdated: 2026-05-06
+# ScriptVersion: 2.5.1
+# LastUpdated: 2026-06-15
 # Purpose: Weekend vendor driver update script with clean HP + Dell support,
-#          YAML logging, local power policy enforcement, colored output,
+#          YAML logging, colored output,
 #          section headers, progress display, and structured per-driver results.
 
 [CmdletBinding()]
@@ -21,7 +21,7 @@ $ErrorActionPreference = 'Stop'
 # Script metadata
 # -----------------------------
 $script:ScriptName        = '05_Weekend_HP_Drivers_Update.ps1'
-$script:ScriptVersion     = '2.5.0'
+$script:ScriptVersion     = '2.5.1'
 $script:StartTime         = Get-Date
 $script:RunFailures       = New-Object System.Collections.Generic.List[string]
 $script:InstalledList     = New-Object System.Collections.Generic.List[string]
@@ -256,78 +256,6 @@ function Remove-WorkingFolderRobust {
             Start-Sleep -Seconds $RetryDelaySeconds
         }
     }
-}
-
-# -----------------------------
-# Power policy
-# -----------------------------
-function Set-LocalPowerPolicyDesktop {
-    try {
-        $base = 'HKLM:\SOFTWARE\Policies\Microsoft\Power\PowerSettings'
-
-        $displayGuid         = '3C0BC021-C8A8-4E07-A973-6B14CBCB2B7E'
-        $sleepGuid           = '29F6C1DB-86DA-48C5-9FDB-F2B67B1F44DA'
-        $unattendedSleepGuid = '7BC4A2F9-D8FC-4469-B07B-33EB785AACA0'
-        $hybridSleepGuid     = '94AC6D29-73CE-41A6-809F-6363BA21B47E'
-        $hibernateGuid       = '9D7815A6-7EE4-497E-8888-515A05F02364'
-
-        foreach ($guid in @($displayGuid,$sleepGuid,$unattendedSleepGuid,$hybridSleepGuid,$hibernateGuid)) {
-            $path = Join-Path $base $guid
-            if (-not (Test-Path -LiteralPath $path)) {
-                New-Item -Path $path -Force | Out-Null
-            }
-        }
-
-        New-ItemProperty -Path (Join-Path $base $displayGuid) -Name ACSettingIndex -PropertyType DWord -Value 3600 -Force | Out-Null
-        New-ItemProperty -Path (Join-Path $base $displayGuid) -Name DCSettingIndex -PropertyType DWord -Value 3600 -Force | Out-Null
-        New-ItemProperty -Path (Join-Path $base $sleepGuid) -Name ACSettingIndex -PropertyType DWord -Value 0 -Force | Out-Null
-        New-ItemProperty -Path (Join-Path $base $sleepGuid) -Name DCSettingIndex -PropertyType DWord -Value 0 -Force | Out-Null
-        New-ItemProperty -Path (Join-Path $base $unattendedSleepGuid) -Name ACSettingIndex -PropertyType DWord -Value 0 -Force | Out-Null
-        New-ItemProperty -Path (Join-Path $base $unattendedSleepGuid) -Name DCSettingIndex -PropertyType DWord -Value 0 -Force | Out-Null
-        New-ItemProperty -Path (Join-Path $base $hybridSleepGuid) -Name ACSettingIndex -PropertyType DWord -Value 1 -Force | Out-Null
-        New-ItemProperty -Path (Join-Path $base $hybridSleepGuid) -Name DCSettingIndex -PropertyType DWord -Value 1 -Force | Out-Null
-        New-ItemProperty -Path (Join-Path $base $hibernateGuid) -Name ACSettingIndex -PropertyType DWord -Value 0 -Force | Out-Null
-        New-ItemProperty -Path (Join-Path $base $hibernateGuid) -Name DCSettingIndex -PropertyType DWord -Value 0 -Force | Out-Null
-
-        powercfg -change -monitor-timeout-ac 60 > $null 2>&1
-        powercfg -change -monitor-timeout-dc 60 > $null 2>&1
-        powercfg -change -standby-timeout-ac 0 > $null 2>&1
-        powercfg -change -standby-timeout-dc 0 > $null 2>&1
-        powercfg -hibernate off > $null 2>&1
-
-        Add-YamlAction 'Applied local power policy (display 60 minutes, sleep never).'
-        Write-Log 'Local power policy applied successfully.' 'OK'
-    }
-    catch {
-        if (($_ | Out-String) -match 'Group policy override settings exist') {
-            Write-Log 'Local power policy already enforced by policy.' 'WARN'
-        }
-        else {
-            Add-RunFailure ("Failed to apply local power policy: {0}" -f $_.Exception.Message)
-        }
-    }
-}
-
-function Enforce-DesktopPowerSettings {
-    $highPerf = (powercfg -l | Select-String 'High performance' | ForEach-Object {
-        if ($_ -match '([A-Fa-f0-9\-]{36})') { $matches[1] }
-    } | Select-Object -First 1)
-
-    if ($highPerf) {
-        powercfg -setactive $highPerf > $null 2>&1
-        Write-Log ("High Performance power plan available: {0}" -f $highPerf) 'OK'
-    }
-    else {
-        Write-Log 'High Performance power plan was not found. Continuing with current plan.' 'WARN'
-    }
-
-    powercfg -change -monitor-timeout-ac 60 > $null 2>&1
-    powercfg -change -monitor-timeout-dc 60 > $null 2>&1
-    powercfg -change -standby-timeout-ac 0 > $null 2>&1
-    powercfg -change -standby-timeout-dc 0 > $null 2>&1
-    powercfg -hibernate off > $null 2>&1
-
-    Write-Log 'Desktop power settings enforced successfully.' 'OK'
 }
 
 # -----------------------------
@@ -1212,8 +1140,6 @@ try {
 
     Write-Log 'Initializing vendor driver update script...' 'INFO'
 
-    Write-Section 'Power Policy Enforcement'
-    Set-LocalPowerPolicyDesktop
 
     Write-Section 'Vendor Detection'
     $script:DetectedVendor = Get-DriverVendor
@@ -1227,10 +1153,6 @@ try {
         Invoke-DellDriverUpdates
     }
 
-    Write-Section 'Final Power Reapply'
-    Write-Log 'Reapplying enforced local desktop power policy (display 60 minutes, sleep never)...' 'INFO'
-    Set-LocalPowerPolicyDesktop
-    Enforce-DesktopPowerSettings
 }
 catch {
     $finalStatus = 'failed'
