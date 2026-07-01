@@ -1,14 +1,14 @@
 # =====================================================================
 # ScriptName: 01_Enable_Windows_Update_Services.ps1
-# ScriptVersion: 2.2
-# LastUpdated: 2026-05-06
+# ScriptVersion: 2.4
+# LastUpdated: 2026-07-01
 # Purpose: Restore Windows Update services, tasks, policy settings,
-#          and Windows 11 classic right-click context menu behavior for all users;
+#          Windows 11 UI preferences, and classic right-click context menu behavior for all users;
 #          verify required services are running, retry startup failures
 #          up to 4 total attempts, and force a reboot if critical
 #          services still refuse to start.
-# Fix:      Rebuilt clean script body to remove duplicate appended script-level
-#          [CmdletBinding()] / param() blocks that can cause parser errors.
+# Fix:      Removed StartWhenAvailable from task creation and added direct
+#          enforcement to clear missed-run behavior from maintenance tasks.
 # =====================================================================
 
 [CmdletBinding()]
@@ -458,6 +458,144 @@ function Enable-ClassicWindows11RightClickMenu {
     Write-Status "Completed Windows 11 classic right-click menu application for all available users." 'OK'
 }
 
+
+function Set-Windows11UIPreferencesForHive {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$RegistryRoot,
+
+        [Parameter(Mandatory)]
+        [string]$DisplayName
+    )
+
+    $advancedPath      = "$RegistryRoot\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
+    $searchSettingsPath = "$RegistryRoot\Software\Microsoft\Windows\CurrentVersion\SearchSettings"
+    $copilotPolicyPath = "$RegistryRoot\Software\Policies\Microsoft\Windows\WindowsCopilot"
+
+    $settings = @(
+        # Windows 11 taskbar/start alignment
+        @{ Path = $advancedPath;       Name = 'TaskbarAl';                 Value = 0; Description = 'taskbar/start alignment left' },
+
+        # Windows 11 taskbar buttons - intentionally does NOT modify Microsoft Teams/Chat
+        @{ Path = $advancedPath;       Name = 'TaskbarDa';                 Value = 0; Description = 'hide Widgets button' },
+        @{ Path = $advancedPath;       Name = 'ShowTaskViewButton';        Value = 0; Description = 'hide Task View button' },
+        @{ Path = $advancedPath;       Name = 'ShowCopilotButton';         Value = 0; Description = 'hide Copilot button' },
+
+        # Search / Copilot preferences
+        @{ Path = $searchSettingsPath; Name = 'IsDynamicSearchBoxEnabled'; Value = 0; Description = 'disable Search Highlights' },
+        @{ Path = $copilotPolicyPath;  Name = 'TurnOffWindowsCopilot';     Value = 1; Description = 'disable Windows Copilot for this user' },
+
+        # File Explorer preferences
+        @{ Path = $advancedPath;       Name = 'LaunchTo';                  Value = 1; Description = 'open File Explorer to This PC' },
+        @{ Path = $advancedPath;       Name = 'HideFileExt';               Value = 0; Description = 'show file extensions' },
+        @{ Path = $advancedPath;       Name = 'Hidden';                    Value = 1; Description = 'show hidden files' }
+    )
+
+    try {
+        foreach ($setting in $settings) {
+            if (-not (Test-Path -LiteralPath $setting.Path)) {
+                New-Item -Path $setting.Path -Force -ErrorAction Stop | Out-Null
+            }
+
+            New-ItemProperty `
+                -Path $setting.Path `
+                -Name $setting.Name `
+                -Value $setting.Value `
+                -PropertyType DWord `
+                -Force `
+                -ErrorAction Stop | Out-Null
+
+            Write-Status "Applied $($setting.Description) for $DisplayName." 'OK'
+        }
+
+        # NOTE: Microsoft Teams / Chat is intentionally not changed.
+        # Do not set TaskbarMn here because Teams is used on campus.
+
+        return $true
+    }
+    catch {
+        Write-Status "Failed to apply Windows 11 UI preferences for $DisplayName : $($_.Exception.Message)" 'WARN'
+        return $false
+    }
+}
+
+function Set-Windows11UIPreferencesForAllUsers {
+    [CmdletBinding()]
+    param()
+
+    Write-Status "Applying Windows 11 UI preferences for all users..." 'INFO'
+    Write-Status "Microsoft Teams / Chat taskbar settings are intentionally left unchanged." 'INFO'
+
+    $processedSids = New-Object 'System.Collections.Generic.HashSet[string]'
+
+    [void](Set-Windows11UIPreferencesForHive -RegistryRoot 'HKCU:' -DisplayName 'current user')
+
+    try {
+        $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        [void]$processedSids.Add($currentSid)
+    }
+    catch {
+        Write-Status "Could not determine current user SID: $($_.Exception.Message)" 'WARN'
+    }
+
+    try {
+        Get-ChildItem -Path 'Registry::HKEY_USERS' -ErrorAction Stop |
+            Where-Object {
+                $_.PSChildName -match '^S-1-5-21-' -and
+                $_.PSChildName -notmatch '_Classes$'
+            } |
+            ForEach-Object {
+                $sid = $_.PSChildName
+                [void]$processedSids.Add($sid)
+                [void](Set-Windows11UIPreferencesForHive -RegistryRoot "Registry::HKEY_USERS\$sid" -DisplayName "loaded profile $sid")
+            }
+    }
+    catch {
+        Write-Status "Failed to enumerate loaded user registry hives for Windows 11 UI preferences: $($_.Exception.Message)" 'WARN'
+    }
+
+    try {
+        $profiles = Get-CimInstance -ClassName Win32_UserProfile -ErrorAction Stop |
+            Where-Object {
+                -not $_.Special -and
+                $_.SID -match '^S-1-5-21-' -and
+                $_.LocalPath -and
+                (Test-Path -LiteralPath (Join-Path $_.LocalPath 'NTUSER.DAT'))
+            }
+
+        foreach ($profile in $profiles) {
+            if ($processedSids.Contains($profile.SID) -or (Test-Path -LiteralPath "Registry::HKEY_USERS\$($profile.SID)")) {
+                Write-Status "Profile already loaded or processed; skipping offline Windows 11 UI preference load for $($profile.LocalPath)" 'INFO'
+                continue
+            }
+
+            $ntUserDat = Join-Path $profile.LocalPath 'NTUSER.DAT'
+            [void](Invoke-WithLoadedUserHive -HiveFile $ntUserDat -DisplayName "offline profile $($profile.LocalPath)" -Action {
+                param($RegistryRoot, $DisplayName)
+                Set-Windows11UIPreferencesForHive -RegistryRoot $RegistryRoot -DisplayName $DisplayName
+            })
+        }
+    }
+    catch {
+        Write-Status "Failed to process offline user profiles for Windows 11 UI preferences: $($_.Exception.Message)" 'WARN'
+    }
+
+    $defaultHive = Join-Path $env:SystemDrive 'Users\Default\NTUSER.DAT'
+    if (Test-Path -LiteralPath $defaultHive) {
+        [void](Invoke-WithLoadedUserHive -HiveFile $defaultHive -DisplayName 'Default User profile for future users' -Action {
+            param($RegistryRoot, $DisplayName)
+            Set-Windows11UIPreferencesForHive -RegistryRoot $RegistryRoot -DisplayName $DisplayName
+        })
+    }
+    else {
+        Write-Status "Default User hive not found at expected path: $defaultHive" 'WARN'
+    }
+
+    Write-Status "Completed Windows 11 UI preference application for all available users." 'OK'
+}
+
+
 function Get-ScriptHeaderValue {
     [CmdletBinding()]
     param(
@@ -513,88 +651,6 @@ function Convert-ToVersionObjectSafe {
             Write-Status "Unable to parse version [$VersionText]. Treating as 0.0." 'WARN'
             return [version]'0.0'
         }
-    }
-}
-
-function Ensure-ShareScriptUpdater {
-    [CmdletBinding()]
-    param(
-        [string]$SourcePath = '\\filesvr\labshare\00_Update-Scripts-FromShare.ps1',
-        [string]$DestinationFolder = 'C:\Scripts',
-        [string]$DestinationFileName = '00_Update-Scripts-FromShare.ps1',
-        [string[]]$LegacyFilesToDelete = @(
-            '00_Update-Scripts-FromGithub.ps1',
-            'Register-Tasks_SYSTEM.ps1'
-        )
-    )
-
-    $destinationPath = Join-Path $DestinationFolder $DestinationFileName
-
-    try {
-        if (-not (Test-Path -LiteralPath $DestinationFolder)) {
-            New-Item -Path $DestinationFolder -ItemType Directory -Force | Out-Null
-            Write-Status "Created destination folder: $DestinationFolder" 'OK'
-        }
-
-        foreach ($legacyFileName in $LegacyFilesToDelete) {
-            $legacyPath = Join-Path $DestinationFolder $legacyFileName
-            if (Test-Path -LiteralPath $legacyPath) {
-                try {
-                    Remove-Item -LiteralPath $legacyPath -Force -ErrorAction Stop
-                    Write-Status "Removed legacy script: $legacyPath" 'OK'
-                }
-                catch {
-                    Write-Status "Failed to remove legacy script [$legacyPath]: $($_.Exception.Message)" 'WARN'
-                }
-            }
-            else {
-                Write-Status "Legacy script not present: $legacyPath" 'INFO'
-            }
-        }
-
-        if (-not (Test-Path -LiteralPath $SourcePath)) {
-            if (Test-Path -LiteralPath $destinationPath) {
-                Write-Status "Share source unavailable, but updater already exists locally: $destinationPath" 'WARN'
-                return $destinationPath
-            }
-
-            throw "Required updater script is missing locally and source is unavailable. Source: $SourcePath ; Local: $destinationPath"
-        }
-
-        $sourceVersionText = Get-ScriptHeaderValue -Path $SourcePath -HeaderName 'ScriptVersion'
-        $localVersionText  = Get-ScriptHeaderValue -Path $destinationPath -HeaderName 'ScriptVersion'
-
-        $sourceVersion = Convert-ToVersionObjectSafe -VersionText $sourceVersionText
-        $localVersion  = Convert-ToVersionObjectSafe -VersionText $localVersionText
-
-        if ([string]::IsNullOrWhiteSpace($sourceVersionText)) {
-            Write-Status "Source updater is missing a ScriptVersion header. It will only be copied if the local file is missing." 'WARN'
-        }
-
-        if (-not (Test-Path -LiteralPath $destinationPath)) {
-            Copy-Item -LiteralPath $SourcePath -Destination $destinationPath -Force -ErrorAction Stop
-            Write-Status "Local updater missing. Copied updater from [$SourcePath] to [$destinationPath]. Source version: [$sourceVersionText]" 'OK'
-        }
-        elseif ($sourceVersion -gt $localVersion) {
-            Write-Status "Updater source version [$sourceVersionText] is newer than local version [$localVersionText]. Updating local copy..." 'WARN'
-            Copy-Item -LiteralPath $SourcePath -Destination $destinationPath -Force -ErrorAction Stop
-            Write-Status "Updated local updater script: $destinationPath" 'OK'
-        }
-        else {
-            Write-Status "Local updater is current. Local version [$localVersionText], source version [$sourceVersionText]." 'OK'
-        }
-
-        try {
-            Unblock-File -LiteralPath $destinationPath -ErrorAction SilentlyContinue
-        }
-        catch {
-        }
-
-        return $destinationPath
-    }
-    catch {
-        Write-Status "Failed to verify/stage share updater script: $($_.Exception.Message)" 'ERROR'
-        return $null
     }
 }
 
@@ -681,6 +737,59 @@ function Test-CheckForUpdatedScriptsTaskCompliant {
     return $issues
 }
 
+
+function Disable-MissedRunBehaviorForMaintenanceTasks {
+    [CmdletBinding()]
+    param(
+        [string[]]$TaskNames = @(
+            '01. Check for Updated Scripts',
+            '02. Remove User Profiles',
+            '03. Weekend Apps Update',
+            '04. Update Edge Silent',
+            '05. Weekend HP Drivers Update',
+            '06. Weekend Windows Updates',
+            '07. Force Reboot Install Updates',
+            '08. System Repair',
+            '09. Disable Windows Update Services',
+            '10. Sync System Time'
+        )
+    )
+
+    try {
+        Import-Module ScheduledTasks -ErrorAction Stop | Out-Null
+    }
+    catch {
+        Write-Status "ScheduledTasks module is unavailable. Cannot clear missed-run behavior: $($_.Exception.Message)" 'WARN'
+        return
+    }
+
+    foreach ($taskName in $TaskNames) {
+        try {
+            $tasks = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
+        }
+        catch {
+            Write-Status "Task not found while clearing missed-run behavior: $taskName" 'WARN'
+            continue
+        }
+
+        foreach ($task in @($tasks)) {
+            try {
+                if ($task.Settings.StartWhenAvailable -eq $true) {
+                    $task.Settings.StartWhenAvailable = $false
+                    Set-ScheduledTask -InputObject $task -ErrorAction Stop | Out-Null
+                    Write-Status "Disabled missed-run behavior for task: $($task.TaskPath)$($task.TaskName)" 'OK'
+                }
+                else {
+                    Write-Status "Missed-run behavior already disabled for task: $($task.TaskPath)$($task.TaskName)" 'INFO'
+                }
+            }
+            catch {
+                Write-Status "Failed to clear missed-run behavior for task $($task.TaskPath)$($task.TaskName): $($_.Exception.Message)" 'WARN'
+            }
+        }
+    }
+}
+
 function Ensure-CheckForUpdatedScriptsTask {
     [CmdletBinding()]
     param(
@@ -743,7 +852,6 @@ function Ensure-CheckForUpdatedScriptsTask {
         $settings = New-ScheduledTaskSettingsSet `
             -AllowStartIfOnBatteries `
             -DontStopIfGoingOnBatteries `
-            -StartWhenAvailable `
             -ExecutionTimeLimit (New-TimeSpan -Hours 12)
 
         Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
@@ -766,11 +874,8 @@ if (-not (Test-IsAdmin)) {
 }
 
 Write-Status "Initializing script..." 'INFO'
+Set-Windows11UIPreferencesForAllUsers
 Enable-ClassicWindows11RightClickMenu
-$shareUpdaterPath = Ensure-ShareScriptUpdater
-if ($shareUpdaterPath) {
-    [void](Ensure-CheckForUpdatedScriptsTask -ScriptPath $shareUpdaterPath)
-}
 
 # Restore registry startup values first
 # Common defaults used for Windows Update-related services:
@@ -874,6 +979,57 @@ if ($failedServices.Count -gt 0) {
     Write-Status "One or more critical Windows Update services failed to start: $failedList" 'ERROR'
     Force-RebootNow -Reason "Windows Update service recovery failed. Services not running: $failedList"
 }
+
+
+# ------------------------------------------------------------
+# One-time scheduled task rebuild
+# Purpose: Apply updated task settings after 00_Update-Scripts-FromShare.ps1
+#          has copied the latest Register-Tasks_SYSTEM.ps1 locally.
+#          This removes "Run task as soon as possible after a scheduled
+#          start is missed" from the registered maintenance tasks.
+# ------------------------------------------------------------
+$TaskRebuildMarker  = 'C:\Scripts\.RegisterTasks_NoMissedRun_v1.done'
+$RegisterTasksScriptCandidates = @(
+    'C:\Scripts\Register-Tasks_SYSTEM.ps1',
+    'C:\Scripts\Register-Tasks_SYSTEM_v2.0.ps1'
+)
+$RegisterTasksScript = $RegisterTasksScriptCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+
+if (-not (Test-Path -LiteralPath $TaskRebuildMarker)) {
+    if ($RegisterTasksScript) {
+        Write-Status "Running one-time scheduled task rebuild to remove missed-run behavior..." 'INFO'
+
+        try {
+            $taskRebuildProcess = Start-Process `
+                -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+                -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$RegisterTasksScript`"" `
+                -Wait `
+                -PassThru `
+                -WindowStyle Hidden
+
+            if ($taskRebuildProcess.ExitCode -eq 0) {
+                New-Item -Path $TaskRebuildMarker -ItemType File -Force | Out-Null
+                Write-Status "Scheduled tasks rebuilt successfully. Marker created: $TaskRebuildMarker" 'OK'
+            }
+            else {
+                Write-Status "Scheduled task rebuild exited with code $($taskRebuildProcess.ExitCode). It will retry next time this script runs." 'WARN'
+            }
+        }
+        catch {
+            Write-Status "Scheduled task rebuild failed: $($_.Exception.Message)" 'WARN'
+        }
+    }
+    else {
+        Write-Status "Register task script not found: $RegisterTasksScript" 'WARN'
+    }
+}
+else {
+    Write-Status "Scheduled task rebuild already completed previously. Skipping." 'INFO'
+}
+
+# Final enforcement pass. This runs after any task rebuild so older register scripts
+# cannot leave "Run task as soon as possible after a scheduled start is missed" enabled.
+Disable-MissedRunBehaviorForMaintenanceTasks
 
 Write-Status "Windows Update settings have been restored and critical services are running." 'OK'
 Write-Status "No reboot required. Continuing normally." 'INFO'
