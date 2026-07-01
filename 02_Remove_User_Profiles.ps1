@@ -1,7 +1,7 @@
 # =====================================================================
 # ScriptName: 02_Remove_User_Profiles.ps1
-# ScriptVersion: 2.0.4
-# LastUpdated: 2026-06-15
+# ScriptVersion: 2.0.5
+# LastUpdated: 2026-07-01
 # =====================================================================
 
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Low')]
@@ -32,7 +32,18 @@ param(
 
     [int]$ProfileFolderJobTimeoutMinutes = 15,
 
-    [string]$ProfileCleanupStatePath = 'C:\ProgramData\Compton\ProfileCleanupState.json'
+    [string]$ProfileCleanupStatePath = 'C:\ProgramData\Compton\ProfileCleanupState.json',
+
+    # Add additional computer name patterns here as needed.
+    # Examples:
+    #   'SSB-114*' matches any computer name that begins with SSB-114.
+    #   'LAB-205-01' matches one exact computer name.
+    [string[]]$EdgeInPrivateComputerNamePatterns = @(
+        'SSB-114*'
+		'SSB-122*'
+    ),
+
+    [string]$EdgeInPrivateUrl = 'https://www.compton.edu'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -150,6 +161,12 @@ function Write-YamlLog {
         $lines.Add("  profile_cleanup_time_limit_minutes: $(ConvertTo-YamlScalar $ProfileCleanupTimeLimitMinutes)") | Out-Null
         $lines.Add("  profile_folder_job_timeout_minutes: $(ConvertTo-YamlScalar $ProfileFolderJobTimeoutMinutes)") | Out-Null
         $lines.Add("  profile_cleanup_state_path: $(ConvertTo-YamlScalar $ProfileCleanupStatePath)") | Out-Null
+        $lines.Add("  edge_inprivate_url: $(ConvertTo-YamlScalar $EdgeInPrivateUrl)") | Out-Null
+        $lines.Add('  edge_inprivate_computer_name_patterns:') | Out-Null
+        if ($EdgeInPrivateComputerNamePatterns.Count -gt 0) {
+            foreach ($pattern in $EdgeInPrivateComputerNamePatterns) { $lines.Add("    - $(ConvertTo-YamlScalar $pattern)") | Out-Null }
+        }
+        else { $lines.Add('    []') | Out-Null }
         $lines.Add('  excluded_profiles:') | Out-Null
         if ($ExcludedProfiles.Count -gt 0) {
             foreach ($name in $ExcludedProfiles) { $lines.Add("    - $(ConvertTo-YamlScalar $name)") | Out-Null }
@@ -197,6 +214,66 @@ function Write-Log {
         'OK'    { Write-Host $line -ForegroundColor Green }
         'WARN'  { Write-Host $line -ForegroundColor Yellow }
         'ERROR' { Write-Host $line -ForegroundColor Red }
+    }
+}
+
+function Test-ComputerNamePatternMatch {
+    param(
+        [Parameter(Mandatory)][string]$ComputerName,
+        [Parameter(Mandatory)][string[]]$Patterns
+    )
+
+    foreach ($pattern in $Patterns) {
+        if ([string]::IsNullOrWhiteSpace($pattern)) {
+            continue
+        }
+
+        if ($ComputerName -like $pattern) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Set-EdgeInPrivateAutoLaunch {
+    param(
+        [Parameter(Mandatory)][string]$Url
+    )
+
+    $edgePaths = @(
+        (Join-Path ${env:ProgramFiles(x86)} 'Microsoft\Edge\Application\msedge.exe'),
+        (Join-Path ${env:ProgramFiles} 'Microsoft\Edge\Application\msedge.exe')
+    )
+
+    $edgePath = $edgePaths | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+
+    if (-not $edgePath) {
+        Write-Log 'Microsoft Edge was not found. Edge InPrivate auto-launch was not configured.' 'ERROR'
+        return $false
+    }
+
+    $runKey = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Run'
+    $runValueName = 'LaunchComptonEdge'
+    $command = '"{0}" --inprivate "{1}"' -f $edgePath, $Url
+
+    try {
+        New-Item -Path $runKey -Force | Out-Null
+
+        New-ItemProperty `
+            -Path $runKey `
+            -Name $runValueName `
+            -Value $command `
+            -PropertyType String `
+            -Force | Out-Null
+
+        Write-Log "Configured Edge InPrivate auto-launch for every user at logon: $Url" 'OK'
+        Write-Log "Run key value: $runValueName = $command" 'INFO'
+        return $true
+    }
+    catch {
+        Write-Log "Failed to configure Edge InPrivate auto-launch: $($_.Exception.Message)" 'ERROR'
+        return $false
     }
 }
 
@@ -780,6 +857,14 @@ if (-not (Test-IsAdministrator)) {
 
 Ensure-LogDirectory
 Write-YamlLog
+
+if (Test-ComputerNamePatternMatch -ComputerName $script:ComputerName -Patterns $EdgeInPrivateComputerNamePatterns) {
+    Write-Log "Computer name '$($script:ComputerName)' matches Edge InPrivate auto-launch list." 'INFO'
+    [void](Set-EdgeInPrivateAutoLaunch -Url $EdgeInPrivateUrl)
+}
+else {
+    Write-Log "Computer name '$($script:ComputerName)' does not match Edge InPrivate auto-launch list. Skipping Edge configuration." 'INFO'
+}
 
 Write-Log 'Starting profile cleanup.' 'INFO'
 Write-Log "Users root: $UsersRoot" 'INFO'
