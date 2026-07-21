@@ -1,11 +1,19 @@
 # =====================================================================
 # ScriptName: 00_Update-Scripts-FromShare.ps1
-# ScriptVersion: 2.2
-# LastUpdated: 2026-04-28
+# ScriptVersion: 3.0
+# LastUpdated: 2026-07-21
+# Purpose:
+#   - Dynamically synchronize PowerShell scripts from the central share.
+#   - Update and relaunch itself when a newer/different updater is found.
+#   - Automatically deploy newly added .ps1 files.
+#   - Run Register-Tasks_SYSTEM.ps1 after synchronization so missing or
+#     changed maintenance tasks are reconciled.
 # =====================================================================
 
 [CmdletBinding()]
-param()
+param(
+    [switch]$Relaunched
+)
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -16,581 +24,275 @@ $ProgressPreference = 'SilentlyContinue'
 $PreferredSourceRoot = '\\filesvr\Labscripts'
 $FallbackSourceRoot  = '\\10.2.3.30\Labscripts'
 
-$LocalScripts  = 'C:\Scripts'
-$LogFolder     = 'C:\Logs'
-$BackupFolder  = 'C:\Scripts\Backup'
+$LocalScripts = 'C:\Scripts'
+$LogFolder    = 'C:\Logs'
+$BackupFolder = 'C:\Scripts\Backup'
+$LogPath      = Join-Path $LogFolder '00_Update-Scripts-FromShare.log'
 
-$ScriptFiles = @(
-    '00_Update-Scripts-FromShare.ps1',
-    '01_Enable_Windows_Update_Services.ps1',
-    '02_Remove_User_Profiles.ps1',
-    '03_Weekend_Apps_Update.ps1',
-    '04_Update_Edge_Silent.ps1',
-    '05_Weekend_HP_Drivers_Update.ps1',
-    '06_Weekend_Windows_Updates.ps1',
-    '07_Force_Reboot_Install_Updates.ps1',
-    '08_System_Repair.ps1',
-    '09_Disable_Windows_Update_Services.ps1',
+$UpdaterFileName      = '00_Update-Scripts-FromShare.ps1'
+$RegisterTasksName    = 'Register-Tasks_SYSTEM.ps1'
+$WindowsPowerShellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+
+# Files or folders in the share root that should not be treated as managed scripts.
+$ExcludedFileNames = @(
     'Register-Tasks_SYSTEM_v2.0.ps1'
 )
 
-$LegacyFilesToDelete = @(
-    '00_Update-Scripts-FromGithub.ps1',
-    'Register-Tasks_SYSTEM.ps1'
-)
-
-# ---------------------------
-# Runtime State
-# ---------------------------
-$script:RunStart             = Get-Date
-$script:ComputerName         = $env:COMPUTERNAME
-$script:YamlLogPath          = $null
-$script:OverallResult        = 'Unknown'
-$script:FailureMessage       = $null
-$script:ActionHistory        = New-Object System.Collections.Generic.List[object]
-$script:FileResults          = New-Object System.Collections.Generic.List[object]
-$script:SelectedSourceRoot   = $null
-$script:SelectedSourceLabel  = $null
-$script:PreferredSourceUsed  = $false
-$script:FallbackSourceUsed   = $false
-$script:PreferredSourceReachable = $false
-$script:FallbackReason       = $null
-
-# ---------------------------
-# Helpers
-# ---------------------------
-function Ensure-Folder {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Path
-    )
-
-    if (-not (Test-Path -LiteralPath $Path)) {
-        New-Item -Path $Path -ItemType Directory -Force | Out-Null
-    }
-}
-
-function Initialize-YamlLog {
-    Ensure-Folder -Path $LogFolder
-
-    $timestamp = $script:RunStart.ToString('yyyy-MM-dd_HH-mm-ss')
-    $baseName = "$($script:ComputerName)-UpdateScriptsFromShare-$timestamp"
-    $script:YamlLogPath = Join-Path $LogFolder ($baseName + '.yaml')
-}
-
 function Write-Status {
     param(
-        [Parameter(Mandatory)]
-        [string]$Message,
-
-        [ValidateSet('INFO','OK','WARN','ERROR')]
+        [Parameter(Mandatory)][string]$Message,
+        [ValidateSet('INFO','ACTION','OK','WARN','ERROR')]
         [string]$Level = 'INFO'
     )
 
     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    $line = "[$timestamp] [$('{0,-5}' -f $Level)] $Message"
+    $line = "[$timestamp] [$('{0,-6}' -f $Level)] $Message"
 
-    switch ($Level) {
-        'INFO'  { Write-Host $line -ForegroundColor Cyan }
-        'OK'    { Write-Host $line -ForegroundColor Green }
-        'WARN'  { Write-Host $line -ForegroundColor Yellow }
-        'ERROR' { Write-Host $line -ForegroundColor Red }
+    $color = switch ($Level) {
+        'ACTION' { 'Yellow' }
+        'OK'     { 'Green' }
+        'WARN'   { 'DarkYellow' }
+        'ERROR'  { 'Red' }
+        default  { 'Cyan' }
     }
 
-    $script:ActionHistory.Add([PSCustomObject]@{
-        Time    = $timestamp
-        Level   = $Level
-        Message = $Message
-    }) | Out-Null
-}
+    Write-Host $line -ForegroundColor $color
 
-function ConvertTo-YamlScalar {
-    param(
-        [AllowNull()]$Value
-    )
-
-    if ($null -eq $Value) {
-        return 'null'
-    }
-
-    if ($Value -is [bool]) {
-        return $Value.ToString().ToLowerInvariant()
-    }
-
-    if ($Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal]) {
-        return [string]$Value
-    }
-
-    if ($Value -is [datetime]) {
-        return "'" + $Value.ToString('yyyy-MM-dd HH:mm:ss') + "'"
-    }
-
-    $text = [string]$Value
-    $text = $text -replace "`r", ' '
-    $text = $text -replace "`n", ' '
-    $text = $text -replace "'", "''"
-    return "'" + $text + "'"
-}
-
-function Write-YamlLog {
     try {
-        if ([string]::IsNullOrWhiteSpace($script:YamlLogPath)) {
-            Initialize-YamlLog
-        }
-
-        $runEnd = Get-Date
-        $duration = [math]::Round(($runEnd - $script:RunStart).TotalSeconds, 0)
-
-        $updatedCount = @($script:FileResults | Where-Object { $_.Status -eq 'Updated' }).Count
-        $currentCount = @($script:FileResults | Where-Object { $_.Status -eq 'Current' }).Count
-        $downloadedMissingCount = @($script:FileResults | Where-Object { $_.Status -eq 'DownloadedMissing' }).Count
-        $errorCount = @($script:FileResults | Where-Object { $_.Status -eq 'Error' }).Count
-
-        $lines = New-Object System.Collections.Generic.List[string]
-
-        $lines.Add("computer_name: $(ConvertTo-YamlScalar $script:ComputerName)") | Out-Null
-        $lines.Add("script_name: '00_Update-Scripts-FromShare.ps1'") | Out-Null
-        $lines.Add("script_version: '2.2'") | Out-Null
-        $lines.Add("run_started: $(ConvertTo-YamlScalar $script:RunStart)") | Out-Null
-        $lines.Add("run_finished: $(ConvertTo-YamlScalar $runEnd)") | Out-Null
-        $lines.Add("duration_seconds: $duration") | Out-Null
-        $lines.Add("preferred_source_root: $(ConvertTo-YamlScalar $PreferredSourceRoot)") | Out-Null
-        $lines.Add("fallback_source_root: $(ConvertTo-YamlScalar $FallbackSourceRoot)") | Out-Null
-        $lines.Add("selected_source_root: $(ConvertTo-YamlScalar $script:SelectedSourceRoot)") | Out-Null
-        $lines.Add("selected_source_label: $(ConvertTo-YamlScalar $script:SelectedSourceLabel)") | Out-Null
-        $lines.Add("preferred_source_reachable: $(ConvertTo-YamlScalar $script:PreferredSourceReachable)") | Out-Null
-        $lines.Add("preferred_source_used: $(ConvertTo-YamlScalar $script:PreferredSourceUsed)") | Out-Null
-        $lines.Add("fallback_source_used: $(ConvertTo-YamlScalar $script:FallbackSourceUsed)") | Out-Null
-        $lines.Add("fallback_reason: $(ConvertTo-YamlScalar $script:FallbackReason)") | Out-Null
-        $lines.Add("local_scripts_path: $(ConvertTo-YamlScalar $LocalScripts)") | Out-Null
-        $lines.Add("backup_folder: $(ConvertTo-YamlScalar $BackupFolder)") | Out-Null
-        $lines.Add("yaml_log_path: $(ConvertTo-YamlScalar $script:YamlLogPath)") | Out-Null
-        $lines.Add("overall_result: $(ConvertTo-YamlScalar $script:OverallResult)") | Out-Null
-        $lines.Add("failure_message: $(ConvertTo-YamlScalar $script:FailureMessage)") | Out-Null
-        $lines.Add('') | Out-Null
-
-        $lines.Add('summary:') | Out-Null
-        $lines.Add("  updated: $updatedCount") | Out-Null
-        $lines.Add("  current: $currentCount") | Out-Null
-        $lines.Add("  downloaded_missing: $downloadedMissingCount") | Out-Null
-        $lines.Add("  errors: $errorCount") | Out-Null
-        $lines.Add('') | Out-Null
-
-        $lines.Add('file_results:') | Out-Null
-        if ($script:FileResults.Count -gt 0) {
-            foreach ($item in $script:FileResults) {
-                $lines.Add('  -') | Out-Null
-                $lines.Add("    file_name: $(ConvertTo-YamlScalar $item.FileName)") | Out-Null
-                $lines.Add("    local_path: $(ConvertTo-YamlScalar $item.LocalPath)") | Out-Null
-                $lines.Add("    source_path: $(ConvertTo-YamlScalar $item.SourcePath)") | Out-Null
-                $lines.Add("    source_label: $(ConvertTo-YamlScalar $item.SourceLabel)") | Out-Null
-                $lines.Add("    status: $(ConvertTo-YamlScalar $item.Status)") | Out-Null
-                $lines.Add("    local_version: $(ConvertTo-YamlScalar $item.LocalVersion)") | Out-Null
-                $lines.Add("    remote_version: $(ConvertTo-YamlScalar $item.RemoteVersion)") | Out-Null
-                $lines.Add("    local_last_updated: $(ConvertTo-YamlScalar $item.LocalLastUpdated)") | Out-Null
-                $lines.Add("    remote_last_updated: $(ConvertTo-YamlScalar $item.RemoteLastUpdated)") | Out-Null
-                $lines.Add("    backup_path: $(ConvertTo-YamlScalar $item.BackupPath)") | Out-Null
-                $lines.Add("    message: $(ConvertTo-YamlScalar $item.Message)") | Out-Null
-            }
-        }
-        else {
-            $lines.Add('  []') | Out-Null
-        }
-
-        $lines.Add('') | Out-Null
-        $lines.Add('actions:') | Out-Null
-        if ($script:ActionHistory.Count -gt 0) {
-            foreach ($action in $script:ActionHistory) {
-                $lines.Add('  -') | Out-Null
-                $lines.Add("    time: $(ConvertTo-YamlScalar $action.Time)") | Out-Null
-                $lines.Add("    level: $(ConvertTo-YamlScalar $action.Level)") | Out-Null
-                $lines.Add("    message: $(ConvertTo-YamlScalar $action.Message)") | Out-Null
-            }
-        }
-        else {
-            $lines.Add('  []') | Out-Null
-        }
-
-        Set-Content -Path $script:YamlLogPath -Value $lines -Encoding UTF8
+        Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8
     }
     catch {
-        Write-Warning "Failed to write YAML log: $($_.Exception.Message)"
     }
 }
 
-function Get-FileTextSafe {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Path
-    )
+function Ensure-Folder {
+    param([Parameter(Mandatory)][string]$Path)
 
-    if (-not (Test-Path -LiteralPath $Path)) {
-        return $null
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+        New-Item -Path $Path -ItemType Directory -Force | Out-Null
     }
+}
+
+function Test-ShareRoot {
+    param([Parameter(Mandatory)][string]$Path)
 
     try {
-        return Get-Content -LiteralPath $Path -Raw -Encoding UTF8
-    }
-    catch {
-        try {
-            return Get-Content -LiteralPath $Path -Raw
-        }
-        catch {
-            throw "Failed reading file [$Path] : $($_.Exception.Message)"
-        }
-    }
-}
-
-function Get-ScriptHeaderValue {
-    param(
-        [Parameter(Mandatory)]
-        [AllowEmptyString()]
-        [string]$Content,
-
-        [Parameter(Mandatory)]
-        [string]$HeaderName
-    )
-
-    if ([string]::IsNullOrWhiteSpace($Content)) {
-        return $null
-    }
-
-    $normalized = $Content -replace "^\uFEFF", ''
-    $normalized = $normalized -replace "`r`n", "`n"
-    $normalized = $normalized -replace "`r", "`n"
-
-    $patternLine = "(?im)^\s*#\s*" + [regex]::Escape($HeaderName) + "\s*:\s*([^\r\n]+?)\s*$"
-    $matchLine = [regex]::Match($normalized, $patternLine)
-    if ($matchLine.Success) {
-        return $matchLine.Groups[1].Value.Trim()
-    }
-
-    $patternInline = "(?is)#\s*" + [regex]::Escape($HeaderName) + "\s*:\s*([^#\r\n]+)"
-    $matchInline = [regex]::Match($normalized, $patternInline)
-    if ($matchInline.Success) {
-        return $matchInline.Groups[1].Value.Trim()
-    }
-
-    return $null
-}
-
-function Convert-ToVersionObject {
-    param(
-        [Parameter(Mandatory)]
-        [string]$VersionText
-    )
-
-    try {
-        return [version]$VersionText.Trim()
-    }
-    catch {
-        $clean = ($VersionText -replace '[^\d\.]', '').Trim('.')
-        if ([string]::IsNullOrWhiteSpace($clean)) {
-            return [version]'0.0'
-        }
-
-        try {
-            return [version]$clean
-        }
-        catch {
-            return [version]'0.0'
-        }
-    }
-}
-
-function Backup-File {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Path
-    )
-
-    if (-not (Test-Path -LiteralPath $Path)) {
-        return $null
-    }
-
-    Ensure-Folder -Path $BackupFolder
-
-    $baseName   = [System.IO.Path]::GetFileNameWithoutExtension($Path)
-    $extension  = [System.IO.Path]::GetExtension($Path)
-    $timestamp  = Get-Date -Format 'yyyyMMdd_HHmmss'
-    $backupName = "${baseName}_${timestamp}${extension}.bak"
-    $backupPath = Join-Path $BackupFolder $backupName
-
-    Copy-Item -LiteralPath $Path -Destination $backupPath -Force
-    Write-Status "Backed up [$Path] to [$backupPath]" 'OK'
-    return $backupPath
-}
-
-function Save-Utf8NoBom {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Path,
-
-        [Parameter(Mandatory)]
-        [string]$Content
-    )
-
-    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-    [System.IO.File]::WriteAllText($Path, $Content, $utf8NoBom)
-}
-
-function Test-ShareReachable {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Path
-    )
-
-    try {
-        return [bool](Test-Path -LiteralPath $Path -ErrorAction Stop)
+        return Test-Path -LiteralPath $Path -PathType Container -ErrorAction Stop
     }
     catch {
         return $false
     }
 }
 
-function Initialize-SourceRoot {
-    $script:PreferredSourceReachable = Test-ShareReachable -Path $PreferredSourceRoot
-
-    if ($script:PreferredSourceReachable) {
-        $script:SelectedSourceRoot  = $PreferredSourceRoot
-        $script:SelectedSourceLabel = 'PreferredUNC'
-        $script:PreferredSourceUsed = $true
-        $script:FallbackSourceUsed  = $false
-        $script:FallbackReason      = $null
-
-        Write-Status "Using preferred source path: $PreferredSourceRoot" 'OK'
-        return
+function Get-ActiveSourceRoot {
+    if (Test-ShareRoot -Path $PreferredSourceRoot) {
+        Write-Status "Using preferred source: $PreferredSourceRoot" 'OK'
+        return $PreferredSourceRoot
     }
 
-    Write-Status "Preferred source path unavailable: $PreferredSourceRoot" 'WARN'
+    Write-Status "Preferred source is unavailable: $PreferredSourceRoot" 'WARN'
 
-    if (Test-ShareReachable -Path $FallbackSourceRoot) {
-        $script:SelectedSourceRoot  = $FallbackSourceRoot
-        $script:SelectedSourceLabel = 'FallbackIP'
-        $script:PreferredSourceUsed = $false
-        $script:FallbackSourceUsed  = $true
-        $script:FallbackReason      = "Preferred path [$PreferredSourceRoot] could not be resolved or reached. Using fallback path [$FallbackSourceRoot]."
-
-        Write-Status $script:FallbackReason 'WARN'
-        return
+    if (Test-ShareRoot -Path $FallbackSourceRoot) {
+        Write-Status "Using fallback source: $FallbackSourceRoot" 'OK'
+        return $FallbackSourceRoot
     }
 
-    throw "Neither source path is reachable. Preferred [$PreferredSourceRoot], Fallback [$FallbackSourceRoot]."
+    throw "Neither script source is available. Preferred: $PreferredSourceRoot | Fallback: $FallbackSourceRoot"
 }
 
-function Remove-LegacyScriptFiles {
-    foreach ($legacyFile in $LegacyFilesToDelete) {
-        $legacyPath = Join-Path $LocalScripts $legacyFile
+function Get-FileSha256 {
+    param([Parameter(Mandatory)][string]$Path)
 
-        if (Test-Path -LiteralPath $legacyPath) {
-            try {
-                Remove-Item -LiteralPath $legacyPath -Force -ErrorAction Stop
-                Write-Status "Deleted legacy script: $legacyPath" 'OK'
-            }
-            catch {
-                Write-Status "Failed deleting legacy script [$legacyPath] : $($_.Exception.Message)" 'ERROR'
-                $script:FileResults.Add([PSCustomObject]@{
-                    FileName          = $legacyFile
-                    LocalPath         = $legacyPath
-                    SourcePath        = $null
-                    SourceLabel       = 'LegacyCleanup'
-                    Status            = 'Error'
-                    LocalVersion      = $null
-                    RemoteVersion     = $null
-                    LocalLastUpdated  = $null
-                    RemoteLastUpdated = $null
-                    BackupPath        = $null
-                    Message           = "Failed deleting legacy script: $($_.Exception.Message)"
-                }) | Out-Null
-            }
-        }
-        else {
-            Write-Status "Legacy script not present, no deletion needed: $legacyPath" 'INFO'
-        }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return $null
     }
+
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash
 }
 
-function Get-SourceFileContent {
+function Get-ScriptVersionText {
+    param([Parameter(Mandatory)][string]$Path)
+
+    try {
+        $match = Select-String `
+            -LiteralPath $Path `
+            -Pattern '^\s*#\s*ScriptVersion\s*:\s*(.+?)\s*$' `
+            -ErrorAction Stop |
+            Select-Object -First 1
+
+        if ($match) {
+            return $match.Matches[0].Groups[1].Value.Trim()
+        }
+    }
+    catch {
+    }
+
+    return 'Unknown'
+}
+
+function Backup-LocalFile {
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return $null
+    }
+
+    Ensure-Folder -Path $BackupFolder
+
+    $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $baseName = [IO.Path]::GetFileNameWithoutExtension($Path)
+    $extension = [IO.Path]::GetExtension($Path)
+    $backupPath = Join-Path $BackupFolder "${baseName}_${stamp}${extension}"
+
+    Copy-Item -LiteralPath $Path -Destination $backupPath -Force
+    return $backupPath
+}
+
+function Copy-FileAtomically {
     param(
-        [Parameter(Mandatory)]
-        [string]$FileName
+        [Parameter(Mandatory)][string]$SourcePath,
+        [Parameter(Mandatory)][string]$DestinationPath
     )
 
-    if ([string]::IsNullOrWhiteSpace($script:SelectedSourceRoot)) {
-        throw 'Source root has not been initialized.'
+    $destinationDirectory = Split-Path -Path $DestinationPath -Parent
+    Ensure-Folder -Path $destinationDirectory
+
+    $temporaryPath = "$DestinationPath.new"
+    Copy-Item -LiteralPath $SourcePath -Destination $temporaryPath -Force
+
+    if (Test-Path -LiteralPath $DestinationPath -PathType Leaf) {
+        Move-Item -LiteralPath $temporaryPath -Destination $DestinationPath -Force
     }
-
-    $sourcePath = Join-Path $script:SelectedSourceRoot $FileName
-
-    if (-not (Test-Path -LiteralPath $sourcePath)) {
-        throw "Source file not found: $sourcePath"
-    }
-
-    $content = Get-FileTextSafe -Path $sourcePath
-    if ([string]::IsNullOrWhiteSpace($content)) {
-        throw "Source file [$sourcePath] was empty."
-    }
-
-    return [PSCustomObject]@{
-        Path    = $sourcePath
-        Content = $content
-        Label   = $script:SelectedSourceLabel
+    else {
+        Rename-Item -LiteralPath $temporaryPath -NewName ([IO.Path]::GetFileName($DestinationPath)) -Force
     }
 }
 
-# ---------------------------
-# Main
-# ---------------------------
-Initialize-YamlLog
+function Invoke-TaskReconciliation {
+    $registerScript = Join-Path $LocalScripts $RegisterTasksName
+
+    if (-not (Test-Path -LiteralPath $registerScript -PathType Leaf)) {
+        Write-Status "Task reconciliation script is not present: $registerScript" 'WARN'
+        return $false
+    }
+
+    Write-Status "Reconciling scheduled tasks with $RegisterTasksName." 'ACTION'
+
+    $process = Start-Process `
+        -FilePath $WindowsPowerShellExe `
+        -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$registerScript`"" `
+        -Wait `
+        -PassThru `
+        -WindowStyle Hidden
+
+    if ($process.ExitCode -ne 0) {
+        Write-Status "Task reconciliation returned exit code $($process.ExitCode)." 'ERROR'
+        return $false
+    }
+
+    Write-Status 'Scheduled task reconciliation completed successfully.' 'OK'
+    return $true
+}
 
 try {
     Ensure-Folder -Path $LocalScripts
     Ensure-Folder -Path $LogFolder
+    Ensure-Folder -Path $BackupFolder
 
-    Write-Status "Initializing script update check from network share..." 'INFO'
-    Write-Status "Preferred source: $PreferredSourceRoot" 'INFO'
-    Write-Status "Fallback source: $FallbackSourceRoot" 'INFO'
-    Write-Status "Local script folder: $LocalScripts" 'INFO'
+    Write-Status 'Starting dynamic script synchronization.' 'INFO'
 
-    Remove-LegacyScriptFiles
+    $sourceRoot = Get-ActiveSourceRoot
+    $remoteScripts = @(
+        Get-ChildItem `
+            -LiteralPath $sourceRoot `
+            -Filter '*.ps1' `
+            -File `
+            -ErrorAction Stop |
+        Where-Object { $_.Name -notin $ExcludedFileNames } |
+        Sort-Object {
+            if ($_.Name -ieq $UpdaterFileName) { 0 } else { 1 }
+        }, Name
+    )
 
-    Initialize-SourceRoot
+    if (-not $remoteScripts) {
+        throw "No PowerShell scripts were found in the source root: $sourceRoot"
+    }
 
-    foreach ($file in $ScriptFiles) {
-        $localPath = Join-Path $LocalScripts $file
+    Write-Status "Discovered $($remoteScripts.Count) managed script(s) on the share." 'INFO'
 
-        Write-Status "Checking file: $file" 'INFO'
+    $updatedFiles = New-Object System.Collections.Generic.List[string]
+    $selfUpdated = $false
 
-        try {
-            $sourceFile = Get-SourceFileContent -FileName $file
-            $remoteContent = $sourceFile.Content
-            $remotePath = $sourceFile.Path
-            $remoteLabel = $sourceFile.Label
+    foreach ($remoteFile in $remoteScripts) {
+        $localPath = Join-Path $LocalScripts $remoteFile.Name
+        $remoteHash = Get-FileSha256 -Path $remoteFile.FullName
+        $localHash = Get-FileSha256 -Path $localPath
 
-            $remoteVersionText = Get-ScriptHeaderValue -Content $remoteContent -HeaderName 'ScriptVersion'
-            $remoteLastUpdated = Get-ScriptHeaderValue -Content $remoteContent -HeaderName 'LastUpdated'
-
-            if ([string]::IsNullOrWhiteSpace($remoteVersionText)) {
-                throw "Source file [$remotePath] is missing or has an unreadable '# ScriptVersion:' header."
-            }
-
-            $remoteVersion = Convert-ToVersionObject -VersionText $remoteVersionText
-
-            $localContent = Get-FileTextSafe -Path $localPath
-
-            if ($null -eq $localContent) {
-                Write-Status "Local file missing. Copying [$file] version [$remoteVersionText] from [$remotePath]." 'WARN'
-                Save-Utf8NoBom -Path $localPath -Content $remoteContent
-                Write-Status "Copied new local file: $localPath" 'OK'
-
-                $script:FileResults.Add([PSCustomObject]@{
-                    FileName          = $file
-                    LocalPath         = $localPath
-                    SourcePath        = $remotePath
-                    SourceLabel       = $remoteLabel
-                    Status            = 'DownloadedMissing'
-                    LocalVersion      = $null
-                    RemoteVersion     = $remoteVersionText
-                    LocalLastUpdated  = $null
-                    RemoteLastUpdated = $remoteLastUpdated
-                    BackupPath        = $null
-                    Message           = "Local file was missing and was copied from [$remotePath]."
-                }) | Out-Null
-
-                continue
-            }
-
-            $localVersionText = Get-ScriptHeaderValue -Content $localContent -HeaderName 'ScriptVersion'
-            $localLastUpdated = Get-ScriptHeaderValue -Content $localContent -HeaderName 'LastUpdated'
-
-            if ([string]::IsNullOrWhiteSpace($localVersionText)) {
-                Write-Status "Local file [$file] is missing ScriptVersion header. Treating local version as 0.0." 'WARN'
-                $localVersionText = '0.0'
-            }
-
-            $localVersion = Convert-ToVersionObject -VersionText $localVersionText
-
-            Write-Status "Local version: [$localVersionText] | Source version: [$remoteVersionText]" 'INFO'
-
-            if ($remoteVersion -gt $localVersion) {
-                Write-Status "Source version is newer for [$file]. Updating local copy..." 'INFO'
-                $backupPath = Backup-File -Path $localPath
-                Save-Utf8NoBom -Path $localPath -Content $remoteContent
-                Write-Status "Updated [$file] from version [$localVersionText] to [$remoteVersionText]" 'OK'
-
-                $script:FileResults.Add([PSCustomObject]@{
-                    FileName          = $file
-                    LocalPath         = $localPath
-                    SourcePath        = $remotePath
-                    SourceLabel       = $remoteLabel
-                    Status            = 'Updated'
-                    LocalVersion      = $localVersionText
-                    RemoteVersion     = $remoteVersionText
-                    LocalLastUpdated  = $localLastUpdated
-                    RemoteLastUpdated = $remoteLastUpdated
-                    BackupPath        = $backupPath
-                    Message           = "Updated local file from $localVersionText to $remoteVersionText using [$remotePath]."
-                }) | Out-Null
-            }
-            else {
-                Write-Status "[$file] is current. Local version [$localVersionText], Source version [$remoteVersionText]." 'OK'
-
-                $script:FileResults.Add([PSCustomObject]@{
-                    FileName          = $file
-                    LocalPath         = $localPath
-                    SourcePath        = $remotePath
-                    SourceLabel       = $remoteLabel
-                    Status            = 'Current'
-                    LocalVersion      = $localVersionText
-                    RemoteVersion     = $remoteVersionText
-                    LocalLastUpdated  = $localLastUpdated
-                    RemoteLastUpdated = $remoteLastUpdated
-                    BackupPath        = $null
-                    Message           = 'Local file is already current.'
-                }) | Out-Null
-            }
+        if ($remoteHash -eq $localHash -and $null -ne $localHash) {
+            Write-Status "$($remoteFile.Name) is current." 'OK'
+            continue
         }
-        catch {
-            Write-Status "Failed processing [$file] : $($_.Exception.Message)" 'ERROR'
 
-            $script:FileResults.Add([PSCustomObject]@{
-                FileName          = $file
-                LocalPath         = $localPath
-                SourcePath        = if ($script:SelectedSourceRoot) { Join-Path $script:SelectedSourceRoot $file } else { $null }
-                SourceLabel       = $script:SelectedSourceLabel
-                Status            = 'Error'
-                LocalVersion      = $null
-                RemoteVersion     = $null
-                LocalLastUpdated  = $null
-                RemoteLastUpdated = $null
-                BackupPath        = $null
-                Message           = $_.Exception.Message
-            }) | Out-Null
+        $remoteVersion = Get-ScriptVersionText -Path $remoteFile.FullName
+        $localVersion = if (Test-Path -LiteralPath $localPath -PathType Leaf) {
+            Get-ScriptVersionText -Path $localPath
+        }
+        else {
+            'Missing'
+        }
+
+        Write-Status "Updating $($remoteFile.Name): local [$localVersion], share [$remoteVersion]." 'ACTION'
+
+        $backupPath = Backup-LocalFile -Path $localPath
+        if ($backupPath) {
+            Write-Status "Backup created: $backupPath" 'INFO'
+        }
+
+        Copy-FileAtomically -SourcePath $remoteFile.FullName -DestinationPath $localPath
+
+        $copiedHash = Get-FileSha256 -Path $localPath
+        if ($copiedHash -ne $remoteHash) {
+            throw "Hash verification failed after copying $($remoteFile.Name)."
+        }
+
+        [void]$updatedFiles.Add($remoteFile.Name)
+        Write-Status "Updated successfully: $($remoteFile.Name)" 'OK'
+
+        if ($remoteFile.Name -ieq $UpdaterFileName) {
+            $selfUpdated = $true
+            break
         }
     }
 
-    $errorCount = @($script:FileResults | Where-Object { $_.Status -eq 'Error' }).Count
-    if ($errorCount -gt 0) {
-        $script:OverallResult = 'CompletedWithErrors'
-    }
-    else {
-        $script:OverallResult = 'Succeeded'
-    }
+    # Stop using the old in-memory updater immediately after replacing it.
+    if ($selfUpdated -and -not $Relaunched) {
+        $newUpdaterPath = Join-Path $LocalScripts $UpdaterFileName
+        Write-Status 'The updater changed. Relaunching the new local updater now.' 'ACTION'
 
-    Write-Status "Update check complete." 'INFO'
-    Write-YamlLog
+        Start-Process `
+            -FilePath $WindowsPowerShellExe `
+            -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$newUpdaterPath`" -Relaunched" `
+            -WindowStyle Hidden | Out-Null
 
-    if ($errorCount -gt 0) {
-        exit 2
-    }
-    else {
         exit 0
     }
+
+    if ($updatedFiles.Count -eq 0) {
+        Write-Status 'All managed scripts are already synchronized.' 'OK'
+    }
+    else {
+        Write-Status "Updated files: $($updatedFiles -join ', ')" 'OK'
+    }
+
+    $tasksOk = Invoke-TaskReconciliation
+    if (-not $tasksOk) {
+        exit 2
+    }
+
+    Write-Status 'Script synchronization and task reconciliation completed.' 'OK'
+    exit 0
 }
 catch {
-    $script:FailureMessage = $_.Exception.Message
-    $script:OverallResult = 'Failed'
     Write-Status "Fatal error: $($_.Exception.Message)" 'ERROR'
-    Write-YamlLog
     exit 1
 }
