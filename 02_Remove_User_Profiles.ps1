@@ -1,7 +1,7 @@
 # =====================================================================
 # ScriptName: 02_Remove_User_Profiles.ps1
-# ScriptVersion: 2.0.5
-# LastUpdated: 2026-07-01
+# ScriptVersion: 2.0.8
+# LastUpdated: 2026-07-21
 # =====================================================================
 
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Low')]
@@ -12,7 +12,7 @@ param(
         'Public',
         'All Users',
         'MISAdmin',
-		"CC-Student"
+        'CC-Student',
         'dswaney'
     ),
 
@@ -39,8 +39,8 @@ param(
     #   'SSB-114*' matches any computer name that begins with SSB-114.
     #   'LAB-205-01' matches one exact computer name.
     [string[]]$EdgeInPrivateComputerNamePatterns = @(
-        'SSB-114*'
-		'SSB-122*'
+        'SSB-114*',
+        'SSB-122*'
     ),
 
     [string]$EdgeInPrivateUrl = 'https://www.compton.edu'
@@ -66,6 +66,7 @@ $script:Summary = [ordered]@{
     SkippedByAge       = 0
     QueuedProfiles     = 0
     DeletedProfiles    = 0
+    OneDriveTasksRemoved = 0
     FailedProfiles     = 0
     TimedOutProfiles   = 0
     DeferredProfiles   = 0
@@ -255,7 +256,7 @@ function Set-EdgeInPrivateAutoLaunch {
 
     $runKey = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Run'
     $runValueName = 'LaunchComptonEdge'
-    $command = '"{0}" --inprivate "{1}"' -f $edgePath, $Url
+    $command = '"{0}" --inprivate --new-window --start-maximized "{1}"' -f $edgePath, $Url
 
     try {
         New-Item -Path $runKey -Force | Out-Null
@@ -425,6 +426,70 @@ function Stop-ProfileCleanupJobs {
 function Get-RunningJobCount {
     param([Parameter(Mandatory)]$Jobs)
     return @($Jobs | Where-Object { $_.Job.State -eq 'Running' }).Count
+}
+
+function Remove-OneDriveTasksForProfile {
+    param(
+        [Parameter(Mandatory)][string]$Sid,
+        [Parameter(Mandatory)][string]$ProfileName
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Sid)) {
+        Write-Log "Cannot check OneDrive reporting tasks because the SID is blank for profile: $ProfileName" 'WARN'
+        return 0
+    }
+
+    try {
+        Import-Module ScheduledTasks -ErrorAction Stop
+
+        $escapedSid = [regex]::Escape($Sid)
+
+        # OneDrive normally creates tasks named similar to:
+        # OneDrive Reporting Task-S-1-5-21-...
+        # OneDrive Startup Task-S-1-5-21-...
+        # Match only those OneDrive task types that contain this exact profile SID.
+        $matchingTasks = @(
+            Get-ScheduledTask -ErrorAction SilentlyContinue |
+            Where-Object {
+                (
+                    $_.TaskName -like 'OneDrive Reporting Task-*' -or
+                    $_.TaskName -like 'OneDrive Startup Task-*'
+                ) -and
+                $_.TaskName -match $escapedSid
+            }
+        )
+
+        if ($matchingTasks.Count -eq 0) {
+            Write-Log "No matching OneDrive reporting or startup task was found for $ProfileName ($Sid)." 'OK'
+            return 0
+        }
+
+        $removedCount = 0
+
+        foreach ($task in $matchingTasks) {
+            try {
+                Write-Log "Removing OneDrive task for deleted profile: $($task.TaskPath)$($task.TaskName)" 'INFO'
+
+                Unregister-ScheduledTask `
+                    -TaskName $task.TaskName `
+                    -TaskPath $task.TaskPath `
+                    -Confirm:$false `
+                    -ErrorAction Stop
+
+                $removedCount++
+                Write-Log "Removed OneDrive task: $($task.TaskPath)$($task.TaskName)" 'OK'
+            }
+            catch {
+                Write-Log "Could not remove OneDrive task '$($task.TaskPath)$($task.TaskName)': $($_.Exception.Message)" 'WARN'
+            }
+        }
+
+        return $removedCount
+    }
+    catch {
+        Write-Log "OneDrive scheduled-task cleanup failed for $ProfileName ($Sid): $($_.Exception.Message)" 'WARN'
+        return 0
+    }
 }
 
 function Remove-ProfileRegistration {
@@ -655,6 +720,11 @@ function Invoke-ParallelProfileDeletion {
                 Add-StateItemUnique -State $state -ListName 'Completed' -Value $item.LocalPath
                 Write-Log "Successfully deleted profile: $($item.ProfileName) ($($item.LocalPath))" 'OK'
 
+                $removedOneDriveTasks = Remove-OneDriveTasksForProfile `
+                    -Sid $item.SID `
+                    -ProfileName $item.ProfileName
+                $script:Summary.OneDriveTasksRemoved += $removedOneDriveTasks
+
                 $script:DeletedProfileDetails.Add([PSCustomObject]@{
                     ProfileName   = $item.ProfileName
                     LocalPath     = $item.LocalPath
@@ -784,6 +854,10 @@ function Invoke-ParallelProfileDeletion {
                 try {
                     Remove-ProfileRegistration -Sid $item.SID -ProfilePath $item.LocalPath -ProfileName $item.ProfileName
                     $script:Summary.DeletedProfiles++
+                    $removedOneDriveTasks = Remove-OneDriveTasksForProfile `
+                        -Sid $item.SID `
+                        -ProfileName $item.ProfileName
+                    $script:Summary.OneDriveTasksRemoved += $removedOneDriveTasks
                     Remove-StateItem -State $state -ListName 'Pending' -Value $item.LocalPath
                     Add-StateItemUnique -State $state -ListName 'Completed' -Value $item.LocalPath
                 }
@@ -807,6 +881,10 @@ function Invoke-ParallelProfileDeletion {
             if (-not (Test-Path -LiteralPath $item.LocalPath)) {
                 Write-Log "Native profile removal deleted the folder before job start: $($item.ProfileName) ($($item.LocalPath))" 'OK'
                 $script:Summary.DeletedProfiles++
+                $removedOneDriveTasks = Remove-OneDriveTasksForProfile `
+                    -Sid $item.SID `
+                    -ProfileName $item.ProfileName
+                $script:Summary.OneDriveTasksRemoved += $removedOneDriveTasks
                 Remove-StateItem -State $state -ListName 'Pending' -Value $item.LocalPath
                 Add-StateItemUnique -State $state -ListName 'Completed' -Value $item.LocalPath
                 $script:DeletedProfileDetails.Add([PSCustomObject]@{
@@ -1005,7 +1083,7 @@ else {
 $script:Summary.EndTime = Get-Date
 
 Write-Log 'Profile cleanup complete.' 'INFO'
-Write-Log "Summary: Found=$($script:Summary.FoundProfiles), Excluded=$($script:Summary.ExcludedProfiles), LoadedSkipped=$($script:Summary.SkippedLoaded), SpecialSkipped=$($script:Summary.SkippedSpecial), AgeSkipped=$($script:Summary.SkippedByAge), Queued=$($script:Summary.QueuedProfiles), Deleted=$($script:Summary.DeletedProfiles), Failed=$($script:Summary.FailedProfiles), TimedOut=$($script:Summary.TimedOutProfiles), Deferred=$($script:Summary.DeferredProfiles)" 'INFO'
+Write-Log "Summary: Found=$($script:Summary.FoundProfiles), Excluded=$($script:Summary.ExcludedProfiles), LoadedSkipped=$($script:Summary.SkippedLoaded), SpecialSkipped=$($script:Summary.SkippedSpecial), AgeSkipped=$($script:Summary.SkippedByAge), Queued=$($script:Summary.QueuedProfiles), Deleted=$($script:Summary.DeletedProfiles), OneDriveTasksRemoved=$($script:Summary.OneDriveTasksRemoved), Failed=$($script:Summary.FailedProfiles), TimedOut=$($script:Summary.TimedOutProfiles), Deferred=$($script:Summary.DeferredProfiles)" 'INFO'
 
 Write-YamlLog
 
