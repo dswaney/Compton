@@ -1,8 +1,9 @@
 # =====================================================================
 # ScriptName: 08_System_Repair.ps1
-# ScriptVersion: 4.0
-# LastUpdated: 2026-06-29
-# Changes: v4.0 changes safety defaults to prevent automatic repairs, disables HP driver remediation by default, and removes Windows.old/System.sav cleanup targets while investigating boot/SSD issues.
+# ScriptVersion: 4.1
+# LastUpdated: 2026-07-22
+# Changes: v4.1 prevents service-stop hangs by placing the stop request under its own timeout; if a service remains running after the service-state timeout, the script force-terminates its backing process when requested.
+# Previous: v4.0 changes safety defaults to prevent automatic repairs, disables HP driver remediation by default, and removes Windows.old/System.sav cleanup targets while investigating boot/SSD issues.
 # Previous: v3.9 adds Tier 3 HP Image Assistant driver-only remediation that runs only when CBS/SFC driver corruption is detected after DISM/SFC repair.
 # Previous: v3.8 adds SFC/CBS corruption extraction and a DISM+SFC repair workflow with grep-friendly CBS/SFC markers.
 # Previous: v3.7 adds explicit RPC root-cause classification output and ties EventLogSummary RPC errors to the RPC diagnostics assessment.
@@ -3790,12 +3791,42 @@ function Stop-ServiceWithValidation {
 
     $processId = Get-ServiceProcessIdSafe -Name $Name
 
+    # Stop-Service can itself block indefinitely while a service remains in StopPending.
+    # Send the stop request through sc.exe in a separate process so the request has its
+    # own hard timeout before the service-state timeout and process-kill fallback begin.
+    $stopRequestTimeoutSeconds = [math]::Min([math]::Max(5, $TimeoutSeconds), 15)
+    $scProcess = $null
+
     try {
-        Write-Log "Stopping service $Name with a $TimeoutSeconds second timeout..." 'INFO'
-        Stop-Service -Name $Name -Force -ErrorAction Stop
+        Write-Log "Requesting stop for service $Name. Stop-request timeout: $stopRequestTimeoutSeconds second(s); service-state timeout: $TimeoutSeconds second(s)..." 'INFO'
+
+        $scProcess = Start-Process -FilePath "$env:SystemRoot\System32\sc.exe" `
+            -ArgumentList @('stop', $Name) `
+            -WindowStyle Hidden `
+            -PassThru `
+            -ErrorAction Stop
+
+        if (-not $scProcess.WaitForExit($stopRequestTimeoutSeconds * 1000)) {
+            Write-Log "The stop request for service $Name exceeded $stopRequestTimeoutSeconds second(s). Terminating the hung sc.exe request process and continuing with validation." 'WARN'
+            try {
+                $scProcess.Kill()
+                $scProcess.WaitForExit(5000) | Out-Null
+            }
+            catch {
+                Write-Log "Unable to terminate the hung sc.exe request process for $Name`: $($_.Exception.Message)" 'WARN'
+            }
+        }
+        elseif ($scProcess.ExitCode -notin @(0, 1062)) {
+            Write-Log "sc.exe returned exit code $($scProcess.ExitCode) while requesting that $Name stop. Service-state validation will continue." 'WARN'
+        }
     }
     catch {
-        Write-Log "Stop-Service reported an issue for $Name`: $($_.Exception.Message)" 'WARN'
+        Write-Log "The timed stop request reported an issue for $Name`: $($_.Exception.Message). Service-state validation will continue." 'WARN'
+    }
+    finally {
+        if ($null -ne $scProcess) {
+            $scProcess.Dispose()
+        }
     }
 
     $after = Wait-ServiceStateSafe -Name $Name -DesiredStatus 'Stopped' -TimeoutSeconds $TimeoutSeconds
