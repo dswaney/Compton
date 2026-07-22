@@ -1,8 +1,9 @@
 # =====================================================================
 # ScriptName: 08_System_Repair.ps1
-# ScriptVersion: 4.1
+# ScriptVersion: 4.2
 # LastUpdated: 2026-07-22
-# Changes: v4.1 prevents service-stop hangs by placing the stop request under its own timeout; if a service remains running after the service-state timeout, the script force-terminates its backing process when requested.
+# Changes: v4.2 fixes Windows PowerShell 5.1 "Argument types do not match" warnings in RPC and Explorer diagnostics by using native generic-list Count properties.
+# Previous: v4.1 prevents service-stop hangs by placing the stop request under its own timeout; if a service remains running after the service-state timeout, the script force-terminates its backing process when requested.
 # Previous: v4.0 changes safety defaults to prevent automatic repairs, disables HP driver remediation by default, and removes Windows.old/System.sav cleanup targets while investigating boot/SSD issues.
 # Previous: v3.9 adds Tier 3 HP Image Assistant driver-only remediation that runs only when CBS/SFC driver corruption is detected after DISM/SFC repair.
 # Previous: v3.8 adds SFC/CBS corruption extraction and a DISM+SFC repair workflow with grep-friendly CBS/SFC markers.
@@ -3141,32 +3142,32 @@ function Invoke-RpcDiagnostics {
         }
     }
 
-    $localProblem = (@($serviceProblems).Count -gt 0 -or -not $localEndpoint.Reachable -or -not $eventLogOk -or -not $cimOk)
-    $remoteProblem = (-not $localProblem -and @($remoteProblems).Count -gt 0)
+    $localProblem = ($serviceProblems.Count -gt 0 -or -not $localEndpoint.Reachable -or -not $eventLogOk -or -not $cimOk)
+    $remoteProblem = (-not $localProblem -and $remoteProblems.Count -gt 0)
 
     $script:Summary.RpcClientSideIssueDetected = [bool]$localProblem
     $script:Summary.RpcRemoteSideIssueDetected = [bool]$remoteProblem
 
-    $rpcAssessment = Get-RpcRootCauseAssessment -LocalProblem ([bool]$localProblem) -RemoteProblem ([bool]$remoteProblem) -ServiceProblemCount (@($serviceProblems).Count) -LocalEndpointMapperReachable ([bool]$localEndpoint.Reachable) -LocalEventLogRead ([bool]$eventLogOk) -LocalWmiQuery ([bool]$cimOk) -RemoteProblemCount (@($remoteProblems).Count)
+    $rpcAssessment = Get-RpcRootCauseAssessment -LocalProblem ([bool]$localProblem) -RemoteProblem ([bool]$remoteProblem) -ServiceProblemCount ($serviceProblems.Count) -LocalEndpointMapperReachable ([bool]$localEndpoint.Reachable) -LocalEventLogRead ([bool]$eventLogOk) -LocalWmiQuery ([bool]$cimOk) -RemoteProblemCount ($remoteProblems.Count)
 
     if ($localProblem) {
         $script:Summary.RpcDiagnosticsStatus = 'LocalClientOrLocalServiceIssueSuspected'
-        Write-Log "RPC_CLIENT_SIDE_SUSPECTED|ServiceProblems=$(@($serviceProblems).Count)|LocalEndpointMapperReachable=$($localEndpoint.Reachable)|LocalEventLogRead=$eventLogOk|LocalWmiQuery=$cimOk" 'WARN'
+        Write-Log "RPC_CLIENT_SIDE_SUSPECTED|ServiceProblems=$($serviceProblems.Count)|LocalEndpointMapperReachable=$($localEndpoint.Reachable)|LocalEventLogRead=$eventLogOk|LocalWmiQuery=$cimOk" 'WARN'
         Add-Note 'RPC diagnostics suggest a local client/service-side issue. Review RPC_LOCAL_SERVICE, RPC_ENDPOINT_MAPPER, RPC_LOCAL_EVENTLOG_READ, and RPC_LOCAL_WMI_QUERY markers.'
     }
     elseif ($remoteProblem) {
         $script:Summary.RpcDiagnosticsStatus = 'RemoteEndpointOrNetworkIssueSuspected'
-        Write-Log "RPC_REMOTE_SIDE_OR_NETWORK_SUSPECTED|RemoteProblemCount=$(@($remoteProblems).Count)|LocalEndpointMapperReachable=$($localEndpoint.Reachable)|LocalEventLogRead=$eventLogOk|LocalWmiQuery=$cimOk" 'WARN'
+        Write-Log "RPC_REMOTE_SIDE_OR_NETWORK_SUSPECTED|RemoteProblemCount=$($remoteProblems.Count)|LocalEndpointMapperReachable=$($localEndpoint.Reachable)|LocalEventLogRead=$eventLogOk|LocalWmiQuery=$cimOk" 'WARN'
         Add-Note 'RPC diagnostics suggest local RPC is healthy, but one or more domain/DNS/logon targets did not answer RPC endpoint mapper port 135.'
     }
     else {
         $script:Summary.RpcDiagnosticsStatus = 'NoRpcIssueDetectedByBasicChecks'
-        Write-Log "RPC_DIAGNOSTICS_OK|LocalEndpointMapperReachable=$($localEndpoint.Reachable)|LocalEventLogRead=$eventLogOk|LocalWmiQuery=$cimOk|RemoteProblemCount=$(@($remoteProblems).Count)" 'OK'
+        Write-Log "RPC_DIAGNOSTICS_OK|LocalEndpointMapperReachable=$($localEndpoint.Reachable)|LocalEventLogRead=$eventLogOk|LocalWmiQuery=$cimOk|RemoteProblemCount=$($remoteProblems.Count)" 'OK'
     }
 
     $rpcAssessmentLevel = if ($localProblem -or $remoteProblem) { 'WARN' } else { 'OK' }
     Write-Log "RPC_ROOT_CAUSE_ASSESSMENT|$rpcAssessment" $rpcAssessmentLevel
-    Write-Log "RPC_DIAGNOSTICS_SUMMARY|Status=$($script:Summary.RpcDiagnosticsStatus)|ClientSideIssue=$($script:Summary.RpcClientSideIssueDetected)|RemoteOrNetworkIssue=$($script:Summary.RpcRemoteSideIssueDetected)|ServiceProblems=$(@($serviceProblems).Count)|RemoteProblems=$(@($remoteProblems).Count)|Assessment=$(Convert-RpcSafeString $rpcAssessment)" ($(if ($localProblem -or $remoteProblem) { 'WARN' } else { 'INFO' }))
+    Write-Log "RPC_DIAGNOSTICS_SUMMARY|Status=$($script:Summary.RpcDiagnosticsStatus)|ClientSideIssue=$($script:Summary.RpcClientSideIssueDetected)|RemoteOrNetworkIssue=$($script:Summary.RpcRemoteSideIssueDetected)|ServiceProblems=$($serviceProblems.Count)|RemoteProblems=$($remoteProblems.Count)|Assessment=$(Convert-RpcSafeString $rpcAssessment)" ($(if ($localProblem -or $remoteProblem) { 'WARN' } else { 'INFO' }))
     Add-Note "RPC root cause assessment: $rpcAssessment"
 
     Add-DetailedResult -Step 'RpcDiagnostics' -Status 'Info' -Message 'RPC diagnostics completed.' -Data @{
@@ -3281,7 +3282,7 @@ function Get-NonMicrosoftShellExtensionInventory {
     } | Sort-Object Source, Name, Clsid -Unique)
 
     $script:Summary.NonMicrosoftShellExtensionCount = @($nonMicrosoft).Count
-    Write-Log "EXPLORER_SHELL_EXTENSION_SUMMARY|NonMicrosoftCount=$($script:Summary.NonMicrosoftShellExtensionCount)|TotalInventoryCount=$(@($items).Count)" 'INFO'
+    Write-Log "EXPLORER_SHELL_EXTENSION_SUMMARY|NonMicrosoftCount=$($script:Summary.NonMicrosoftShellExtensionCount)|TotalInventoryCount=$($items.Count)" 'INFO'
 
     foreach ($entry in ($nonMicrosoft | Select-Object -First 75)) {
         Write-Log "NON_MICROSOFT_SHELL_EXTENSION|Source=$(Convert-ExplorerSafeString $entry.Source)|Name=$(Convert-ExplorerSafeString $entry.Name)|Clsid=$(Convert-ExplorerSafeString $entry.Clsid)|RegistryPath=$(Convert-ExplorerSafeString $entry.RegistryPath)" 'WARN'
@@ -3289,7 +3290,7 @@ function Get-NonMicrosoftShellExtensionInventory {
 
     Add-DetailedResult -Step 'ExplorerShellExtensionInventory' -Status 'Info' -Message 'Collected shell extension inventory.' -Data @{
         NonMicrosoftCount = $script:Summary.NonMicrosoftShellExtensionCount
-        TotalInventoryCount = @($items).Count
+        TotalInventoryCount = $items.Count
         NonMicrosoftJson = (($nonMicrosoft | Select-Object -First 100) | ConvertTo-Json -Compress)
     }
 
@@ -3334,7 +3335,7 @@ function Test-ExplorerNetworkPaths {
     }
     catch { Write-Log "Network printer check failed: $($_.Exception.Message)" 'WARN' }
 
-    $script:Summary.BrokenNetworkPathCount = @($problems).Count
+    $script:Summary.BrokenNetworkPathCount = $problems.Count
     Write-Log "EXPLORER_NETWORK_PATH_SUMMARY|BrokenOrOfflineCount=$($script:Summary.BrokenNetworkPathCount)" 'INFO'
 
     foreach ($item in $problems) {
