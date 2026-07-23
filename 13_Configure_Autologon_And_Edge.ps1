@@ -18,7 +18,7 @@ param(
 
     [string]$DefaultUserName = 'CC-Student',
 
-    [string]$DefaultPassword = 'CC$tud3nt!',
+    [string]$DefaultPassword = '',
 
     [string]$DefaultDomainName = 'Compton.edu',
 
