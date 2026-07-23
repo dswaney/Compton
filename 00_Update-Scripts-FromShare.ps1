@@ -1,7 +1,7 @@
 # =====================================================================
 # ScriptName: 00_Update-Scripts-FromShare.ps1
-# ScriptVersion: 3.0
-# LastUpdated: 2026-07-21
+# ScriptVersion: 3.1
+# LastUpdated: 2026-07-22
 # Purpose:
 #   - Dynamically synchronize PowerShell scripts from the central share.
 #   - Update and relaunch itself when a newer/different updater is found.
@@ -31,6 +31,10 @@ $LogPath      = Join-Path $LogFolder '00_Update-Scripts-FromShare.log'
 
 $UpdaterFileName      = '00_Update-Scripts-FromShare.ps1'
 $RegisterTasksName    = 'Register-Tasks_SYSTEM.ps1'
+$RequiredManagedFiles = @(
+    'Register-Tasks_SYSTEM.ps1',
+    '12. Enable-SystemRestore-And-Create-RestorePoint.ps1'
+)
 $WindowsPowerShellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 
 # Files or folders in the share root that should not be treated as managed scripts.
@@ -283,6 +287,21 @@ try {
     else {
         Write-Status "Updated files: $($updatedFiles -join ', ')" 'OK'
     }
+
+    $missingRequiredFiles = @(
+        foreach ($requiredFile in $RequiredManagedFiles) {
+            $requiredPath = Join-Path $LocalScripts $requiredFile
+            if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
+                $requiredFile
+            }
+        }
+    )
+
+    if ($missingRequiredFiles.Count -gt 0) {
+        throw "Required managed file(s) are missing after synchronization: $($missingRequiredFiles -join ', ')"
+    }
+
+    Write-Status 'All required managed files are present locally.' 'OK'
 
     $tasksOk = Invoke-TaskReconciliation
     if (-not $tasksOk) {
