@@ -1,11 +1,22 @@
-# ScriptVersion: 2.0
-# LastUpdated: 2026-04-16
+# =====================================================================
+# Script Name   : Register-Tasks_SYSTEM.ps1
+# ScriptVersion : 3.2
+# LastUpdated   : 2026-07-22
+# Purpose       : Reconcile managed scheduled tasks under SYSTEM.
+#
+# Behavior:
+#   - Creates missing managed tasks.
+#   - Updates managed tasks only when their action, trigger, principal, or
+#     important settings differ.
+#   - Leaves unrelated and Microsoft scheduled tasks untouched.
+#   - Removes no scheduled tasks automatically.
+# =====================================================================
 
-[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Low')]
+[CmdletBinding()]
 param(
     [string]$ScriptsRoot = 'C:\Scripts',
-    [string]$LogPath = "$env:SystemDrive\Temp\Register-Tasks_SYSTEM.log",
-    [switch]$IncludeMicrosoftTasks = $false
+    [string]$TaskPath = '\',
+    [string]$LogPath = 'C:\Logs\Register-Tasks_SYSTEM.log'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -14,225 +25,339 @@ $WindowsPowerShellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1
 function Write-Log {
     param(
         [Parameter(Mandatory)][string]$Message,
-        [ValidateSet('INFO','OK','WARN','ERROR')]
+        [ValidateSet('INFO','ACTION','OK','WARN','ERROR')]
         [string]$Level = 'INFO'
     )
 
     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    $line = "[$timestamp] [$('{0,-5}' -f $Level)] $Message"
+    $line = "[$timestamp] [$('{0,-6}' -f $Level)] $Message"
 
-    switch ($Level) {
-        'INFO'  { Write-Host $line -ForegroundColor Cyan }
-        'OK'    { Write-Host $line -ForegroundColor Green }
-        'WARN'  { Write-Host $line -ForegroundColor Yellow }
-        'ERROR' { Write-Host $line -ForegroundColor Red }
+    $color = switch ($Level) {
+        'ACTION' { 'Yellow' }
+        'OK'     { 'Green' }
+        'WARN'   { 'DarkYellow' }
+        'ERROR'  { 'Red' }
+        default  { 'Cyan' }
     }
 
+    Write-Host $line -ForegroundColor $color
+
     try {
-        $logDir = Split-Path -Path $LogPath -Parent
-        if (-not [string]::IsNullOrWhiteSpace($logDir) -and -not (Test-Path -LiteralPath $logDir)) {
-            New-Item -Path $logDir -ItemType Directory -Force | Out-Null
+        $logDirectory = Split-Path -Path $LogPath -Parent
+        if (-not (Test-Path -LiteralPath $logDirectory -PathType Container)) {
+            New-Item -Path $logDirectory -ItemType Directory -Force | Out-Null
         }
-        Add-Content -Path $LogPath -Value $line -Encoding UTF8
+
+        Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8
     }
     catch {
     }
 }
 
 function Test-IsAdministrator {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Get-DesiredActionArguments {
+    param(
+        [Parameter(Mandatory)][string]$ScriptPath,
+        [string]$ExtraArguments = ''
+    )
+
+    $arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$ScriptPath`""
+
+    if (-not [string]::IsNullOrWhiteSpace($ExtraArguments)) {
+        $arguments = "$arguments $ExtraArguments"
+    }
+
+    return $arguments
+}
+
+function Get-TimeText {
+    param([Parameter(Mandatory)]$DateValue)
+
     try {
-        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-        $principal = New-Object Security.Principal.WindowsPrincipal($identity)
-        return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+        return ([datetime]$DateValue).ToString('HH:mm')
     }
     catch {
-        return $false
+        return $null
     }
 }
 
-function Get-TaskPrincipal {
-    return New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+function Test-CommonTaskProperties {
+    param(
+        [Parameter(Mandatory)]$ExistingTask,
+        [Parameter(Mandatory)][string]$ExpectedArguments
+    )
+
+    $issues = New-Object System.Collections.Generic.List[string]
+
+    $action = @($ExistingTask.Actions)[0]
+    if (-not $action) {
+        [void]$issues.Add('PowerShell action is missing.')
+    }
+    else {
+        if ([string]$action.Execute -ine $WindowsPowerShellExe) {
+            [void]$issues.Add("Executable differs: $($action.Execute)")
+        }
+
+        if ([string]$action.Arguments -cne $ExpectedArguments) {
+            [void]$issues.Add("Arguments differ: $($action.Arguments)")
+        }
+    }
+
+    if ([string]$ExistingTask.Principal.UserId -notmatch '^(SYSTEM|S-1-5-18)$') {
+        [void]$issues.Add("Principal differs: $($ExistingTask.Principal.UserId)")
+    }
+
+    if ([string]$ExistingTask.Principal.RunLevel -ne 'Highest') {
+        [void]$issues.Add("Run level differs: $($ExistingTask.Principal.RunLevel)")
+    }
+
+    if ($ExistingTask.Settings.StartWhenAvailable) {
+        [void]$issues.Add('Run-as-soon-as-possible-after-missed-start is enabled.')
+    }
+
+    if ($ExistingTask.Settings.DisallowStartIfOnBatteries) {
+        [void]$issues.Add('Task is blocked while on battery power.')
+    }
+
+    if ($ExistingTask.Settings.StopIfGoingOnBatteries) {
+        [void]$issues.Add('Task stops when switching to battery power.')
+    }
+
+    return @($issues)
 }
 
-function Get-TaskSettings {
+function Test-WeeklyTaskMatches {
+    param(
+        [Parameter(Mandatory)]$ExistingTask,
+        [Parameter(Mandatory)][string]$ExpectedArguments,
+        [Parameter(Mandatory)][string]$StartTime
+    )
+
+    $issues = New-Object System.Collections.Generic.List[string]
+    foreach ($issue in @(Test-CommonTaskProperties -ExistingTask $ExistingTask -ExpectedArguments $ExpectedArguments)) {
+        [void]$issues.Add($issue)
+    }
+
+    $triggers = @($ExistingTask.Triggers)
+    if ($triggers.Count -ne 1) {
+        [void]$issues.Add("Expected one weekly trigger; found $($triggers.Count).")
+    }
+    else {
+        $trigger = $triggers[0]
+
+        if ([string]$trigger.CimClass.CimClassName -notmatch 'Weekly') {
+            [void]$issues.Add('Trigger is not weekly.')
+        }
+
+        # Sunday is bit value 1 for MSFT_TaskWeeklyTrigger.DaysOfWeek.
+        if ([int]$trigger.DaysOfWeek -ne 1) {
+            [void]$issues.Add("Weekly day differs: $($trigger.DaysOfWeek)")
+        }
+
+        if ([int]$trigger.WeeksInterval -ne 1) {
+            [void]$issues.Add("Weeks interval differs: $($trigger.WeeksInterval)")
+        }
+
+        if ((Get-TimeText -DateValue $trigger.StartBoundary) -ne $StartTime) {
+            [void]$issues.Add("Start time differs: $(Get-TimeText -DateValue $trigger.StartBoundary)")
+        }
+    }
+
+    return @($issues)
+}
+
+function Test-TimeSyncTaskMatches {
+    param(
+        [Parameter(Mandatory)]$ExistingTask,
+        [Parameter(Mandatory)][string]$ExpectedArguments,
+        [Parameter(Mandatory)][string[]]$ExpectedTimes
+    )
+
+    $issues = New-Object System.Collections.Generic.List[string]
+    foreach ($issue in @(Test-CommonTaskProperties -ExistingTask $ExistingTask -ExpectedArguments $ExpectedArguments)) {
+        [void]$issues.Add($issue)
+    }
+
+    $actualTimes = @(
+        $ExistingTask.Triggers |
+        ForEach-Object { Get-TimeText -DateValue $_.StartBoundary } |
+        Where-Object { $_ } |
+        Sort-Object
+    )
+
+    $wantedTimes = @($ExpectedTimes | Sort-Object)
+
+    if (($actualTimes -join ',') -ne ($wantedTimes -join ',')) {
+        [void]$issues.Add("Trigger times differ. Actual: $($actualTimes -join ', ')")
+    }
+
+    return @($issues)
+}
+
+function New-ManagedTaskSettings {
     return New-ScheduledTaskSettingsSet `
         -AllowStartIfOnBatteries `
         -DontStopIfGoingOnBatteries `
-        -StartWhenAvailable `
         -ExecutionTimeLimit (New-TimeSpan -Hours 12)
 }
 
-function Remove-ExistingScheduledTasks {
-    [CmdletBinding(SupportsShouldProcess = $true)]
-    param(
-        [switch]$DeleteMicrosoftTasks
-    )
-
-    try {
-        Import-Module ScheduledTasks -ErrorAction Stop | Out-Null
-    }
-    catch {
-        throw "The ScheduledTasks module is not available. $($_.Exception.Message)"
-    }
-
-    $tasks = Get-ScheduledTask | Where-Object {
-        if ($DeleteMicrosoftTasks) {
-            $true
-        }
-        else {
-            $_.TaskPath -notlike '\Microsoft\*'
-        }
-    } | Sort-Object TaskPath, TaskName
-
-    if (-not $tasks) {
-        Write-Log 'No existing scheduled tasks matched the deletion scope.' 'INFO'
-        return
-    }
-
-    Write-Log "Removing $($tasks.Count) existing scheduled task(s)." 'WARN'
-
-    foreach ($task in $tasks) {
-        $fullName = "$($task.TaskPath)$($task.TaskName)"
-
-        if ($PSCmdlet.ShouldProcess($fullName, 'Unregister scheduled task')) {
-            try {
-                Unregister-ScheduledTask -TaskName $task.TaskName -TaskPath $task.TaskPath -Confirm:$false -ErrorAction Stop
-                Write-Log "Removed scheduled task: $fullName" 'OK'
-            }
-            catch {
-                Write-Log "Failed to remove scheduled task ${fullName}: $($_.Exception.Message)" 'WARN'
-            }
-        }
-    }
+function New-ManagedTaskPrincipal {
+    return New-ScheduledTaskPrincipal `
+        -UserId 'SYSTEM' `
+        -LogonType ServiceAccount `
+        -RunLevel Highest
 }
 
-function Register-WeeklyPowerShellTask {
-    [CmdletBinding(SupportsShouldProcess = $true)]
+function Ensure-WeeklyTask {
     param(
-        [Parameter(Mandatory)][string]$TaskName,
+        [Parameter(Mandatory)][string]$Name,
         [Parameter(Mandatory)][string]$ScriptPath,
         [Parameter(Mandatory)][string]$StartTime,
         [string]$ExtraArguments = ''
     )
 
-    if (-not (Test-Path -LiteralPath $WindowsPowerShellExe)) {
-        throw "Windows PowerShell executable not found: $WindowsPowerShellExe"
+    if (-not (Test-Path -LiteralPath $ScriptPath -PathType Leaf)) {
+        Write-Log "The script is currently missing, but its task definition will still be reconciled: $ScriptPath" 'WARN'
     }
 
-    if (-not (Test-Path -LiteralPath $ScriptPath)) {
-        Write-Log "Script path does not currently exist, but the task will still be created: $ScriptPath" 'WARN'
+    $arguments = Get-DesiredActionArguments -ScriptPath $ScriptPath -ExtraArguments $ExtraArguments
+    $existing = Get-ScheduledTask -TaskName $Name -TaskPath $TaskPath -ErrorAction SilentlyContinue
+
+    $needsUpdate = $true
+    $issues = @()
+
+    if ($existing) {
+        $issues = @(Test-WeeklyTaskMatches -ExistingTask $existing -ExpectedArguments $arguments -StartTime $StartTime)
+        $needsUpdate = $issues.Count -gt 0
     }
 
-    $argumentString = "-NoProfile -ExecutionPolicy Bypass -File `"$ScriptPath`""
-    if (-not [string]::IsNullOrWhiteSpace($ExtraArguments)) {
-        $argumentString = "$argumentString $ExtraArguments"
+    if (-not $needsUpdate) {
+        Write-Log "Task is already correct: $TaskPath$Name" 'OK'
+        return
     }
 
-    $displayCommand = "$WindowsPowerShellExe $argumentString"
-    Write-Log "Registering task '$TaskName' with action: $displayCommand" 'INFO'
-
-    try {
-        $action = New-ScheduledTaskAction -Execute $WindowsPowerShellExe -Argument $argumentString
-        $startAt = [datetime]::Today.Add([timespan]::Parse($StartTime))
-        $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday -WeeksInterval 1 -At $startAt
-        $principal = Get-TaskPrincipal
-        $settings = Get-TaskSettings
-
-        if ($PSCmdlet.ShouldProcess($TaskName, 'Register weekly scheduled task')) {
-            Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
-            Write-Log "Created task '$TaskName' for Sunday at $StartTime." 'OK'
+    if ($existing) {
+        Write-Log "Task requires an update: $TaskPath$Name" 'ACTION'
+        foreach ($issue in $issues) {
+            Write-Log " - $issue" 'WARN'
         }
     }
-    catch {
-        throw "Failed to create weekly task '$TaskName'. $($_.Exception.Message)"
+    else {
+        Write-Log "Task is missing and will be created: $TaskPath$Name" 'ACTION'
     }
+
+    $action = New-ScheduledTaskAction -Execute $WindowsPowerShellExe -Argument $arguments
+    $startAt = [datetime]::Today.Add([timespan]::Parse($StartTime))
+    $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday -WeeksInterval 1 -At $startAt
+    $principal = New-ManagedTaskPrincipal
+    $settings = New-ManagedTaskSettings
+
+    Register-ScheduledTask `
+        -TaskName $Name `
+        -TaskPath $TaskPath `
+        -Action $action `
+        -Trigger $trigger `
+        -Principal $principal `
+        -Settings $settings `
+        -Force `
+        -ErrorAction Stop | Out-Null
+
+    $verifiedTask = Get-ScheduledTask `
+        -TaskName $Name `
+        -TaskPath $TaskPath `
+        -ErrorAction SilentlyContinue
+
+    if (-not $verifiedTask) {
+        throw "Task registration returned without error, but the task could not be verified: $TaskPath$Name"
+    }
+
+    Write-Log "Task reconciled and verified: $TaskPath$Name at Sunday $StartTime" 'OK'
 }
 
-function Ensure-TimeSyncHelperScript {
-    [CmdletBinding()]
+function Ensure-TimeSyncTask {
     param(
-        [Parameter(Mandatory)][string]$ScriptsDirectory
+        [Parameter(Mandatory)][string]$ScriptPath,
+        [string]$Name = '00. Sync System Time Every 4 Hours'
     )
 
-    try {
-        if (-not (Test-Path -LiteralPath $ScriptsDirectory)) {
-            New-Item -Path $ScriptsDirectory -ItemType Directory -Force | Out-Null
-            Write-Log "Created scripts directory: $ScriptsDirectory" 'OK'
-        }
+    $triggerTimes = @('00:00','04:00','08:00','12:00','16:00','20:00')
+    $arguments = Get-DesiredActionArguments -ScriptPath $ScriptPath
+    $existing = Get-ScheduledTask -TaskName $Name -TaskPath $TaskPath -ErrorAction SilentlyContinue
 
-        $helperPath = Join-Path $ScriptsDirectory '10_Sync_System_Time.ps1'
-        $helperContent = @'
-$ErrorActionPreference = 'SilentlyContinue'
+    $needsUpdate = $true
+    $issues = @()
 
-try {
-    Start-Service -Name 'w32time' -ErrorAction SilentlyContinue
-}
-catch {
-}
-
-try {
-    & "$env:SystemRoot\System32\w32tm.exe" /resync /force *> $null
-}
-catch {
-}
-
-exit 0
-'@
-
-        Set-Content -Path $helperPath -Value $helperContent -Encoding UTF8 -Force
-        Write-Log "Ensured time sync helper script: $helperPath" 'OK'
-        return $helperPath
-    }
-    catch {
-        throw "Failed to create time sync helper script. $($_.Exception.Message)"
-    }
-}
-
-function Register-TimeSyncTask {
-    [CmdletBinding(SupportsShouldProcess = $true)]
-    param(
-        [Parameter(Mandatory)][string]$ScriptsDirectory,
-        [string]$TaskName = '00. Sync System Time Every 4 Hours'
-    )
-
-    if (-not (Test-Path -LiteralPath $WindowsPowerShellExe)) {
-        throw "Windows PowerShell executable not found: $WindowsPowerShellExe"
+    if ($existing) {
+        $issues = @(Test-TimeSyncTaskMatches -ExistingTask $existing -ExpectedArguments $arguments -ExpectedTimes $triggerTimes)
+        $needsUpdate = $issues.Count -gt 0
     }
 
-    $helperScriptPath = Ensure-TimeSyncHelperScript -ScriptsDirectory $ScriptsDirectory
-    $argumentString = "-NoProfile -ExecutionPolicy Bypass -File `"$helperScriptPath`""
-    $displayCommand = "$WindowsPowerShellExe $argumentString"
-    Write-Log "Registering task '$TaskName' with action: $displayCommand" 'INFO'
+    if (-not $needsUpdate) {
+        Write-Log "Task is already correct: $TaskPath$Name" 'OK'
+        return
+    }
 
-    try {
-        $action = New-ScheduledTaskAction -Execute $WindowsPowerShellExe -Argument $argumentString
-        $triggerTimes = @('00:00','04:00','08:00','12:00','16:00','20:00')
-        $triggers = foreach ($timeText in $triggerTimes) {
-            $atTime = [datetime]::Today.Add([timespan]::Parse($timeText))
-            New-ScheduledTaskTrigger -Daily -At $atTime -DaysInterval 1
-        }
-        $principal = Get-TaskPrincipal
-        $settings = Get-TaskSettings
-
-        if ($PSCmdlet.ShouldProcess($TaskName, 'Register time sync scheduled task')) {
-            Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $triggers -Principal $principal -Settings $settings -Force | Out-Null
-            Write-Log "Created task '$TaskName' to sync time every 4 hours using helper script '$helperScriptPath'." 'OK'
+    if ($existing) {
+        Write-Log "Time-sync task requires an update: $TaskPath$Name" 'ACTION'
+        foreach ($issue in $issues) {
+            Write-Log " - $issue" 'WARN'
         }
     }
-    catch {
-        throw "Failed to create time sync task '$TaskName'. $($_.Exception.Message)"
+    else {
+        Write-Log "Time-sync task is missing and will be created: $TaskPath$Name" 'ACTION'
     }
+
+    $action = New-ScheduledTaskAction -Execute $WindowsPowerShellExe -Argument $arguments
+    $triggers = foreach ($timeText in $triggerTimes) {
+        $atTime = [datetime]::Today.Add([timespan]::Parse($timeText))
+        New-ScheduledTaskTrigger -Daily -At $atTime -DaysInterval 1
+    }
+
+    Register-ScheduledTask `
+        -TaskName $Name `
+        -TaskPath $TaskPath `
+        -Action $action `
+        -Trigger $triggers `
+        -Principal (New-ManagedTaskPrincipal) `
+        -Settings (New-ManagedTaskSettings) `
+        -Force `
+        -ErrorAction Stop | Out-Null
+
+    $verifiedTask = Get-ScheduledTask `
+        -TaskName $Name `
+        -TaskPath $TaskPath `
+        -ErrorAction SilentlyContinue
+
+    if (-not $verifiedTask) {
+        throw "Task registration returned without error, but the task could not be verified: $TaskPath$Name"
+    }
+
+    Write-Log "Time-sync task reconciled and verified: $TaskPath$Name" 'OK'
 }
 
 if (-not (Test-IsAdministrator)) {
-    Write-Error 'This script must be run as Administrator.'
+    Write-Error 'This script must be run as Administrator or SYSTEM.'
     exit 1
 }
 
+# These are previous names from the transition that would otherwise leave
+# duplicate 07:00 or 07:30 tasks. Only these explicitly managed obsolete names
+# are removed; unrelated tasks are never touched.
+$obsoleteManagedTaskNames = @(
+    '13. Force Reboot Install Updates 3',
+    '14. Maintain SHARP Driver and PaperCut'
+)
+
 $taskDefinitions = @(
-    [pscustomobject]@{ Name = '01. Check for Updated Scripts';          Script = (Join-Path $ScriptsRoot '00_Update-Scripts-FromShare.ps1');       Time = '01:15'; Args = '' },
-    [pscustomobject]@{ Name = '02. Enable Windows Update Services';     Script = (Join-Path $ScriptsRoot '01_Enable_Windows_Update_Services.ps1');  Time = '01:20'; Args = '' },
-    [pscustomobject]@{ Name = '03. Remove User Profiles Weekly';        Script = (Join-Path $ScriptsRoot '02_Remove_User_Profiles.ps1');            Time = '01:30'; Args = '' },
+    [pscustomobject]@{ Name = '01. Check for Updated Scripts';          Script = (Join-Path $ScriptsRoot '00_Update-Scripts-FromShare.ps1');                         Time = '01:00'; Args = '' },
+    [pscustomobject]@{ Name = '01A. Create Weekly System Restore Point'; Script = (Join-Path $ScriptsRoot '12. Enable-SystemRestore-And-Create-RestorePoint.ps1'); Time = '01:10'; Args = '' },
+    [pscustomobject]@{ Name = '02. Enable Windows Update Services';     Script = (Join-Path $ScriptsRoot '01_Enable_Windows_Update_Services.ps1');                  Time = '01:30'; Args = '' },
+    [pscustomobject]@{ Name = '03. Remove User Profiles Weekly';        Script = (Join-Path $ScriptsRoot '02_Remove_User_Profiles.ps1');                             Time = '01:40'; Args = '' },
     [pscustomobject]@{ Name = '04. Weekend Apps Update';                Script = (Join-Path $ScriptsRoot '03_Weekend_Apps_Update.ps1');             Time = '02:00'; Args = '' },
     [pscustomobject]@{ Name = '05. Update Edge Silent';                 Script = (Join-Path $ScriptsRoot '04_Update_Edge_Silent.ps1');              Time = '02:45'; Args = '-KillEdgeProcesses' },
     [pscustomobject]@{ Name = '06. Weekend HP Drivers Update';          Script = (Join-Path $ScriptsRoot '05_Weekend_HP_Drivers_Update.ps1');       Time = '03:00'; Args = '' },
@@ -242,29 +367,73 @@ $taskDefinitions = @(
     [pscustomobject]@{ Name = '10. Disable Windows Update Services';    Script = (Join-Path $ScriptsRoot '09_Disable_Windows_Update_Services.ps1'); Time = '06:00'; Args = '' },
     [pscustomobject]@{ Name = '11. Force Reboot Install Updates 2';     Script = (Join-Path $ScriptsRoot '07_Force_Reboot_Install_Updates.ps1');    Time = '06:05'; Args = '' },
     [pscustomobject]@{ Name = '12. System Repair';                      Script = (Join-Path $ScriptsRoot '08_System_Repair.ps1');                   Time = '06:15'; Args = '' },
-    [pscustomobject]@{ Name = '13. Force Reboot Install Updates 3';     Script = (Join-Path $ScriptsRoot '07_Force_Reboot_Install_Updates.ps1');    Time = '07:00'; Args = '' }
+    [pscustomobject]@{ Name = '13. Maintain SHARP Driver and PaperCut'; Script = (Join-Path $ScriptsRoot '11_Install_SharpDriver_And_PaperCut.ps1'); Time = '07:00'; Args = '' },
+    [pscustomobject]@{ Name = '14. Force Reboot Install Updates 3';     Script = (Join-Path $ScriptsRoot '07_Force_Reboot_Install_Updates.ps1');    Time = '07:30'; Args = '' }
 )
 
-Write-Log 'Initializing scheduled task rebuild script...' 'INFO'
-Write-Log "Scripts root: $ScriptsRoot" 'INFO'
-Write-Log "Delete Microsoft tasks: $IncludeMicrosoftTasks" 'INFO'
-Write-Log 'Weekly tasks will be registered for Sunday, matching the batch file commands.' 'INFO'
-
 try {
-    Import-Module ScheduledTasks -ErrorAction Stop | Out-Null
+    Import-Module ScheduledTasks -ErrorAction Stop
 
-    Remove-ExistingScheduledTasks -DeleteMicrosoftTasks:$IncludeMicrosoftTasks
+    Write-Log "Reconciling managed tasks under $TaskPath" 'INFO'
 
-    foreach ($task in $taskDefinitions) {
-        Register-WeeklyPowerShellTask -TaskName $task.Name -ScriptPath $task.Script -StartTime $task.Time -ExtraArguments $task.Args
+    $desiredTaskNames = @($taskDefinitions.Name) + '00. Sync System Time Every 4 Hours'
+
+    foreach ($obsoleteName in $obsoleteManagedTaskNames) {
+        if ($obsoleteName -in $desiredTaskNames) {
+            continue
+        }
+
+        $obsoleteTask = Get-ScheduledTask `
+            -TaskName $obsoleteName `
+            -TaskPath $TaskPath `
+            -ErrorAction SilentlyContinue
+
+        if ($obsoleteTask) {
+            Write-Log "Removing superseded managed task: $TaskPath$obsoleteName" 'ACTION'
+
+            Unregister-ScheduledTask `
+                -TaskName $obsoleteName `
+                -TaskPath $TaskPath `
+                -Confirm:$false `
+                -ErrorAction Stop
+
+            Write-Log "Removed superseded managed task: $TaskPath$obsoleteName" 'OK'
+        }
     }
 
-    Register-TimeSyncTask -ScriptsDirectory $ScriptsRoot
+    foreach ($task in $taskDefinitions) {
+        Ensure-WeeklyTask `
+            -Name $task.Name `
+            -ScriptPath $task.Script `
+            -StartTime $task.Time `
+            -ExtraArguments $task.Args
+    }
 
-    Write-Log 'Scheduled task rebuild completed successfully.' 'OK'
+    Ensure-TimeSyncTask -ScriptPath (Join-Path $ScriptsRoot '10_Sync_System_Time.ps1')
+
+    $expectedTaskNames = @($taskDefinitions.Name) + '00. Sync System Time Every 4 Hours'
+    $missingTasks = @(
+        foreach ($expectedTaskName in $expectedTaskNames) {
+            $registeredTask = Get-ScheduledTask `
+                -TaskName $expectedTaskName `
+                -TaskPath $TaskPath `
+                -ErrorAction SilentlyContinue
+
+            if (-not $registeredTask) {
+                $expectedTaskName
+            }
+        }
+    )
+
+    if ($missingTasks.Count -gt 0) {
+        throw "The following managed task(s) could not be verified after reconciliation: $($missingTasks -join ', ')"
+    }
+
+    Write-Log "Verified all $($expectedTaskNames.Count) managed scheduled tasks." 'OK'
+    Write-Log 'All managed scheduled tasks were reconciled successfully.' 'OK'
     exit 0
 }
 catch {
-    Write-Log "Script failed: $($_.Exception.Message)" 'ERROR'
+    Write-Log "Task reconciliation failed: $($_.Exception.Message)" 'ERROR'
     exit 2
 }
