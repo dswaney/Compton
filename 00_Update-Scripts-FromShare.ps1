@@ -1,11 +1,11 @@
 # =====================================================================
 # ScriptName: 00_Update-Scripts-FromShare.ps1
-# ScriptVersion: 3.2
+# ScriptVersion: 3.4.1
 # LastUpdated: 2026-07-23
 # Purpose:
-#   - Dynamically synchronize PowerShell scripts from the central share.
+#   - Synchronize only managed scripts 00 through 13 and Register-Tasks_SYSTEM.ps1.
 #   - Update and relaunch itself when a newer/different updater is found.
-#   - Automatically deploy newly added .ps1 files.
+#   - Automatically deploy newly added managed scripts within the 00-13 range.
 #   - Self-heal deleted or missing local scripts from the active share.
 #   - Verify every restored or updated script using SHA-256.
 #   - Run Register-Tasks_SYSTEM.ps1 after synchronization so missing or
@@ -38,11 +38,18 @@ $RequiredManagedFiles = @(
     '12. Enable-SystemRestore-And-Create-RestorePoint.ps1'
 )
 $WindowsPowerShellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+$TaskMarkerFolder     = 'C:\ProgramData\Compton'
+$TaskMarkerPath       = Join-Path $TaskMarkerFolder 'TaskRegistration.current.json'
 
-# Files or folders in the share root that should not be treated as managed scripts.
-$ExcludedFileNames = @(
-    'Register-Tasks_SYSTEM_v2.0.ps1'
-)
+# Only these files are managed by this updater:
+#   - Numbered maintenance scripts beginning with 00 through 13
+#   - Register-Tasks_SYSTEM.ps1
+#
+# Examples accepted:
+#   00_Update-Scripts-FromShare.ps1
+#   12. Enable-SystemRestore-And-Create-RestorePoint.ps1
+#   13_Configure_Autologon_And_Edge.ps1
+$ManagedNumberedScriptPattern = '^(?:0[0-9]|1[0-3])(?:[._ -].*)?\.ps1$'
 
 function Write-Status {
     param(
@@ -174,6 +181,31 @@ function Copy-FileAtomically {
     }
 }
 
+
+function Write-TaskRegistrationMarker {
+    param([Parameter(Mandatory)][string]$RegisterScriptPath)
+
+    try {
+        Ensure-Folder -Path $TaskMarkerFolder
+
+        $marker = [ordered]@{
+            SchemaVersion      = 1
+            CompletedUtc       = (Get-Date).ToUniversalTime().ToString('o')
+            ComputerName       = $env:COMPUTERNAME
+            RegisterScriptPath = $RegisterScriptPath
+            RegisterScriptHash = Get-FileSha256 -Path $RegisterScriptPath
+        }
+
+        $marker | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $TaskMarkerPath -Encoding UTF8 -Force
+        Write-Status "Task-registration marker updated: $TaskMarkerPath" 'OK'
+        return $true
+    }
+    catch {
+        Write-Status "Task reconciliation succeeded, but the marker could not be written: $($_.Exception.Message)" 'WARN'
+        return $false
+    }
+}
+
 function Invoke-TaskReconciliation {
     $registerScript = Join-Path $LocalScripts $RegisterTasksName
 
@@ -197,6 +229,7 @@ function Invoke-TaskReconciliation {
     }
 
     Write-Status 'Scheduled task reconciliation completed successfully.' 'OK'
+    [void](Write-TaskRegistrationMarker -RegisterScriptPath $registerScript)
     return $true
 }
 
@@ -214,7 +247,10 @@ try {
             -Filter '*.ps1' `
             -File `
             -ErrorAction Stop |
-        Where-Object { $_.Name -notin $ExcludedFileNames } |
+        Where-Object {
+            $_.Name -ieq $RegisterTasksName -or
+            $_.Name -match $ManagedNumberedScriptPattern
+        } |
         Sort-Object {
             if ($_.Name -ieq $UpdaterFileName) { 0 } else { 1 }
         }, Name
@@ -224,7 +260,7 @@ try {
         throw "No PowerShell scripts were found in the source root: $sourceRoot"
     }
 
-    Write-Status "Discovered $($remoteScripts.Count) managed script(s) on the share." 'INFO'
+    Write-Status "Discovered $($remoteScripts.Count) approved managed script(s) on the share (00-13 plus Register-Tasks_SYSTEM.ps1)." 'INFO'
 
     $updatedFiles  = New-Object System.Collections.Generic.List[string]
     $restoredFiles = New-Object System.Collections.Generic.List[string]
@@ -293,12 +329,25 @@ try {
         $newUpdaterPath = Join-Path $LocalScripts $UpdaterFileName
         Write-Status 'The updater changed. Relaunching the new local updater now.' 'ACTION'
 
-        Start-Process `
-            -FilePath $WindowsPowerShellExe `
-            -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$newUpdaterPath`" -Relaunched" `
-            -WindowStyle Hidden | Out-Null
+        # Run the refreshed updater in the same console and wait for it to finish.
+        # This keeps its output visible and prevents the original process from
+        # exiting before PowerShell has successfully started the replacement.
+        & $WindowsPowerShellExe `
+            -NoProfile `
+            -ExecutionPolicy Bypass `
+            -File $newUpdaterPath `
+            -Relaunched
 
-        exit 0
+        $relaunchExitCode = $LASTEXITCODE
+        if ($null -eq $relaunchExitCode) {
+            $relaunchExitCode = 1
+        }
+
+        if ($relaunchExitCode -ne 0) {
+            Write-Status "The refreshed updater exited with code $relaunchExitCode." 'ERROR'
+        }
+
+        exit $relaunchExitCode
     }
 
     if ($restoredFiles.Count -gt 0) {
