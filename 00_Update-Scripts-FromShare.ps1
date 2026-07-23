@@ -1,11 +1,13 @@
 # =====================================================================
 # ScriptName: 00_Update-Scripts-FromShare.ps1
-# ScriptVersion: 3.1
-# LastUpdated: 2026-07-22
+# ScriptVersion: 3.2
+# LastUpdated: 2026-07-23
 # Purpose:
 #   - Dynamically synchronize PowerShell scripts from the central share.
 #   - Update and relaunch itself when a newer/different updater is found.
 #   - Automatically deploy newly added .ps1 files.
+#   - Self-heal deleted or missing local scripts from the active share.
+#   - Verify every restored or updated script using SHA-256.
 #   - Run Register-Tasks_SYSTEM.ps1 after synchronization so missing or
 #     changed maintenance tasks are reconciled.
 # =====================================================================
@@ -224,7 +226,8 @@ try {
 
     Write-Status "Discovered $($remoteScripts.Count) managed script(s) on the share." 'INFO'
 
-    $updatedFiles = New-Object System.Collections.Generic.List[string]
+    $updatedFiles  = New-Object System.Collections.Generic.List[string]
+    $restoredFiles = New-Object System.Collections.Generic.List[string]
     $selfUpdated = $false
 
     foreach ($remoteFile in $remoteScripts) {
@@ -238,29 +241,46 @@ try {
         }
 
         $remoteVersion = Get-ScriptVersionText -Path $remoteFile.FullName
-        $localVersion = if (Test-Path -LiteralPath $localPath -PathType Leaf) {
+        $localExists = Test-Path -LiteralPath $localPath -PathType Leaf
+        $localVersion = if ($localExists) {
             Get-ScriptVersionText -Path $localPath
         }
         else {
             'Missing'
         }
 
-        Write-Status "Updating $($remoteFile.Name): local [$localVersion], share [$remoteVersion]." 'ACTION'
+        if (-not $localExists) {
+            Write-Status "Missing managed script detected: $localPath" 'WARN'
+            Write-Status "Restoring $($remoteFile.Name) from $sourceRoot." 'ACTION'
+        }
+        else {
+            Write-Status "Updating $($remoteFile.Name): local [$localVersion], share [$remoteVersion]." 'ACTION'
 
-        $backupPath = Backup-LocalFile -Path $localPath
-        if ($backupPath) {
-            Write-Status "Backup created: $backupPath" 'INFO'
+            $backupPath = Backup-LocalFile -Path $localPath
+            if ($backupPath) {
+                Write-Status "Backup created: $backupPath" 'INFO'
+            }
         }
 
         Copy-FileAtomically -SourcePath $remoteFile.FullName -DestinationPath $localPath
 
-        $copiedHash = Get-FileSha256 -Path $localPath
-        if ($copiedHash -ne $remoteHash) {
-            throw "Hash verification failed after copying $($remoteFile.Name)."
+        if (-not (Test-Path -LiteralPath $localPath -PathType Leaf)) {
+            throw "The destination file is still missing after copying $($remoteFile.Name)."
         }
 
-        [void]$updatedFiles.Add($remoteFile.Name)
-        Write-Status "Updated successfully: $($remoteFile.Name)" 'OK'
+        $copiedHash = Get-FileSha256 -Path $localPath
+        if ([string]::IsNullOrWhiteSpace($copiedHash) -or $copiedHash -ne $remoteHash) {
+            throw "SHA-256 verification failed after copying $($remoteFile.Name)."
+        }
+
+        if ($localExists) {
+            [void]$updatedFiles.Add($remoteFile.Name)
+            Write-Status "Updated and hash-verified: $($remoteFile.Name)" 'OK'
+        }
+        else {
+            [void]$restoredFiles.Add($remoteFile.Name)
+            Write-Status "Restored and hash-verified: $($remoteFile.Name)" 'OK'
+        }
 
         if ($remoteFile.Name -ieq $UpdaterFileName) {
             $selfUpdated = $true
@@ -281,11 +301,16 @@ try {
         exit 0
     }
 
-    if ($updatedFiles.Count -eq 0) {
-        Write-Status 'All managed scripts are already synchronized.' 'OK'
+    if ($restoredFiles.Count -gt 0) {
+        Write-Status "Self-healed missing files: $($restoredFiles -join ', ')" 'OK'
     }
-    else {
-        Write-Status "Updated files: $($updatedFiles -join ', ')" 'OK'
+
+    if ($updatedFiles.Count -gt 0) {
+        Write-Status "Updated changed files: $($updatedFiles -join ', ')" 'OK'
+    }
+
+    if ($updatedFiles.Count -eq 0 -and $restoredFiles.Count -eq 0) {
+        Write-Status 'All managed scripts are already synchronized.' 'OK'
     }
 
     $missingRequiredFiles = @(
