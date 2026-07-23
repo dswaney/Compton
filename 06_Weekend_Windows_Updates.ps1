@@ -1,7 +1,7 @@
 # =====================================================================
 # ScriptName: 06_Weekend_Windows_Updates.ps1
-# ScriptVersion: 1.8
-# LastUpdated: 2026-04-26
+# ScriptVersion: 2.0
+# LastUpdated: 2026-07-23
 # Purpose: Installs Windows Updates using PSWindowsUpdate, writes a
 #          YAML audit log in C:\Logs, and explicitly reboots if Windows
 #          reports that a reboot is required.
@@ -142,7 +142,7 @@ function Initialize-YamlLog {
     Set-Content -Path $script:YamlLogPath -Value @(
         'computer_name: ' + (ConvertTo-YamlSafeValue $script:ComputerName),
         'script_name: "06_Weekend_Windows_Updates.ps1"',
-        'script_version: "1.8"',
+        'script_version: "1.6"',
         'status: "Initializing"',
         'run_started: ' + (ConvertTo-YamlSafeValue ($script:RunStart.ToString('yyyy-MM-dd HH:mm:ss'))),
         'yaml_log_path: ' + (ConvertTo-YamlSafeValue $script:YamlLogPath),
@@ -269,7 +269,7 @@ function Write-YamlLog {
 
         $yamlLines.Add('computer_name: ' + (ConvertTo-YamlSafeValue $script:ComputerName)) | Out-Null
         $yamlLines.Add('script_name: "06_Weekend_Windows_Updates.ps1"') | Out-Null
-        $yamlLines.Add('script_version: "1.8"') | Out-Null
+        $yamlLines.Add('script_version: "1.6"') | Out-Null
         $yamlLines.Add('run_started: ' + (ConvertTo-YamlSafeValue ($script:RunStart.ToString('yyyy-MM-dd HH:mm:ss')))) | Out-Null
         $yamlLines.Add('run_finished: ' + (ConvertTo-YamlSafeValue ($runEnd.ToString('yyyy-MM-dd HH:mm:ss')))) | Out-Null
         $yamlLines.Add('duration_seconds: ' + $duration) | Out-Null
@@ -534,28 +534,33 @@ function Reset-WUComponentsSafe {
     Write-Log "Windows Update components reset complete." 'OK'
 }
 
-function Invoke-PSWindowsUpdateJobOnce {
-    param(
-        [Parameter(Mandatory)]
-        [int]$TimeoutSeconds
-    )
+function Install-AvailableWindowsUpdates {
+    Write-Log "Scanning for and installing available Windows Updates..." 'INFO'
+
+    if (-not (Get-Command -Name Install-WindowsUpdate -ErrorAction SilentlyContinue)) {
+        throw "Install-WindowsUpdate command was not found."
+    }
 
     Write-Log "Starting background job for Install-WindowsUpdate..." 'INFO'
     $job = Start-Job -ScriptBlock {
+        param($ResetModulePath)
         Import-Module PSWindowsUpdate -Force
         Install-WindowsUpdate -MicrosoftUpdate -AcceptAll -IgnoreReboot -Verbose *>&1
     }
 
-    Write-Log "Background job started with ID $($job.Id). Waiting for completion for up to $TimeoutSeconds seconds..." 'INFO'
+    Write-Log "Background job started with ID $($job.Id). Waiting for completion for up to $OperationTimeoutSeconds seconds..." 'INFO'
 
     $pollIntervalSeconds = 5
     $heartbeatIntervalSeconds = 60
     $elapsedSeconds = 0
     $completed = $null
 
-    while (-not $completed -and $elapsedSeconds -lt $TimeoutSeconds) {
+    while (-not $completed -and $elapsedSeconds -lt $OperationTimeoutSeconds) {
         $completed = Wait-Job -Job $job -Timeout $pollIntervalSeconds
-        if ($completed) { break }
+
+        if ($completed) {
+            break
+        }
 
         $elapsedSeconds += $pollIntervalSeconds
 
@@ -570,22 +575,11 @@ function Invoke-PSWindowsUpdateJobOnce {
         Write-Log "Windows Update job did not finish before timeout. Final observed state: $jobState" 'ERROR'
         Stop-Job -Job $job -Force | Out-Null
         Remove-Job -Job $job -Force | Out-Null
-        throw "Install-WindowsUpdate exceeded timeout of $TimeoutSeconds seconds."
+        throw "Install-WindowsUpdate exceeded timeout of $OperationTimeoutSeconds seconds."
     }
 
     Write-Log "Background job completed. Receiving Windows Update output..." 'INFO'
-
-    $receiveErrors = @()
-    $results = Receive-Job -Job $job -ErrorAction SilentlyContinue -ErrorVariable receiveErrors
-
-    $jobState = $job.State
-    $jobReason = $null
-    try {
-        if ($job.ChildJobs -and $job.ChildJobs.Count -gt 0 -and $job.ChildJobs[0].JobStateInfo.Reason) {
-            $jobReason = $job.ChildJobs[0].JobStateInfo.Reason.Message
-        }
-    }
-    catch {}
+    $results = Receive-Job -Job $job
 
     Write-Log "Removing completed background job..." 'INFO'
     Remove-Job -Job $job -Force | Out-Null
@@ -602,68 +596,10 @@ function Invoke-PSWindowsUpdateJobOnce {
         }
     }
     else {
-        Write-Log "Install-WindowsUpdate returned no normal output objects." 'WARN'
+        Write-Log "Install-WindowsUpdate returned no output objects." 'WARN'
     }
 
-    if ($receiveErrors -and $receiveErrors.Count -gt 0) {
-        foreach ($err in $receiveErrors) {
-            $errText = [string]$err
-            if (-not [string]::IsNullOrWhiteSpace($errText)) {
-                $script:RawUpdateLines.Add("ERROR: $errText") | Out-Null
-                Write-Log "Install-WindowsUpdate reported error output: $errText" 'WARN'
-            }
-        }
-
-        $errorText = (($receiveErrors | ForEach-Object { [string]$_ }) -join ' | ')
-        throw $errorText
-    }
-
-    if ($jobState -eq 'Failed') {
-        if ([string]::IsNullOrWhiteSpace($jobReason)) {
-            throw "Install-WindowsUpdate background job failed."
-        }
-        else {
-            throw "Install-WindowsUpdate background job failed: $jobReason"
-        }
-    }
-
-    return $results
-}
-
-function Install-AvailableWindowsUpdates {
-    Write-Log "Scanning for and installing available Windows Updates..." 'INFO'
-
-    if (-not (Get-Command -Name Install-WindowsUpdate -ErrorAction SilentlyContinue)) {
-        throw "Install-WindowsUpdate command was not found."
-    }
-
-    $attempt = 1
-    $maxAttempts = 2
-
-    while ($attempt -le $maxAttempts) {
-        try {
-            if ($attempt -gt 1) {
-                Write-Log "Retrying Windows Update install phase. Attempt $attempt of $maxAttempts..." 'INFO'
-            }
-
-            [void](Invoke-PSWindowsUpdateJobOnce -TimeoutSeconds $OperationTimeoutSeconds)
-            Write-Log "Windows Update installation command completed." 'OK'
-            return
-        }
-        catch {
-            $message = $_.Exception.Message
-            Write-Log "Windows Update install attempt $attempt failed: $message" 'WARN'
-
-            if ($message -match '0x80248007' -and $attempt -lt $maxAttempts) {
-                Write-Log "Detected Windows Update datastore/catalog error 0x80248007. Resetting Windows Update components and retrying once..." 'WARN'
-                Reset-WUComponentsSafe
-                $attempt++
-                continue
-            }
-
-            throw
-        }
-    }
+    Write-Log "Windows Update installation command completed." 'OK'
 }
 
 function Test-WURebootRequired {
