@@ -1,7 +1,7 @@
 # =====================================================================
 # ScriptName: Compton_Tech_Utils.ps1
-# ScriptVersion: 1.13.3
-# LastUpdated: 2026-07-21
+# ScriptVersion: 1.13.6
+# LastUpdated: 2026-08-13
 # =====================================================================
 
 # -----------------------------------------------------------------------------
@@ -5851,6 +5851,8 @@ function Update-HPDrivers {
         [string]$HpiaInternetLandingPage = 'https://ftp.ext.hp.com/pub/caps-softpaq/cmit/HPIA.html',
         [string]$LocalHpiaFolder = 'C:\ProgramData\Compton\HPImageAssistant',
         [string]$DellCommandUpdateSharePath = '\\filesvr\labscripts\Dell-Command-Update-Windows-Universal-Application.exe',
+        [string]$DellCommandUpdateInternetUrl = 'https://dl.dell.com/FOLDER12925773M/2/Dell-Command-Update-Windows-Universal-Application_P4DJW_WIN64_5.5.0_A00_01.EXE',
+        [string]$DellCommandUpdateInternetSha256 = '324C83D8495BEF5E58817988563B5D123CCEE35EBB643324B7DDB38D969D9B12',
         [string]$DotNetDesktopRuntimeSharePath = '\\filesvr\labscripts\windowsdesktop-runtime-8.0.25-win-x64.exe',
         [string]$DotNetDesktopRuntimeInternetUrl = 'https://aka.ms/dotnet/8.0/windowsdesktop-runtime-win-x64.exe',
         [string]$DellCommandUpdateWingetId = 'Dell.CommandUpdate.Universal'
@@ -6970,6 +6972,30 @@ function Update-HPDrivers {
         Write-Log ("Downloaded {0} to: {1}" -f $DisplayName, $DestinationPath) 'OK'
     }
 
+
+    function Test-DownloadedFileSha256 {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory)][string]$Path,
+            [Parameter(Mandatory)][string]$ExpectedSha256,
+            [Parameter(Mandatory)][string]$DisplayName
+        )
+
+        if ([string]::IsNullOrWhiteSpace($ExpectedSha256)) {
+            return
+        }
+
+        $actual = (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash.ToUpperInvariant()
+        $expected = $ExpectedSha256.ToUpperInvariant()
+
+        if ($actual -ne $expected) {
+            throw ("{0} SHA-256 validation failed. Expected {1}; found {2}." -f $DisplayName, $expected, $actual)
+        }
+
+        Write-Log ("{0} SHA-256 validated successfully." -f $DisplayName) 'OK'
+        Add-YamlAction ("{0} SHA-256 validation succeeded." -f $DisplayName)
+    }
+
     function Ensure-DotNetDesktopRuntimeForDcu {
         [CmdletBinding()]
         param()
@@ -7010,35 +7036,72 @@ function Update-HPDrivers {
 
         Ensure-DotNetDesktopRuntimeForDcu
 
+        $localDcuInstaller = Join-Path $WorkingRoot 'Dell-Command-Update-Windows-Universal-Application.exe'
+
         if (Test-Path -LiteralPath $DellCommandUpdateSharePath) {
             Write-Log ("Using Dell Command | Update installer from file share: {0}" -f $DellCommandUpdateSharePath) 'OK'
-            $localDcuInstaller = Join-Path $WorkingRoot 'Dell-Command-Update-Windows-Universal-Application.exe'
             Copy-Item -LiteralPath $DellCommandUpdateSharePath -Destination $localDcuInstaller -Force
             Invoke-InstallerAndValidateExitCode -FilePath $localDcuInstaller -ArgumentList @('/s') -DisplayName 'Dell Command | Update'
         }
         else {
             Write-Log ("File-share Dell Command | Update installer is unavailable: {0}" -f $DellCommandUpdateSharePath) 'WARN'
-            $winget = Get-Command -Name 'winget.exe' -ErrorAction SilentlyContinue
-            if (-not $winget) {
-                throw 'Dell Command | Update is not on the file share and winget.exe is unavailable for the Internet fallback.'
+            Write-Log 'Attempting direct vendor download of Dell Command | Update from Dell...' 'INFO'
+            Add-YamlAction 'File-share Dell Command | Update unavailable; using Dell vendor Internet fallback.'
+
+            $directDownloadSucceeded = $false
+
+            try {
+                Save-InternetFile `
+                    -Uri ([uri]$DellCommandUpdateInternetUrl) `
+                    -DestinationPath $localDcuInstaller `
+                    -DisplayName 'Dell Command | Update'
+
+                Test-DownloadedFileSha256 `
+                    -Path $localDcuInstaller `
+                    -ExpectedSha256 $DellCommandUpdateInternetSha256 `
+                    -DisplayName 'Dell Command | Update'
+
+                Invoke-InstallerAndValidateExitCode `
+                    -FilePath $localDcuInstaller `
+                    -ArgumentList @('/s') `
+                    -DisplayName 'Dell Command | Update'
+
+                $directDownloadSucceeded = $true
+                Add-YamlAction 'Dell Command | Update installed from Dell direct vendor download.'
+            }
+            catch {
+                Write-Log ("Direct Dell vendor download/install failed: {0}" -f $_.Exception.Message) 'WARN'
+                Add-YamlAction ("Direct Dell vendor fallback failed: {0}" -f $_.Exception.Message)
             }
 
-            Write-Log 'Installing Dell Command | Update from the Internet using winget...' 'INFO'
-            $wingetArgs = @(
-                'install',
-                '--id', $DellCommandUpdateWingetId,
-                '--exact',
-                '--silent',
-                '--accept-package-agreements',
-                '--accept-source-agreements',
-                '--disable-interactivity'
-            )
-            $wingetProcess = Start-Process -FilePath $winget.Source -ArgumentList $wingetArgs -Wait -PassThru -NoNewWindow
-            Write-Log ("winget Dell Command | Update exit code: {0}" -f $wingetProcess.ExitCode) 'INFO'
-            if ($wingetProcess.ExitCode -ne 0) {
-                throw ("Internet installation of Dell Command | Update failed with winget exit code {0}." -f $wingetProcess.ExitCode)
+            if (-not $directDownloadSucceeded) {
+                $winget = Get-Command -Name 'winget.exe' -ErrorAction SilentlyContinue
+
+                if (-not $winget) {
+                    throw 'Dell Command | Update could not be installed from the file share or Dell vendor download, and winget.exe is unavailable.'
+                }
+
+                Write-Log 'Trying final Dell Command | Update Internet fallback using winget...' 'WARN'
+
+                $wingetArgs = @(
+                    'install',
+                    '--id', $DellCommandUpdateWingetId,
+                    '--exact',
+                    '--silent',
+                    '--accept-package-agreements',
+                    '--accept-source-agreements',
+                    '--disable-interactivity'
+                )
+
+                $wingetProcess = Start-Process -FilePath $winget.Source -ArgumentList $wingetArgs -Wait -PassThru -NoNewWindow
+                Write-Log ("winget Dell Command | Update exit code: {0}" -f $wingetProcess.ExitCode) 'INFO'
+
+                if ($wingetProcess.ExitCode -ne 0) {
+                    throw ("Internet installation of Dell Command | Update failed with winget exit code {0}." -f $wingetProcess.ExitCode)
+                }
+
+                Add-YamlAction 'Dell Command | Update installed from Internet using winget fallback.'
             }
-            Add-YamlAction 'Dell Command | Update installed from the Internet using winget.'
         }
 
         Start-Sleep -Seconds 3
@@ -24820,7 +24883,13 @@ function Update-HPDrivers {
         [string]$HpiaSourceFolder = '\\filesvr\Labscripts\HPImageAssistant',
         [string]$HpiaInstallerSharePath = '\\filesvr\labscripts\HPImageAssistant.exe',
         [string]$HpiaInternetLandingPage = 'https://ftp.ext.hp.com/pub/caps-softpaq/cmit/HPIA.html',
-        [string]$LocalHpiaFolder = 'C:\ProgramData\Compton\HPImageAssistant'
+        [string]$LocalHpiaFolder = 'C:\ProgramData\Compton\HPImageAssistant',
+        [string]$DellCommandUpdateSharePath = '\\filesvr\labscripts\Dell-Command-Update-Windows-Universal-Application.exe',
+        [string]$DellCommandUpdateInternetUrl = 'https://dl.dell.com/FOLDER12925773M/2/Dell-Command-Update-Windows-Universal-Application_P4DJW_WIN64_5.5.0_A00_01.EXE',
+        [string]$DellCommandUpdateInternetSha256 = '324C83D8495BEF5E58817988563B5D123CCEE35EBB643324B7DDB38D969D9B12',
+        [string]$DotNetDesktopRuntimeSharePath = '\\filesvr\labscripts\windowsdesktop-runtime-8.0.25-win-x64.exe',
+        [string]$DotNetDesktopRuntimeInternetUrl = 'https://aka.ms/dotnet/8.0/windowsdesktop-runtime-win-x64.exe',
+        [string]$DellCommandUpdateWingetId = 'Dell.CommandUpdate.Universal'
     )
 
     Set-StrictMode -Version Latest
@@ -25850,13 +25919,241 @@ function Update-HPDrivers {
         return @($items)
     }
 
+    function Test-DotNetDesktopRuntime8 {
+        [CmdletBinding()]
+        param(
+            [version]$MinimumVersion = [version]'8.0.25'
+        )
+
+        $dotnetExe = Join-Path $env:ProgramFiles 'dotnet\dotnet.exe'
+        if (-not (Test-Path -LiteralPath $dotnetExe)) {
+            return $false
+        }
+
+        try {
+            $runtimeLines = @(& $dotnetExe --list-runtimes 2>$null)
+            foreach ($line in $runtimeLines) {
+                if ($line -match '^Microsoft\.WindowsDesktop\.App\s+(?<Version>\d+\.\d+\.\d+)\s+') {
+                    try {
+                        if ([version]$Matches.Version -ge $MinimumVersion) {
+                            return $true
+                        }
+                    }
+                    catch { }
+                }
+            }
+        }
+        catch {
+            Write-Log ("Unable to query installed .NET desktop runtimes: {0}" -f $_.Exception.Message) 'WARN'
+        }
+
+        return $false
+    }
+
+    function Invoke-InstallerAndValidateExitCode {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory)][string]$FilePath,
+            [Parameter(Mandatory)][string[]]$ArgumentList,
+            [Parameter(Mandatory)][string]$DisplayName,
+            [int[]]$SuccessExitCodes = @(0, 3010, 1641)
+        )
+
+        Write-Log ("Installing {0} from: {1}" -f $DisplayName, $FilePath) 'INFO'
+        $process = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -Wait -PassThru -NoNewWindow
+        Write-Log ("{0} installer exit code: {1}" -f $DisplayName, $process.ExitCode) 'INFO'
+
+        if ($process.ExitCode -notin $SuccessExitCodes) {
+            throw ("{0} installation failed with exit code {1}." -f $DisplayName, $process.ExitCode)
+        }
+
+        if ($process.ExitCode -in @(3010, 1641)) {
+            Write-Log ("{0} installed successfully and requires a restart." -f $DisplayName) 'WARN'
+            Add-YamlAction ("{0} installed; restart required." -f $DisplayName)
+        }
+        else {
+            Write-Log ("{0} installed successfully." -f $DisplayName) 'OK'
+            Add-YamlAction ("{0} installed successfully." -f $DisplayName)
+        }
+    }
+
+    function Save-InternetFile {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory)][uri]$Uri,
+            [Parameter(Mandatory)][string]$DestinationPath,
+            [Parameter(Mandatory)][string]$DisplayName
+        )
+
+        Ensure-Folder -Path (Split-Path -Path $DestinationPath -Parent)
+        if (Test-Path -LiteralPath $DestinationPath) {
+            Remove-Item -LiteralPath $DestinationPath -Force -ErrorAction SilentlyContinue
+        }
+
+        Write-Log ("Downloading {0} from the Internet..." -f $DisplayName) 'INFO'
+        try {
+            Start-BitsTransfer -Source $Uri.AbsoluteUri -Destination $DestinationPath -ErrorAction Stop
+        }
+        catch {
+            Write-Log ("BITS download failed; retrying with Invoke-WebRequest: {0}" -f $_.Exception.Message) 'WARN'
+            Invoke-WebRequest -Uri $Uri.AbsoluteUri -OutFile $DestinationPath -UseBasicParsing -ErrorAction Stop
+        }
+
+        if (-not (Test-Path -LiteralPath $DestinationPath) -or (Get-Item -LiteralPath $DestinationPath).Length -lt 1MB) {
+            throw ("The downloaded {0} installer is missing or unexpectedly small." -f $DisplayName)
+        }
+
+        Write-Log ("Downloaded {0} to: {1}" -f $DisplayName, $DestinationPath) 'OK'
+    }
+
+
+    function Test-DownloadedFileSha256 {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory)][string]$Path,
+            [Parameter(Mandatory)][string]$ExpectedSha256,
+            [Parameter(Mandatory)][string]$DisplayName
+        )
+
+        if ([string]::IsNullOrWhiteSpace($ExpectedSha256)) {
+            return
+        }
+
+        $actual = (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash.ToUpperInvariant()
+        $expected = $ExpectedSha256.ToUpperInvariant()
+
+        if ($actual -ne $expected) {
+            throw ("{0} SHA-256 validation failed. Expected {1}; found {2}." -f $DisplayName, $expected, $actual)
+        }
+
+        Write-Log ("{0} SHA-256 validated successfully." -f $DisplayName) 'OK'
+        Add-YamlAction ("{0} SHA-256 validation succeeded." -f $DisplayName)
+    }
+
+    function Ensure-DotNetDesktopRuntimeForDcu {
+        [CmdletBinding()]
+        param()
+
+        if (Test-DotNetDesktopRuntime8 -MinimumVersion ([version]'8.0.25')) {
+            Write-Log '.NET Desktop Runtime 8.0.25 or newer is already installed.' 'OK'
+            Add-YamlAction '.NET Desktop Runtime prerequisite already satisfied.'
+            return
+        }
+
+        $localInstaller = Join-Path $WorkingRoot 'windowsdesktop-runtime-8-win-x64.exe'
+        if (Test-Path -LiteralPath $DotNetDesktopRuntimeSharePath) {
+            Write-Log ("Using .NET Desktop Runtime installer from file share: {0}" -f $DotNetDesktopRuntimeSharePath) 'OK'
+            Copy-Item -LiteralPath $DotNetDesktopRuntimeSharePath -Destination $localInstaller -Force
+        }
+        else {
+            Write-Log ("File-share .NET installer is unavailable: {0}" -f $DotNetDesktopRuntimeSharePath) 'WARN'
+            Save-InternetFile -Uri ([uri]$DotNetDesktopRuntimeInternetUrl) -DestinationPath $localInstaller -DisplayName '.NET Desktop Runtime 8 x64'
+        }
+
+        Invoke-InstallerAndValidateExitCode -FilePath $localInstaller -ArgumentList @('/install','/quiet','/norestart') -DisplayName '.NET Desktop Runtime 8 x64'
+
+        if (-not (Test-DotNetDesktopRuntime8 -MinimumVersion ([version]'8.0.25'))) {
+            throw '.NET Desktop Runtime installation completed, but version 8.0.25 or newer was not detected.'
+        }
+    }
+
+    function Ensure-DellCommandUpdateInstalled {
+        [CmdletBinding()]
+        param()
+
+        $dcuCliPath = Join-Path ${env:ProgramFiles} 'Dell\CommandUpdate\dcu-cli.exe'
+        if (Test-Path -LiteralPath $dcuCliPath) {
+            Write-Log ("Dell Command | Update is already installed: {0}" -f $dcuCliPath) 'OK'
+            Add-YamlAction 'Dell Command | Update was already installed.'
+            return $dcuCliPath
+        }
+
+        Ensure-DotNetDesktopRuntimeForDcu
+
+        $localDcuInstaller = Join-Path $WorkingRoot 'Dell-Command-Update-Windows-Universal-Application.exe'
+
+        if (Test-Path -LiteralPath $DellCommandUpdateSharePath) {
+            Write-Log ("Using Dell Command | Update installer from file share: {0}" -f $DellCommandUpdateSharePath) 'OK'
+            Copy-Item -LiteralPath $DellCommandUpdateSharePath -Destination $localDcuInstaller -Force
+            Invoke-InstallerAndValidateExitCode -FilePath $localDcuInstaller -ArgumentList @('/s') -DisplayName 'Dell Command | Update'
+        }
+        else {
+            Write-Log ("File-share Dell Command | Update installer is unavailable: {0}" -f $DellCommandUpdateSharePath) 'WARN'
+            Write-Log 'Attempting direct vendor download of Dell Command | Update from Dell...' 'INFO'
+            Add-YamlAction 'File-share Dell Command | Update unavailable; using Dell vendor Internet fallback.'
+
+            $directDownloadSucceeded = $false
+
+            try {
+                Save-InternetFile `
+                    -Uri ([uri]$DellCommandUpdateInternetUrl) `
+                    -DestinationPath $localDcuInstaller `
+                    -DisplayName 'Dell Command | Update'
+
+                Test-DownloadedFileSha256 `
+                    -Path $localDcuInstaller `
+                    -ExpectedSha256 $DellCommandUpdateInternetSha256 `
+                    -DisplayName 'Dell Command | Update'
+
+                Invoke-InstallerAndValidateExitCode `
+                    -FilePath $localDcuInstaller `
+                    -ArgumentList @('/s') `
+                    -DisplayName 'Dell Command | Update'
+
+                $directDownloadSucceeded = $true
+                Add-YamlAction 'Dell Command | Update installed from Dell direct vendor download.'
+            }
+            catch {
+                Write-Log ("Direct Dell vendor download/install failed: {0}" -f $_.Exception.Message) 'WARN'
+                Add-YamlAction ("Direct Dell vendor fallback failed: {0}" -f $_.Exception.Message)
+            }
+
+            if (-not $directDownloadSucceeded) {
+                $winget = Get-Command -Name 'winget.exe' -ErrorAction SilentlyContinue
+
+                if (-not $winget) {
+                    throw 'Dell Command | Update could not be installed from the file share or Dell vendor download, and winget.exe is unavailable.'
+                }
+
+                Write-Log 'Trying final Dell Command | Update Internet fallback using winget...' 'WARN'
+
+                $wingetArgs = @(
+                    'install',
+                    '--id', $DellCommandUpdateWingetId,
+                    '--exact',
+                    '--silent',
+                    '--accept-package-agreements',
+                    '--accept-source-agreements',
+                    '--disable-interactivity'
+                )
+
+                $wingetProcess = Start-Process -FilePath $winget.Source -ArgumentList $wingetArgs -Wait -PassThru -NoNewWindow
+                Write-Log ("winget Dell Command | Update exit code: {0}" -f $wingetProcess.ExitCode) 'INFO'
+
+                if ($wingetProcess.ExitCode -ne 0) {
+                    throw ("Internet installation of Dell Command | Update failed with winget exit code {0}." -f $wingetProcess.ExitCode)
+                }
+
+                Add-YamlAction 'Dell Command | Update installed from Internet using winget fallback.'
+            }
+        }
+
+        Start-Sleep -Seconds 3
+        if (-not (Test-Path -LiteralPath $dcuCliPath)) {
+            throw ("Dell Command | Update installation completed, but the CLI was not found: {0}" -f $dcuCliPath)
+        }
+
+        Write-Log ("Dell Command | Update installed and verified: {0}" -f $dcuCliPath) 'OK'
+        return $dcuCliPath
+    }
+
     function Invoke-DellDriverUpdates {
         Write-Section 'Dell Command Update Workflow'
 
-        $dcuCli = Join-Path ${env:ProgramFiles} 'Dell\CommandUpdate\dcu-cli.exe'
-        if (-not (Test-Path -LiteralPath $dcuCli)) {
-            throw "Dell Command | Update CLI was not found: $dcuCli"
-        }
+        # Ensure .NET Desktop Runtime and Dell Command | Update are available.
+        # This supports standalone/non-domain computers that cannot reach the
+        # internal Labscripts shares by using official vendor Internet fallbacks.
+        $dcuCli = Ensure-DellCommandUpdateInstalled
 
         Write-Log ("Using Dell Command | Update CLI: {0}" -f $dcuCli) 'OK'
         Add-YamlAction 'Using Dell Command | Update CLI.'
