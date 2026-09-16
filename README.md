@@ -15,6 +15,7 @@ The primary goal is simple:
 ## Repository Utilities
 
 - [Compton Tech Utils](#-compton-tech-utils)
+- [Post-Deployment Workstation Setup](#-post-deployment-workstation-setup)
 - [Check AD Password Expiry](#-check-ad-password-expiry)
 - [Collect Power Setting Forensics](#-collect-power-setting-forensics)
 - [Configure Dell BIOS Settings](#-configure-dell-bios-settings)
@@ -660,6 +661,68 @@ This gives technicians a standardized Windows Update recovery procedure instead 
 
 ---
 
+# 🚀 Post-Deployment Workstation Setup
+
+## `Post-Deployment.ps1`
+
+A general-purpose, failure-tolerant workflow for preparing or refreshing HP and Dell Windows computers after deployment.
+
+The script runs each major operation as an independent section. If an installer, update package, or network source is unavailable, the failure is written to the post-deployment log and the remaining sections continue.
+
+### Main operations
+
+- Detects whether the computer is manufactured by HP or Dell.
+- Installs applicable hardware drivers and, when enabled, BIOS and firmware updates.
+- Suspends BitLocker protection for one reboot before applicable firmware work.
+- Refreshes the local maintenance-script directory from a configurable central share.
+- Runs `Register-Tasks_SYSTEM.ps1` after maintenance scripts are refreshed.
+- Detects PaperCut Print Deploy and silently installs it when missing.
+- Detects the Action1 Agent and silently installs it when missing.
+- Detects Office LTSC 2024 and activates it when installed.
+- Skips Office activation when Office LTSC 2024 is not present.
+- Updates installed applications through WinGet.
+- Installs Microsoft and Windows updates.
+- Tracks MSI exit codes that require a restart.
+- Removes temporary driver-update files.
+- Optionally restarts the computer when processing is complete.
+
+### PaperCut and Action1 deployment
+
+PaperCut and Action1 installation is idempotent. An already-installed product is detected and skipped. A new installation is verified before its section is marked successful.
+
+The public script uses placeholder server and share names. Before production use, configure the script parameters for your authorized deployment sources:
+
+- `DellCommandUpdateSharePath`
+- `DotNetDesktopRuntimeSharePath`
+- `ScriptsSourcePath`
+- `PaperCutMsiPath`
+- `Action1InstallerPath`
+
+Installer timeouts, application updates, Windows updates, BIOS and firmware handling, Office activation, and automatic reboot behavior are also configurable through parameters.
+
+### Logging and failure handling
+
+Operational and installer logs are written under `C:\Logs` by default.
+
+Each section reports its result independently. A failed section does not prevent subsequent deployment operations from running, and the final summary lists every section. The script returns a nonzero exit code when one or more sections fail.
+
+### Example
+
+Run from an elevated Windows PowerShell session:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\Post-Deployment.ps1
+```
+
+To test without automatically restarting the computer:
+
+```powershell
+.\Post-Deployment.ps1 -RebootWhenComplete $false
+```
+
+---
+
 # 🔐 Check AD Password Expiry
 
 ## `Check-ADPasswordExpiry.ps1`
@@ -855,6 +918,8 @@ Compton/
 │
 ├── Edge_inPrivate.ps1
 │
+├── Post-Deployment.ps1
+│
 ├── Remove_Sysprep_Blocking_Appx.ps1
 │
 ├── Reset-Edge_AllUsers.ps1
@@ -872,6 +937,7 @@ Compton/
 | Active Directory | `Check-ADPasswordExpiry.ps1` |
 | Diagnostics / Forensics | `Collect_Power_Setting_Forensics.ps1` |
 | BIOS / Hardware | `Set-Dell-BIOS-Settings.ps1` |
+| Deployment / Maintenance | `Post-Deployment.ps1` |
 | Microsoft Edge | `Edge_inPrivate.ps1` |
 | Microsoft Edge | `Reset-Edge_AllUsers.ps1` |
 | Windows Deployment | `Remove_Sysprep_Blocking_Appx.ps1` |
@@ -942,6 +1008,9 @@ Removing Windows packages can affect operating-system functionality.
 
 **Registry Changes**  
 Registry settings can significantly alter Windows behavior.
+
+**Post-Deployment Sources**  
+Configure only trusted, access-controlled installer and script sources. Test BIOS and firmware deployment on representative hardware before broad use.
 
 ---
 
