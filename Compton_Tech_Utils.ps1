@@ -1,6 +1,6 @@
 # =====================================================================
 # ScriptName: Compton_Tech_Utils.ps1
-# ScriptVersion: 1.14.0
+# ScriptVersion: 1.14.1
 # LastUpdated: 2026-10-12
 # =====================================================================
 
@@ -10627,6 +10627,7 @@ function Show-Menu {
     Write-Host "18. Network Diag & Repair" -ForegroundColor White
     Write-Host "19. Windows Update Services Repair" -ForegroundColor White
     Write-Host "20. Sunday Lab Applications / Office Maintenance" -ForegroundColor White
+    Write-Host "21. Remove Microsoft Copilot (this computer)" -ForegroundColor White
     Write-Host "Q.  Exit" -ForegroundColor Red
 
     Write-Host ""
@@ -10783,6 +10784,8 @@ function Main {
 				Pause
 			}
 			
+            "20" { Clear-Host; Invoke-LabApplicationMaintenance; Pause }
+            "21" { Clear-Host; Remove-MicrosoftCopilot; Pause }
 			"Q" {
 				Clear-Host
 				Write-Host "Compton College Tech Utils has exited." -ForegroundColor Cyan
@@ -10913,6 +10916,36 @@ function Invoke-LabApplicationMaintenance {
     [switch]$ForceElasticAgentReinstall
 )
     Invoke-TechMaintenanceScript -ScriptName '04_Sunday_Lab_Application_Maintenance.ps1' -Parameters $PSBoundParameters
+}
+
+function Remove-MicrosoftCopilot {
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
+    param()
+    $folder = Initialize-TechMaintenanceBundle
+    $module = $null
+    try {
+        $module = Import-Module -Name (Join-Path $folder 'Maintenance.Copilot.psm1') -Force -DisableNameChecking -PassThru -ErrorAction Stop
+        $result = Invoke-ComprehensiveCopilotRemoval -WhatIf:$WhatIfPreference -Logger {
+            param($Message, $Level)
+            $color = switch -Regex ([string]$Level) {
+                '^(?i:error|failed)$' { 'Red'; break }
+                '^(?i:warn|warning)$' { 'Yellow'; break }
+                default { 'Cyan' }
+            }
+            Write-Host ("[{0}] {1}" -f $Level, $Message) -ForegroundColor $color
+        }
+        $result | Format-List | Out-Host
+        if ($WhatIfPreference) { $global:LastStatus = '[INFO] Copilot removal preview completed.' }
+        elseif ([int]$result.Failures -gt 0) {
+            $global:LastStatus = "[ERROR] Copilot removal reported $($result.Failures) failure(s). Review the results above."
+        }
+        else { $global:LastStatus = "[OK] Copilot removal completed. Status=$($result.Status); reboot required=$($result.RebootRequired)." }
+        Write-Host $global:LastStatus -ForegroundColor Yellow
+    }
+    finally {
+        if ($module) { Remove-Module -ModuleInfo $module -Force -ErrorAction SilentlyContinue }
+        Remove-Item -LiteralPath $folder -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 # -----------------------------------------------------------------------------
