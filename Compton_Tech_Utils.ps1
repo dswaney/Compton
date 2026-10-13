@@ -1,7 +1,11 @@
 # =====================================================================
 # ScriptName: Compton_Tech_Utils.ps1
-# ScriptVersion: 1.14.2
+# ScriptVersion: 1.14.3
 # LastUpdated: 2026-10-12
+# Changes: v1.14.3 corrects menu/hover/AutoEndTasks registry types and verifies
+#          registry value kinds. MapsBroker is Manual; RemoteAccess is Disabled.
+#          Windows Update service defaults are retained for technician use.
+#          Netlogon and W32Time remain Automatic.
 # =====================================================================
 
 # -----------------------------------------------------------------------------
@@ -1188,11 +1192,11 @@ function Apply-RecommendedRegistrySettings {
         Performance = @(
             @{ Path = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile'; Name = 'SystemResponsiveness'; Value = 0; Type = 'DWORD'; Description = 'Optimize system responsiveness' },
             @{ Path = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile'; Name = 'NetworkThrottlingIndex'; Value = 4294967295; Type = 'DWORD'; Description = 'Disable network throttling' },
-            @{ Path = 'HKCU:\Control Panel\Desktop'; Name = 'MenuShowDelay'; Value = 1; Type = 'DWORD'; Description = 'Reduce menu show delay' },
-            @{ Path = 'HKCU:\Control Panel\Desktop'; Name = 'AutoEndTasks'; Value = 1; Type = 'DWORD'; Description = 'Auto-end hung tasks' },
+            @{ Path = 'HKCU:\Control Panel\Desktop'; Name = 'MenuShowDelay'; Value = '200'; Type = 'String'; Description = 'Reduce menu show delay' },
+            @{ Path = 'HKCU:\Control Panel\Desktop'; Name = 'AutoEndTasks'; Value = '1'; Type = 'String'; Description = 'Auto-end hung tasks' },
             @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management'; Name = 'ClearPageFileAtShutdown'; Value = 0; Type = 'DWORD'; Description = 'Skip page file clearing' },
             @{ Path = 'HKLM:\SYSTEM\ControlSet001\Services\Ndu'; Name = 'Start'; Value = 2; Type = 'DWORD'; Description = 'Optimize network usage' },
-            @{ Path = 'HKCU:\Control Panel\Mouse'; Name = 'MouseHoverTime'; Value = 400; Type = 'DWORD'; Description = 'Reduce mouse hover time' },
+            @{ Path = 'HKCU:\Control Panel\Mouse'; Name = 'MouseHoverTime'; Value = '400'; Type = 'String'; Description = 'Reduce mouse hover time' },
             @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters'; Name = 'IRPStackSize'; Value = 30; Type = 'DWORD'; Description = 'Optimize file sharing' },
             @{ Path = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DeliveryOptimization\Config'; Name = 'DODownloadMode'; Value = 1; Type = 'DWORD'; Description = 'Optimize delivery mode' }
         )
@@ -1412,7 +1416,8 @@ function Set-RegistryValueSafe {
             $currentValue = Get-ItemProperty -Path $Path -Name $Name -ErrorAction SilentlyContinue
             if ($null -ne $currentValue) {
                 $result.PreviousValue = $currentValue.$Name
-                if ($currentValue.$Name -eq $Value) {
+                if ($currentValue.$Name -eq $Value -and
+                    ([string](Get-Item -LiteralPath $Path -ErrorAction Stop).GetValueKind($Name)) -ieq $Type) {
                     $result.Status = "Unchanged"
                     return $result
                 }
@@ -1432,15 +1437,14 @@ function Set-RegistryValueSafe {
                 'ExpandString' { 'ExpandString' }
             }
 
-            if (Get-ItemProperty -Path $Path -Name $Name -ErrorAction SilentlyContinue) {
-                Set-ItemProperty -Path $Path -Name $Name -Value $Value -Force -ErrorAction Stop
-            } else {
-                New-ItemProperty -Path $Path -Name $Name -Value $Value -PropertyType $propertyType -Force -ErrorAction Stop | Out-Null
-            }
+            # Force recreates an existing value with the requested registry kind.
+            # Set-ItemProperty alone can retain an earlier incorrect DWORD kind.
+            New-ItemProperty -LiteralPath $Path -Name $Name -Value $Value -PropertyType $propertyType -Force -ErrorAction Stop | Out-Null
 
             # Verify write
             $verify = Get-ItemProperty -Path $Path -Name $Name -ErrorAction SilentlyContinue
-            if ($null -ne $verify -and $verify.$Name -eq $Value) {
+            if ($null -ne $verify -and $verify.$Name -eq $Value -and
+                ([string](Get-Item -LiteralPath $Path -ErrorAction Stop).GetValueKind($Name)) -ieq $Type) {
                 $result.Status = "Success"
             } else {
                 $result.Status = "Failed"
@@ -1722,7 +1726,7 @@ function Optimize-WindowsServices {
             "LanmanServer"                  = "Automatic"
             "LanmanWorkstation"             = "Automatic"
             "LSM"                           = "Automatic"
-            "MapsBroker"                    = "AutomaticDelayedStart"
+            "MapsBroker"                    = "Manual"
             "MpsSvc"                        = "Automatic"
             "Netlogon"                      = "Automatic"
             "Power"                         = "Automatic"
@@ -1827,7 +1831,7 @@ function Optimize-WindowsServices {
             "QWAVE"                         = "Manual"
             "RasAuto"                       = "Manual"
             "RasMan"                        = "Manual"
-            "RemoteAccess"                  = "Manual"
+            "RemoteAccess"                  = "Disabled"
             "RetailDemo"                    = "Manual"
             "RmSvc"                         = "Manual"
             "RpcLocator"                    = "Manual"
