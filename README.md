@@ -729,21 +729,36 @@ This makes the utility useful as a **forensics/diagnostic collector** rather tha
 
 ## `Set-Dell-BIOS-Settings.ps1`
 
-Automates selected BIOS configuration on supported Dell computers.
+Version **2.3.0** checks and corrects Sunday-only automatic power-on at **00:00**, using the BIOS clock, and wired Wake-on-LAN (`LanOnly`). It uses Dell's native agentless CIM namespace (`root\dcim\sysman\biosattributes`) rather than importing DellBIOSProvider, avoiding the provider import failure seen on an OptiPlex AIO 7410 65W. No Visual C++ installation, provider DLL replacement or module-share access is required.
 
-BIOS configuration can otherwise require technicians to physically enter firmware setup on individual machines and manually configure each setting.
+The script preflights all eleven required attributes, writes only incorrect supported values through `BIOSAttributeInterface.SetAttribute`, checks Dell's returned status, and reads the settings back independently before reporting `Verified`. Unsupported or read-only incorrect settings prevent writes. A method success without matching read-back is reported as incomplete.
 
-Automating supported settings provides a more repeatable configuration process.
+Run in elevated native 64-bit Windows PowerShell 5.1 or as SYSTEM. For an unattended Insight push after deploying the script locally:
 
-Potential benefits include:
+```powershell
+powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "C:\Scripts\Set-Dell-BIOS-Settings.ps1"
+```
 
-- Standardized BIOS configuration.
-- Faster workstation deployment.
-- Reduced manual setup.
-- Reduced configuration drift.
-- Easier reconfiguration of existing systems.
+For a read-only BIOS audit:
 
-> **Important:** BIOS configuration should always be tested against the specific Dell models being managed because available BIOS settings can differ between hardware generations.
+```powershell
+powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "C:\Scripts\Set-Dell-BIOS-Settings.ps1" -AuditOnly
+```
+
+There are no interactive prompts, forced restarts, firmware updates, or changes to BitLocker, Secure Boot, storage mode or BIOS passwords. A BIOS administrator password can optionally be supplied as a `SecureString` by a trusted local PowerShell caller; never embed it in the script or command line. Without suitable credentials, protected writes report access denied and stop repeated authentication attempts. Already compliant computers need no BIOS write.
+
+Each endpoint prints its before/desired/after values and summary for Insight. It saves a uniquely named text log and JSON report in `C:\Logs`, plus `C:\Logs\Set-Dell-BIOS-Settings.latest.json`. Active logs are staged in `C:\Temp\Compton-DellBIOS-Logs`; shared append, retries and a fresh fallback file prevent a locked log from terminating BIOS work. Reports are local; no new Elastic collection input is configured.
+
+| Exit | Meaning |
+|---|---|
+| 0 | All settings verified, or a non-Dell computer explicitly skipped; inspect `Status` to distinguish them. |
+| 1 | Failed or incomplete configuration. |
+| 2 | Audit found differences; no BIOS writes attempted. |
+| 20 | Another configuration instance is active on the same computer. |
+
+PowerShell parsing and 13 mocked branch checks passed. Direct CIM reads were confirmed on the Dell test computer; actual writes still require a Windows pilot before the full lab push. Separate computers can run concurrently; a per-computer mutex prevents overlapping local instances. Scheduled power-on also depends on the computer's clock, power and firmware behavior.
+
+Dell interface specification: https://downloads.dell.com/manuals/common/dell-agentless-client-manageability.pdf
 
 ---
 
